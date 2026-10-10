@@ -48,8 +48,8 @@ help: ## Display this help.
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 	@# The Helm chart consumes the generated CRDs and RBAC rules directly so it cannot drift.
-	rm -f $(CHART_DIR)/crds/*.yaml
-	cp config/crd/bases/*.yaml $(CHART_DIR)/crds/
+	rm -f $(CHART_DIR)/files/crds/*.yaml
+	cp config/crd/bases/*.yaml $(CHART_DIR)/files/crds/
 	cp config/rbac/role.yaml $(CHART_DIR)/files/manager-role.yaml
 	cp config/admission/policies.yaml $(CHART_DIR)/files/admission-policies.yaml
 
@@ -165,8 +165,9 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 CHART_DIR ?= charts/talos-operator
 
 .PHONY: helm-lint
-helm-lint: manifests ## Lint the Helm chart.
+helm-lint: manifests ## Lint the Helm chart and check what it renders.
 	helm lint $(CHART_DIR)
+	hack/chart/check.sh $(CHART_DIR)
 
 .PHONY: helm-template
 helm-template: manifests ## Render the Helm chart for inspection.

@@ -65,6 +65,14 @@ metrics:
   # Serve metrics over HTTPS on 8443, authenticated via the Kubernetes API.
   enabled: true
 
+crds:
+  # The CustomResourceDefinitions are part of the release, so `helm upgrade` upgrades them
+  # (docs/scope.md §12.15). Disable only if they are installed some other way.
+  enabled: true
+  # Leave the CRDs in place when the chart is uninstalled. Deleting a CRD deletes every object
+  # of its kind: every TalosCluster, pool and machine.
+  keep: true
+
 admissionPolicies:
   # ValidatingAdmissionPolicies guarding the management gate and TalosMachine deletion
   # (docs/scope.md §5.2). Disable only if they are installed some other way.

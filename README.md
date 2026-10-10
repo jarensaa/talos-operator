@@ -28,7 +28,7 @@ You need:
 
 Nothing on a node changes before step 6. The [guide](docs/guide.md) has what these steps leave out: what the conditions mean while a cluster is adopted, and what to do when a rollout halts, asks for approval, or finds a node changed by hand.
 
-> **Two things below arrive with the next release.** The operator creating the resources itself (steps 4 and 5), and the chart upgrading its CRDs (step 2). In the current release the operator writes the resources to a ConfigMap for you to apply, and CRDs are upgraded by hand. The guide has [both procedures](docs/guide.md#until-the-next-release).
+> **Steps 4 and 5 arrive with the next release.** In the current release the operator does not create the resources itself: it writes them to a ConfigMap for you to apply. The guide has [that procedure](docs/guide.md#until-the-next-release).
 
 ### 1. Allow the operator to request Talos credentials
 
@@ -65,6 +65,7 @@ kind: TalosCluster
 metadata:
   name: my-cluster
   namespace: talos-operator
+spec: {}
 EOF
 ```
 
@@ -194,7 +195,8 @@ spec:
 |---|---|
 | Observing clusters and machines | Implemented |
 | Adoption: proposal, config comparison, dry-run proof, gated switch to `Manage` | Implemented |
-| Adoption that creates the resources itself; CRDs upgraded with the chart | Planned next |
+| CRDs installed and upgraded with the chart | Implemented |
+| Adoption that creates the resources itself | Planned next |
 | Machine pools and reusable config | Implemented |
 | Drift reporting and enforcement | Implemented |
 | Applying config changes, with Talos try-mode rollback | Implemented |

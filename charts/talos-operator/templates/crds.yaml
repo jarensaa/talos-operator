@@ -1,0 +1,15 @@
+{{- /*
+The CRDs come from controller-gen (config/crd/bases, copied to files/crds by `make manifests`).
+They are templates and not in the chart's crds/ directory, which Helm installs once and never
+upgrades (docs/scope.md §12.15). They are cluster-scoped and their names are fixed.
+*/ -}}
+{{- if .Values.crds.enabled }}
+{{- range $path, $_ := .Files.Glob "files/crds/*.yaml" }}
+{{- $crd := $.Files.Get $path | fromYaml }}
+{{- if $.Values.crds.keep }}
+{{- $_ := set $crd.metadata.annotations "helm.sh/resource-policy" "keep" }}
+{{- end }}
+---
+{{ toYaml $crd }}
+{{- end }}
+{{- end }}
