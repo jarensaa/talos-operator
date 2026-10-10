@@ -127,9 +127,12 @@ type machineView struct {
 	node *nodeFacts
 	// live is the node's normalized active config; nil if it could not be read.
 	live *render.Config
-	// desired is what the spec renders now; nil if it does not render, and problem says why.
-	desired *render.Config
-	problem string
+	// rendered is what the spec renders now, and desired what a config rollout is to bring the
+	// node to: the same, but for the images of the Kubernetes components, which stay as the
+	// node has them (withLiveKubernetes). Both are nil if the spec does not render, and problem
+	// says why.
+	rendered, desired *render.Config
+	problem           string
 	// withhold is set when a config source is a Secret: what Talos says about the config may
 	// quote it, so it is not repeated.
 	withhold bool
@@ -164,8 +167,16 @@ func (r *TalosClusterReconciler) view(ctx context.Context, tc *talosv1alpha1.Tal
 		return v, nil
 	}
 
-	v.desired = desired
+	v.rendered, v.desired = desired, desired
 	v.withhold = len(resolved.fromSecrets) > 0
+
+	if v.live != nil {
+		if v.desired, _, err = withLiveKubernetes(desired, v.node.activeConfig); err != nil {
+			v.rendered, v.desired, v.problem = nil, nil, "keep the node's Kubernetes images: "+err.Error()
+
+			return v, nil //nolint:nilerr // a problem of this machine's config, which the planner is told as such
+		}
+	}
 
 	if v.live != nil {
 		// A node that runs what its config's installer installs takes that config like any other.
@@ -175,7 +186,7 @@ func (r *TalosClusterReconciler) view(ctx context.Context, tc *talosv1alpha1.Tal
 		}
 
 		if v.change, err = classify.Classify(v.live, v.desired, opts...); err != nil {
-			v.desired, v.problem = nil, "classify the change: "+err.Error()
+			v.rendered, v.desired, v.problem = nil, nil, "classify the change: "+err.Error()
 		}
 	}
 

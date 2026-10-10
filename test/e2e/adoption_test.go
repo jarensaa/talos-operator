@@ -38,11 +38,9 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/yaml"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/plan"
@@ -98,34 +96,11 @@ const (
 	brokenKubeletPatch = "apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  " + unknownKubeletFlag + ": \"true\"\n"
 )
 
-// An API that Kubernetes 1.37 no longer serves, and an object of it. The definition stands in
-// for the real, alpha API, which a cluster does not serve unless it is asked to; a group of
-// Kubernetes's own needs a word on why this is not the real thing.
+// A flag that kubelet 1.37 no longer has (go-kubernetes lists it among those removed with the
+// deprecated cAdvisor flags), with its default value: 1.36 takes it, and it changes nothing.
 const (
-	removedAPI = `
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: workloads.scheduling.k8s.io
-  annotations:
-    api-approved.kubernetes.io: "unapproved, stands in for a removed API in an e2e test"
-spec:
-  group: scheduling.k8s.io
-  scope: Namespaced
-  names: {plural: workloads, singular: workload, kind: Workload, listKind: WorkloadList}
-  versions:
-    - name: v1alpha2
-      served: true
-      storage: true
-      schema:
-        openAPIV3Schema: {type: object, x-kubernetes-preserve-unknown-fields: true}
-`
-	strandedWorkload = `
-apiVersion: scheduling.k8s.io/v1alpha2
-kind: Workload
-metadata:
-  name: stranded
-`
+	removedKubeletFlag  = "global-housekeeping-interval"
+	removedKubeletPatch = "apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  " + removedKubeletFlag + ": 1m0s\n"
 )
 
 func labelDocument(value string) string {
@@ -1118,7 +1093,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 	// A Kubernetes upgrade (docs/scope.md §7.4): the components Talos runs, one on one node at a
 	// time, every API server first. It is the one scenario in which the Kubernetes API the
 	// operator itself depends on is restarted under it, on purpose.
-	It("upgrades Kubernetes by a minor, after refusing to while an object of a removed API exists", func(ctx context.Context) {
+	It("upgrades Kubernetes by a minor, after refusing to while a kubelet runs with a removed flag", func(ctx context.Context) {
 		from, target := os.Getenv("E2E_KUBERNETES_VERSION"), os.Getenv("E2E_KUBERNETES_UPGRADE_TO")
 		if target == "" || target == from {
 			Skip("the harness cluster already runs the Kubernetes version to upgrade to")
@@ -1148,19 +1123,28 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		// What 1.37 removes, by go-kubernetes's list. Other versions remove other things.
 		strands := strings.HasPrefix(from, "1.36.") && strings.HasPrefix(target, "1.37.")
 
-		workload, definition := &unstructured.Unstructured{}, &unstructured.Unstructured{}
-		Expect(yaml.Unmarshal([]byte(strandedWorkload), &workload.Object)).To(Succeed())
-		Expect(yaml.Unmarshal([]byte(removedAPI), &definition.Object)).To(Succeed())
-		workload.SetNamespace(testNamespace)
+		// The pool whose kubelets get the flag: the workers, where there are any.
+		role, flagged := talosv1alpha1.MachineRoleWorker, addrsOf("E2E_WORKERS")
+		if len(flagged) == 0 {
+			role, flagged = talosv1alpha1.MachineRoleControlPlane, controlPlanes
+		}
+
+		original := poolConfig(ctx, role)
 
 		if strands {
-			By("creating an object of an API the new version no longer serves")
-			Expect(k8sClient.Create(ctx, definition)).To(Succeed())
-			DeferCleanup(func(ctx context.Context) {
-				Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, definition))).To(Succeed())
-			})
-			Eventually(func() error { return k8sClient.Create(ctx, workload.DeepCopy()) }).
-				WithContext(ctx).WithTimeout(2*time.Minute).WithPolling(2*time.Second).Should(Succeed(), "the API is served once it is established")
+			By("starting kubelets with a flag the new version removed")
+			ended := rollouts(ctx)
+			setPoolConfig(ctx, role, with(original, removedKubeletPatch))
+
+			Eventually(func(g Gomega) {
+				refresh(ctx, g)
+				if op := tc.Status.Operation; op != nil {
+					g.Expect(op.Failure).To(BeNil(), "the rollout halted: %+v", op.Failure)
+				}
+				g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
+				g.Expect(tc.Status.History).To(HaveLen(ended + 1))
+			}).WithContext(ctx).WithTimeout(time.Duration(len(flagged)) * 6 * time.Minute).Should(Succeed())
+			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded), tc.Status.History[0].Message)
 		}
 
 		By("asking for the next Kubernetes minor")
@@ -1177,7 +1161,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 				refresh(ctx, g)
 				g.Expect(upToDate()).NotTo(BeNil())
 				g.Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible), upToDate().Message)
-				g.Expect(upToDate().Message).To(ContainSubstring("workloads.v1alpha2.scheduling.k8s.io"))
+				g.Expect(upToDate().Message).To(ContainSubstring("--" + removedKubeletFlag))
 			}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
 
 			Consistently(func(g Gomega) {
@@ -1188,9 +1172,10 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			Expect(snapshot(ctx, harness, nodes)).To(Equal(before))
 			Expect(kubeletVersions(ctx, Default)).To(HaveEach("v" + from))
 
-			By("removing the object")
-			Expect(k8sClient.Delete(ctx, workload)).To(Succeed())
-			Expect(k8sClient.Delete(ctx, definition)).To(Succeed())
+			// What clears the way is a config change, and the refused upgrade must not hold it up:
+			// the rollout takes the flag out and leaves the kubelet's image as it is.
+			By("taking the flag out again")
+			setPoolConfig(ctx, role, original)
 		}
 
 		upgraded := func() []talosv1alpha1.OperationRecord {
@@ -1208,7 +1193,8 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		By("waiting for the upgrade to go through every component on every node")
 		// The API server is restarted on the way, and with a single control plane nothing answers
 		// meanwhile: the test, like the operator, simply asks again.
-		turns := 3*len(controlPlanes) + len(nodes)
+		// Four images in a control plane's config besides the kubelet's, and a kubelet on every node.
+		turns := 4*len(controlPlanes) + len(nodes)
 		Eventually(func(g Gomega) {
 			refresh(ctx, g)
 			if op := tc.Status.Operation; op != nil {
@@ -1252,8 +1238,8 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			}
 		}
 
-		By("waiting for the config to follow: what is left of the change is the control planes' kube-proxy image")
-		inSync(ctx, time.Duration(len(controlPlanes))*6*time.Minute+2*time.Minute)
+		By("checking that nothing is left for a config rollout")
+		inSync(ctx, 2*time.Minute)
 
 		Eventually(func(g Gomega) {
 			refresh(ctx, g)

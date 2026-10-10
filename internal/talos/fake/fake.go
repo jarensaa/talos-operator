@@ -837,7 +837,9 @@ func (u *upgrader) PullImage(ctx context.Context, node netip.Addr, image string)
 
 // PullKubernetesImage implements talos.Upgrader.
 func (u *upgrader) PullKubernetesImage(ctx context.Context, node netip.Addr, component, image string) error {
-	if !slices.Contains(talos.KubernetesComponents, component) {
+	// Talos runs these from a node's config. kube-proxy is not among them: nothing pulls it here.
+	runs := []string{talos.ComponentAPIServer, talos.ComponentControllerManager, talos.ComponentScheduler, talos.ComponentKubelet}
+	if !slices.Contains(runs, component) {
 		return fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
 	}
 

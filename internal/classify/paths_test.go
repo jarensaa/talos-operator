@@ -42,7 +42,8 @@ func TestPathClass(t *testing.T) {
 		"cluster.apiServer.image":                Kubernetes,
 		"cluster.controllerManager.image":        Kubernetes,
 		"cluster.scheduler.image":                Kubernetes,
-		"cluster.proxy.image":                    LiveSafe,
+		"cluster.proxy.image":                    Kubernetes,
+		"cluster.proxy.disabled":                 LiveSafe,
 		"machine.nodeLabels":                     LiveSafe,
 		"machine.certSANs":                       LiveSafe,
 		"machine.kubeletExtra":                   Unknown, // a prefix must match a whole path segment

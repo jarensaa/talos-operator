@@ -270,7 +270,7 @@ No node is begun outside a window; a node that is being changed when the window 
 
 The API is `v1alpha1` and may change incompatibly between releases.
 
-Adoption, rollouts and upgrades are tested in CI against Talos clusters running in QEMU. The operator under test is the chart's image, installed with two replicas. The tests assert that adoption needs nothing applied by hand and leaves boot IDs and config hashes unchanged, that every node is upgraded to the next Talos release while a workload stays up, that a rollout finishes when the leader is killed in the middle of it, that a label reaches a node without a reboot, that a config which cuts a node off is reverted and never confirmed, that a rollout waits for its window and its gate and runs its hooks, and that Kubernetes is upgraded by a minor after being refused while an object of a removed API existed.
+Adoption, rollouts and upgrades are tested in CI against Talos clusters running in QEMU. The operator under test is the chart's image, installed with two replicas. The tests assert that adoption needs nothing applied by hand and leaves boot IDs and config hashes unchanged, that every node is upgraded to the next Talos release while a workload stays up, that a rollout finishes when the leader is killed in the middle of it, that a label reaches a node without a reboot, that a config which cuts a node off is reverted and never confirmed, that a rollout waits for its window and its gate and runs its hooks, and that Kubernetes is upgraded by a minor after being refused while a kubelet was started with a flag the new version removed.
 
 No cluster other than those depends on the operator yet. That is on purpose: until one does, the API changes without migrations.
 

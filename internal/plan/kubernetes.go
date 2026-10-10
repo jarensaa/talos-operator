@@ -37,11 +37,20 @@ const (
 	ComponentAPIServer         = "kube-apiserver"
 	ComponentControllerManager = "kube-controller-manager"
 	ComponentScheduler         = "kube-scheduler"
-	ComponentKubelet           = "kubelet"
+	// ComponentProxy is kube-proxy. Talos does not run it; a control plane's config names its
+	// image, and an upgrade brings that in line with the rest.
+	ComponentProxy   = "kube-proxy"
+	ComponentKubelet = "kubelet"
 )
 
 // KubernetesComponents lists the components in upgrade order.
-var KubernetesComponents = []string{ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentKubelet}
+var KubernetesComponents = []string{
+	ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentProxy, ComponentKubelet,
+}
+
+// Runs reports whether Talos runs the component on a node. What it does not run has no image to
+// pull and nothing to be seen running.
+func Runs(component string) bool { return component != ComponentProxy }
 
 // TurnKey names one turn of a Kubernetes upgrade: one component on one machine.
 func TurnKey(component, machine string) string { return component + "/" + machine }
@@ -72,8 +81,8 @@ type KubernetesMachine struct {
 	// Current is true when the node's config was just read and its spec renders. Stale
 	// information is never acted on.
 	Current bool
-	// Images are the components the machine has: all four on a control plane, the kubelet on a
-	// worker.
+	// Images are the components the machine's config names an image for: every one on a control
+	// plane, the kubelet on a worker.
 	Images map[string]KubernetesImage
 }
 
@@ -239,7 +248,8 @@ type KubernetesSettings struct {
 type KubernetesUpgrade struct {
 	Hop KubernetesHop
 	// Pending lists the turns, in order: the API server on every control plane, then the
-	// controller manager, the scheduler, and the kubelet on control planes and then on workers.
+	// controller manager, the scheduler, the kube-proxy image of each control plane's config, and
+	// the kubelet on control planes and then on workers.
 	Pending []string
 	// Images maps each turn to the image its component is to name.
 	Images map[string]string

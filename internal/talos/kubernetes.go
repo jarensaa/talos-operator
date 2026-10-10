@@ -47,13 +47,22 @@ const (
 	ComponentControllerManager = k8s.ControllerManagerID
 	ComponentScheduler         = k8s.SchedulerID
 	ComponentKubelet           = k8s.KubeletID
+	// ComponentProxy is kube-proxy, which Talos does not run: a control plane's config names its
+	// image for the manifest Talos applies when a cluster is bootstrapped. The image belongs to
+	// the Kubernetes version like the others, so an upgrade brings it in line; nothing is pulled
+	// or restarted for it.
+	ComponentProxy = "kube-proxy"
 )
 
-// KubernetesComponents lists the components in the order an upgrade takes them.
-var KubernetesComponents = []string{ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentKubelet}
+// KubernetesComponents lists the components in the order an upgrade takes them, which is
+// talosctl's (pkg/cluster/kubernetes/talos_managed.go:138-152 in Talos v1.14).
+var KubernetesComponents = []string{
+	ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentProxy, ComponentKubelet,
+}
 
-// KubernetesImages returns the image a machine config names for each Kubernetes component the
-// machine runs: the kubelet on every machine, the control-plane components on a control plane.
+// KubernetesImages returns the image a machine config names for each Kubernetes component: the
+// kubelet on every machine, the control-plane components and kube-proxy on a control plane. A
+// component the config names no image for is left out.
 func KubernetesImages(raw []byte) (map[string]string, error) {
 	cfg, err := ParseMachineConfig(raw)
 	if err != nil {
@@ -82,6 +91,16 @@ func KubernetesImages(raw []byte) (map[string]string, error) {
 		images[ComponentScheduler] = c.Image()
 	}
 
+	if c := cfg.K8sProxyConfig(); c != nil {
+		images[ComponentProxy] = c.Image()
+	}
+
+	for component, image := range images {
+		if image == "" {
+			delete(images, component)
+		}
+	}
+
 	return images, nil
 }
 
@@ -104,10 +123,12 @@ func WithKubernetesImage(raw []byte, component, image string) ([]byte, error) {
 		patch, err = stdpatches.WithKubeControllerManagerImage(stdpatches.GuessVersionContractKubeControllerManager(cfg), image)
 	case ComponentScheduler:
 		patch, err = stdpatches.WithKubeSchedulerImage(stdpatches.GuessVersionContractKubeScheduler(cfg), image)
+	case ComponentProxy:
+		patch, err = stdpatches.WithKubeProxyImage(stdpatches.GuessVersionContractKubeProxy(cfg), image)
 	case ComponentKubelet:
 		patch, err = stdpatches.WithKubeletImage(stdpatches.GuessVersionContractKubelet(cfg), image)
 	default:
-		return nil, fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
+		return nil, fmt.Errorf("%q is not a Kubernetes component a machine config names an image for", component)
 	}
 
 	loaded, err := stdpatches.PreparePatch(patch, err)

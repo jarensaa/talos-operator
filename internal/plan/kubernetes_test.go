@@ -37,6 +37,7 @@ var kubeRepos = map[string]string{
 	ComponentAPIServer:         "registry.k8s.io/kube-apiserver",
 	ComponentControllerManager: "registry.k8s.io/kube-controller-manager",
 	ComponentScheduler:         "registry.k8s.io/kube-scheduler",
+	ComponentProxy:             "registry.k8s.io/kube-proxy",
 	ComponentKubelet:           "ghcr.io/siderolabs/kubelet",
 }
 
@@ -183,6 +184,7 @@ func TestPlanKubernetesOrder(t *testing.T) {
 		"kube-apiserver/cp1", "kube-apiserver/cp2",
 		"kube-controller-manager/cp1", "kube-controller-manager/cp2",
 		"kube-scheduler/cp1", "kube-scheduler/cp2",
+		"kube-proxy/cp1", "kube-proxy/cp2",
 		"kubelet/cp1", "kubelet/cp2", "kubelet/w1", "kubelet/w2",
 	}
 	if !slices.Equal(got.Pending, want) || !got.MayStart() {
@@ -217,7 +219,7 @@ func TestPlanKubernetesOrder(t *testing.T) {
 
 	want = []string{
 		"kube-apiserver/cp2", "kube-controller-manager/cp2", "kube-scheduler/cp1", "kube-scheduler/cp2",
-		"kubelet/cp1", "kubelet/cp2", "kubelet/w2",
+		"kube-proxy/cp1", "kube-proxy/cp2", "kubelet/cp1", "kubelet/cp2", "kubelet/w2",
 	}
 	if !slices.Equal(resumed.Pending, want) {
 		t.Fatalf("resumed: got %v\nwant %v", resumed.Pending, want)
@@ -231,7 +233,7 @@ func TestPlanKubernetesOrder(t *testing.T) {
 	// image its rendered config names.
 	far := PlanKubernetes([]KubernetesMachine{kubeControlPlane(kubeCP1, "1.35.4", kubeNew), kubeWorker("w1", "1.35.4", kubeNew)},
 		KubernetesSettings{}, healthyPass())
-	if far.Hop.Version != "1.36.0" || far.Images["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.0" || len(far.Pending) != 5 {
+	if far.Hop.Version != "1.36.0" || far.Images["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.0" || len(far.Pending) != 6 {
 		t.Fatalf("far: %+v", far)
 	}
 
@@ -369,6 +371,16 @@ func TestNextKubernetesStep(t *testing.T) {
 	for _, now := range []time.Time{t0, t0.Add(time.Minute), late, late.Add(time.Hour)} {
 		if got := NextKubernetesStep(pulling, on(prev, prev), closed, open, timing, now); got.Kind == Pull {
 			t.Fatalf("pulled behind a closed gate at %s", now)
+		}
+	}
+}
+
+// Talos runs every component from a node's config but kube-proxy, whose image the config only
+// names for a manifest.
+func TestRuns(t *testing.T) {
+	for _, component := range KubernetesComponents {
+		if Runs(component) != (component != ComponentProxy) {
+			t.Errorf("%s: runs %v", component, Runs(component))
 		}
 	}
 }

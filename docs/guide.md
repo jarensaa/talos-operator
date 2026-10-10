@@ -191,11 +191,13 @@ After a skip or an abort the operator doesn't come back with the same installer 
 
 Set `versions.kubernetes`, with `management.upgrades` set to `Enabled`. What is upgraded is what Talos runs from a node's machine config: `kube-apiserver`, `kube-controller-manager` and `kube-scheduler` on control planes, and the kubelet on every node.
 
-Without `upgrades: Enabled` the operator only says what is behind: `KubernetesUpToDate` is false with reason `UpgradesDisabled`, and the config rollout waits with `AwaitingKubernetesUpgrade`. A config rollout never changes these images, whatever else is waiting with them: no other component may be newer than the API servers, and a rollout has no such order.
+Without `upgrades: Enabled` the operator only says what is behind: `KubernetesUpToDate` is false with reason `UpgradesDisabled`, and nothing changes.
+
+A config rollout never changes the images of these components: no other component may be newer than the API servers, and a rollout has no such order. It applies everything else of a change and leaves the images as the node has them, also while an upgrade is due, running or refused. A machine whose config differs from its node's only in these images says so in `ConfigMatchesLive`.
 
 ### What happens
 
-One component on one node at a time, in this order: the API server on every control plane, then the controller manager on each, then the scheduler, then the kubelet on control planes and on workers. `status.operation.plan` lists the turns, as `kube-apiserver/<machine>`.
+One component on one node at a time, in this order: the API server on every control plane, then the controller manager on each, then the scheduler, then the kube-proxy image that each control plane's config names (see below), then the kubelet on control planes and on workers. `status.operation.plan` lists the turns, as `kube-apiserver/<machine>`.
 
 | Step | What happens |
 |---|---|
@@ -220,6 +222,8 @@ With one control plane, the Kubernetes API is down while its API server restarts
 
 If one of those checks cannot be run, the upgrade waits (`AwaitingStatus`) and says which.
 
+A removed flag is usually in your own config. Take it out of the pool's or machine's config: that change rolls out although the upgrade is refused, and the upgrade starts once the last node is rid of the flag.
+
 ### When a component doesn't come up
 
 Talos puts the previous image back when the try ends, the upgrade halts, and nothing after it is touched. `retry` runs that turn again and `abort` ends the upgrade; there is no `skip-machine`, because what comes after would be newer than the component that was skipped. After an abort the operator does not start again for the same version.
@@ -232,7 +236,7 @@ Talos puts the previous image back when the try ends, the upgrade halts, and not
 
 ### What the operator leaves alone
 
-- **kube-proxy, CoreDNS and the other manifests Talos applies when a cluster is bootstrapped.** Talos applies them once and never again, and the operator does not either. If your cluster still runs the kube-proxy Talos deployed, update its DaemonSet yourself; `KubernetesUpToDate` says when it is behind. kube-proxy may be older than the API server, so there is no hurry, but it does not follow by itself.
+- **kube-proxy, CoreDNS and the other manifests Talos applies when a cluster is bootstrapped.** Talos applies them once and never again, and the operator does not either. The upgrade does update the kube-proxy image that each control plane's config names, so that the config is right; nothing runs from it. If your cluster still runs the kube-proxy Talos deployed, update its DaemonSet yourself; `KubernetesUpToDate` says when it is behind. kube-proxy may be older than the API server, so there is no hurry, but it does not follow by itself.
 - **Everything Talos does not run:** the CNI, CSI drivers, workloads.
 
 ## Windows, gates and hooks

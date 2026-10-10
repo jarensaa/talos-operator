@@ -31,6 +31,7 @@ import (
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/plan"
+	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos"
 )
 
@@ -63,10 +64,55 @@ func (f KubernetesCheckerFunc) RemovedAPIObjects(ctx context.Context, from, to s
 	return f(ctx, from, to)
 }
 
+// withLiveKubernetes is what a config rollout applies to a node: the rendered config, with the
+// image of every Kubernetes component as the node's own config names it now. Those images are a
+// Kubernetes upgrade's to change, in its own order (docs/scope.md §7.4), so they are never part
+// of what a config rollout compares or applies. Everything else of a change goes through, also
+// while a Kubernetes upgrade is due, in flight or refused: a refused upgrade must not hold up
+// the config change that clears its way. It reports whether it changed anything.
+func withLiveKubernetes(rendered *render.Config, liveRaw []byte) (*render.Config, bool, error) {
+	live, err := talos.KubernetesImages(liveRaw)
+	if err != nil {
+		return nil, false, err
+	}
+
+	want, err := talos.KubernetesImages(rendered.Bytes)
+	if err != nil {
+		return nil, false, err
+	}
+
+	raw, kept := rendered.Bytes, false
+
+	for _, component := range talos.KubernetesComponents {
+		if live[component] == "" || want[component] == "" || live[component] == want[component] {
+			continue
+		}
+
+		if raw, err = talos.WithKubernetesImage(raw, component, live[component]); err != nil {
+			return nil, false, err
+		}
+
+		kept = true
+	}
+
+	if !kept {
+		return rendered, false, nil
+	}
+
+	parsed, err := talos.ParseMachineConfig(raw)
+	if err != nil {
+		return nil, false, err
+	}
+
+	out, err := render.Normalize(parsed)
+
+	return out, true, err
+}
+
 // kubernetesImages is what a machine's node and its rendered config say about the Kubernetes
 // components the machine runs; nil if either cannot be told.
 func kubernetesImages(v machineView) map[string]plan.KubernetesImage {
-	if v.node == nil || v.live == nil || v.desired == nil {
+	if v.node == nil || v.live == nil || v.rendered == nil {
 		return nil
 	}
 
@@ -75,7 +121,7 @@ func kubernetesImages(v machineView) map[string]plan.KubernetesImage {
 		return nil
 	}
 
-	desired, err := talos.KubernetesImages(v.desired.Bytes)
+	desired, err := talos.KubernetesImages(v.rendered.Bytes)
 	if err != nil {
 		return nil
 	}
@@ -680,6 +726,16 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 		return "", nil
 	}
 
+	// The deadline is persisted before the try is sent, as in a config rollout.
+	deadline := metav1.NewTime(now.Add(timing.TryTimeout))
+
+	if !plan.Runs(cur.Component) {
+		// Nothing on the node runs from this image, so there is nothing to pull to it.
+		cur.Step, cur.PreviousHash, cur.DesiredHash, cur.Since, cur.Deadline = plan.StepTrying, v.live.Hash, desired, stamp, &deadline
+
+		return "", nil
+	}
+
 	upgrader, err := r.Resolver.ResolveUpgrader(ctx, tc, obs.endpoints)
 	if err != nil {
 		//nolint:nilerr // what the step waits for; the planner's timeouts end it if this lasts
@@ -702,8 +758,6 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 		return "", nil
 	}
 
-	// The deadline is persisted before the try is sent, as in a config rollout.
-	deadline := metav1.NewTime(now.Add(timing.TryTimeout))
 	cur.Step, cur.PreviousHash, cur.DesiredHash, cur.Since, cur.Deadline = plan.StepTrying, v.live.Hash, desired, stamp, &deadline
 
 	return "", nil
@@ -711,10 +765,15 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 
 // componentRuns checks that the component of the step in flight runs the image the step applied,
 // and is ready: for the kubelet by the version its Node reports, for a static pod by the pod the
-// kubelet mirrors into the API.
+// kubelet mirrors into the API. kube-proxy is not run from a node's config, and so has nothing
+// to be seen.
 func (r *TalosClusterReconciler) componentRuns(ctx context.Context, v machineView, cur *talosv1alpha1.OperationStep) (plan.Gate, error) {
 	closed := func(format string, args ...any) (plan.Gate, error) {
 		return plan.Gate{Reason: fmt.Sprintf(format, args...)}, nil
+	}
+
+	if !plan.Runs(cur.Component) {
+		return plan.Gate{Open: true}, nil
 	}
 
 	name := v.node.hostname

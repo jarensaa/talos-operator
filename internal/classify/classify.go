@@ -60,9 +60,9 @@ const (
 	// (§7.3). As a config change it is applied once the node runs what the image installs, and
 	// then it changes nothing on the node: see Installed.
 	Installer Class = "Installer"
-	// Kubernetes changes name another version of a Kubernetes component Talos runs: the API
-	// server, controller manager, scheduler or kubelet. A config rollout never applies them: a
-	// Kubernetes upgrade does, one component at a time and the API servers first (§7.4).
+	// Kubernetes changes name another image of a Kubernetes component: the API server, controller
+	// manager, scheduler, kube-proxy or kubelet. A config rollout never applies them: a Kubernetes
+	// upgrade does, one component at a time and the API servers first (§7.4).
 	Kubernetes Class = "Kubernetes"
 	// BootTime changes only take effect when a node is installed: kernel arguments, the install
 	// disk, disk encryption. The operator does not reinstall a node for them.
@@ -132,7 +132,8 @@ var kindClasses = map[string]Class{
 
 	"KubeNodeConfig": LiveSafe, "KubeletConfig": LiveSafe, "KubeCredentialProviderConfig": LiveSafe,
 	// Talos applies the kube-proxy manifest once, when the cluster is bootstrapped, and never again
-	// (§12.20): what the config says about kube-proxy changes nothing that runs.
+	// (§12.20): what the config says about kube-proxy changes nothing that runs. Its image still
+	// belongs to the Kubernetes version (kubernetesKinds).
 	"KubeProxyConfig": LiveSafe,
 	"SysctlConfig":    LiveSafe, "SysfsConfig": LiveSafe, "TimeSyncConfig": LiveSafe, "RegistryMirrorConfig": LiveSafe,
 	"RegistryAuthConfig": LiveSafe, "RegistryTLSConfig": LiveSafe, "EnvironmentConfig": LiveSafe, "EtcFileConfig": LiveSafe,
@@ -160,7 +161,7 @@ var pathRules = sortRules([]pathRule{
 	{v1alpha1InstallImage, Installer},
 	{"machine.kubelet.image", Kubernetes}, {"cluster.apiServer.image", Kubernetes},
 	{"cluster.controllerManager.image", Kubernetes}, {"cluster.scheduler.image", Kubernetes},
-	{"cluster.proxy", LiveSafe},
+	{"cluster.proxy.image", Kubernetes}, {"cluster.proxy", LiveSafe},
 	{"machine.install", BootTime}, {"machine.kernel", BootTime}, {"machine.systemDiskEncryption", BootTime},
 
 	{"machine.disks", Storage},
@@ -344,6 +345,7 @@ func kindOf(key render.DocKey) string {
 // each in its "image" field (machinery config/types/k8s).
 var kubernetesKinds = map[string]bool{
 	"KubeAPIServerConfig": true, "KubeControllerManagerConfig": true, "KubeSchedulerConfig": true, "KubeletConfig": true,
+	"KubeProxyConfig": true,
 }
 
 const componentImage = "image"

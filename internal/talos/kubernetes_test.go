@@ -91,6 +91,7 @@ func TestKubernetesImages(t *testing.T) {
 				ComponentAPIServer:         "registry.k8s.io/kube-apiserver:v1.36.2",
 				ComponentControllerManager: "registry.k8s.io/kube-controller-manager:v1.36.2",
 				ComponentScheduler:         "registry.k8s.io/kube-scheduler:v1.36.2",
+				ComponentProxy:             "registry.k8s.io/kube-proxy:v1.36.2",
 				ComponentKubelet:           "ghcr.io/siderolabs/kubelet:v1.36.2",
 			}
 			if len(got) != len(want) {
@@ -185,8 +186,8 @@ func TestWithKubernetesImage(t *testing.T) {
 	}
 
 	raw := generated(t, config.TalosVersion1_14, machine.TypeWorker)
-	if _, err := WithKubernetesImage(raw, "kube-proxy", "registry.k8s.io/kube-proxy:v1.37.1"); err == nil {
-		t.Fatal("only the components an upgrade takes in order are patched")
+	if _, err := WithKubernetesImage(raw, "etcd", "registry.k8s.io/etcd:v3.6.0"); err == nil {
+		t.Fatal("only the components of a Kubernetes version are patched")
 	}
 
 	// An error never quotes the config: it holds the cluster's keys.
@@ -414,17 +415,20 @@ func TestUpgraderPullsKubernetesImagesToWhereTheyRun(t *testing.T) {
 	u := &machineryUpgrader{*reader(c)}
 	ctx := context.Background()
 
-	for _, component := range KubernetesComponents {
+	// Everything Talos runs from a node's config. kube-proxy is not: see below.
+	runs := []string{ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentKubelet}
+
+	for _, component := range runs {
 		if err := u.PullKubernetesImage(ctx, apiNode, component, "registry.example.com/"+component+":v1.37.1"); err != nil {
 			t.Fatalf("%s: %v", component, err)
 		}
 	}
 
-	if len(api.pulls) != len(KubernetesComponents) {
+	if len(api.pulls) != len(runs) {
 		t.Fatalf("pulls: %+v", api.pulls)
 	}
 
-	for i, component := range KubernetesComponents {
+	for i, component := range runs {
 		got := api.pulls[i]
 		driver, namespace := common.ContainerDriver_CRI, common.ContainerdNamespace_NS_CRI
 
@@ -438,8 +442,8 @@ func TestUpgraderPullsKubernetesImagesToWhereTheyRun(t *testing.T) {
 		}
 	}
 
-	err := u.PullKubernetesImage(ctx, apiNode, "kube-proxy", "registry.k8s.io/kube-proxy:v1.37.1")
-	if err == nil || len(api.pulls) != len(KubernetesComponents) {
+	err := u.PullKubernetesImage(ctx, apiNode, ComponentProxy, "registry.k8s.io/kube-proxy:v1.37.1")
+	if err == nil || len(api.pulls) != len(runs) {
 		t.Fatal("what Talos does not run from a node's config is not pulled")
 	}
 }

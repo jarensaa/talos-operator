@@ -275,7 +275,7 @@ func TestClassifyKubernetesVersion(t *testing.T) {
 	}{
 		{"a control plane", renderedAt(t, bundle, controlPlane, "1.36.2"), renderedAt(t, bundle, controlPlane, "1.37.0"), classify.Kubernetes,
 			[]string{"v1alpha1/KubeAPIServerConfig: image", "v1alpha1/KubeControllerManagerConfig: image",
-				"v1alpha1/KubeSchedulerConfig: image", kubeletImage}},
+				"v1alpha1/KubeProxyConfig: image", "v1alpha1/KubeSchedulerConfig: image", kubeletImage}},
 		{"a worker", renderedAt(t, bundle, worker, "1.36.2"), renderedAt(t, bundle, worker, "1.37.0"), classify.Kubernetes,
 			[]string{kubeletImage}},
 		{"a patch release", renderedAt(t, bundle, worker, "1.37.0"), renderedAt(t, bundle, worker, "1.37.1"), classify.Kubernetes,

@@ -36,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -2197,6 +2198,10 @@ var _ = Describe("Config rollout", func() {
 							running[key] = image
 						}
 
+						if !plan.Runs(component) {
+							continue
+						}
+
 						if component == plan.ComponentKubelet {
 							version, _ := plan.VersionOf(running[key])
 
@@ -2253,7 +2258,7 @@ var _ = Describe("Config rollout", func() {
 			Expect(operation().Target).To(Equal(patch))
 			Expect(operation().Plan).To(Equal([]string{
 				"kube-apiserver/" + cp1Machine, "kube-controller-manager/" + cp1Machine, "kube-scheduler/" + cp1Machine,
-				"kubelet/" + cp1Machine, "kubelet/" + worker1, "kubelet/" + worker2,
+				"kube-proxy/" + cp1Machine, "kubelet/" + cp1Machine, "kubelet/" + worker1, "kubelet/" + worker2,
 			}))
 			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonUpgrading))
 
@@ -2273,9 +2278,12 @@ var _ = Describe("Config rollout", func() {
 				cp1Machine + " registry.k8s.io/kube-scheduler:v" + patch,
 				cp1Machine + " " + kubelet + patch, worker1 + " " + kubelet + patch, worker2 + " " + kubelet + patch,
 			}))
-			Expect(applies()[:12]).To(Equal([]string{
+			// Five changes of the control plane's config, the kube-proxy image among them, for which
+			// nothing is pulled; then one for each worker's kubelet.
+			Expect(applies()).To(Equal([]string{
 				tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine),
-				tried(cp1Machine), confirmed(cp1Machine), tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2),
+				tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine),
+				tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2),
 			}))
 
 			for _, n := range rolloutNodes {
@@ -2286,13 +2294,11 @@ var _ = Describe("Config rollout", func() {
 				Expect(scenario.TryPending(n.addr)).To(BeFalse())
 			}
 
-			// What is left is what the upgrade does not own: the kube-proxy image of the control
-			// plane's config, which a config rollout brings in line.
+			// Nothing is left for a config rollout: every image the version names is the upgrade's.
 			runUntil("everything settles", settled)
 			Expect(upToDate().Message).To(ContainSubstring("all 3 nodes"))
 			Expect(applies()).To(HaveLen(14))
-			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationConfigRollout))
-			Expect(tc.Status.History[0].Completed).To(Equal([]string{cp1Machine}))
+			Expect(tc.Status.History).To(HaveLen(1))
 			Expect(drain(recorder)).To(ContainElement(ContainSubstring("KubernetesUpgradeStarted")))
 		})
 
@@ -2303,12 +2309,52 @@ var _ = Describe("Config rollout", func() {
 			Expect(upToDate().Status).To(Equal(metav1.ConditionFalse))
 			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonUpgradesDisabled))
 			Expect(upToDate().Message).To(ContainSubstring(cp1Machine))
-			// And no config rollout applies the images behind the upgrade's back.
-			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonAwaitingKubernetesUpgrade))
 			Expect(operation()).To(BeNil())
-			Expect(applies()).To(BeEmpty())
 			Expect(pulled()).To(BeEmpty())
-			Expect(getMachine(worker1).Status.Config.ChangeClass).To(Equal("Kubernetes"))
+
+			// And no config rollout applies the images behind the upgrade's back.
+			Expect(applies()).To(BeEmpty())
+
+			for _, n := range rolloutNodes {
+				for component, image := range imagesOf(n.machine) {
+					Expect(image).To(HaveSuffix(":v"+kubernetesVersion), "%s on %s", component, n.machine)
+				}
+			}
+
+			Expect(inSync().Status).To(Equal(metav1.ConditionTrue), inSync().Message)
+			matches := apimeta.FindStatusCondition(getMachine(worker1).Status.Conditions, talosv1alpha1.ConditionConfigMatchesLive)
+			Expect(matches.Status).To(Equal(metav1.ConditionTrue))
+			Expect(matches.Message).To(ContainSubstring("apart from the Kubernetes version"), "a machine says what its comparison leaves out")
+		})
+
+		// What stands in the way of an upgrade is often something in the config: a flag the new
+		// version removed. Taking it out is a config change, and must not wait for the upgrade
+		// that waits for it.
+		It("rolls out a config change while the upgrade is refused, without touching the images", func() {
+			scenario.SetRemovedInKubernetes(patch, "kubelet on 10.5.0.3 is started with --container-hints, which the new version removed")
+			upgradeKubernetes(patch)
+			advance(time.Minute)
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(applies()).To(BeEmpty())
+
+			setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+			runUntil("the config change is rolled out", func() bool { return idle() && len(tc.Status.History) == 1 })
+
+			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationConfigRollout))
+			Expect(tc.Status.History[0].Completed).To(Equal([]string{worker1, worker2}))
+			Expect(string(scenario.Node(workerAddr).Config.Active)).To(ContainSubstring("rollout: one"))
+			Expect(imagesOf(worker1)[plan.ComponentKubelet]).To(HaveSuffix(":v"+kubernetesVersion), "the image is not a config rollout's to change")
+			Expect(pulled()).To(BeEmpty())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible), "and the upgrade is still refused")
+
+			// With the way cleared, the upgrade goes ahead, and keeps what the rollout applied.
+			scenario.SetRemovedInKubernetes(patch)
+			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+			Expect(kubernetesOperations()[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+			Expect(imagesOf(worker1)[plan.ComponentKubelet]).To(HaveSuffix(":v" + patch))
+			Expect(string(scenario.Node(workerAddr).Config.Active)).To(ContainSubstring("rollout: one"))
+
+			runUntil("everything settles", settled)
 		})
 
 		It("refuses a version the nodes' Talos does not run, before any node is touched, and says which to upgrade first", func() {
