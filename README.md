@@ -136,16 +136,17 @@ kubectl -n talos-operator describe taloscluster my-cluster
 
 From `Adopted` on the operator never writes to these resources again. They are yours, and there is no way back to `Adopting`.
 
-You can leave them in the cluster and edit them with `kubectl`. To manage them from Git, take them from the ConfigMap the operator keeps for this, which holds them without status or other noise:
+You can leave them in the cluster and edit them with `kubectl`. To manage them from Git, export them and strip what the API server added (this uses [yq](https://github.com/mikefarah/yq)):
 
 ```bash
-for f in taloscluster talosmachinepools talosmachines; do
-  kubectl -n talos-operator get configmap my-cluster-adoption-proposal \
-    -o jsonpath="{.data.$f\.yaml}" > "$f.yaml"
-done
+kubectl -n talos-operator get talosclusters,talosmachinepools,talosmachines -o yaml \
+  | yq '.items[] | del(.status) | .metadata |= pick(["name", "namespace", "labels", "annotations"]) | split_doc' \
+  > my-cluster.yaml
 ```
 
-Commit the files and point your GitOps tool at them. Any tool works; a Flux Kustomization, for instance, takes the existing objects over as they are.
+Commit the file and point your GitOps tool at it. Any tool works; a Flux Kustomization, for instance, takes the existing objects over as they are.
+
+Leave the two Secrets where they are. They hold the cluster's keys and do not belong in Git unencrypted, and the operator does not need them delivered from outside.
 
 ### 6. Switch management on
 
