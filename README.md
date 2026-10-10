@@ -108,7 +108,7 @@ EOF
 
 The operator reads every node and writes down what it finds:
 
-- one `TalosMachinePool` per role, with the config its nodes share;
+- two `TalosMachinePool`s, `my-cluster-control-plane` and `my-cluster-workers`, each with the config its nodes share (a cluster without workers gets only the first);
 - one `TalosMachine` per node, named after the node and pinned to its hardware UUID;
 - the versions, the endpoint and the config every node shares, in the `TalosCluster`'s own spec, where you left them empty;
 - two Secrets: the cluster's secrets bundle, and a backup of every node's config as it was.
