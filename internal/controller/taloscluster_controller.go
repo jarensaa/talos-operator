@@ -744,8 +744,7 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 
 		switch {
 		case is.Failure != nil && (was.Failure == nil || was.Failure.Token != is.Failure.Token):
-			warning(kind+"Halted", "%s, step %s (%s): %s %s",
-				is.Failure.Machine, is.Failure.Step, is.Failure.Reason, is.Failure.Message, is.Failure.Remediation)
+			warning(kind+"Halted", "%s: %s %s", haltedAt(is.Failure), is.Failure.Message, is.Failure.Remediation)
 		case is.Failure == nil && was.Failure != nil:
 			normal(kind+"Resumed", "%s %s continues after %s", is.Type, is.ID, was.Failure.Reason)
 		}

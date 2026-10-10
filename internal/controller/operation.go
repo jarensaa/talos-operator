@@ -229,6 +229,16 @@ func (r *TalosClusterReconciler) actOnHookFailure(tc *talosv1alpha1.TalosCluster
 	return nil
 }
 
+// haltedAt says where a failure halted an operation: at a machine's step, or at a hook of the
+// operation as a whole, which has no machine.
+func haltedAt(f *talosv1alpha1.OperationFailure) string {
+	if f.Machine == "" {
+		return fmt.Sprintf("at %s (%s)", f.Step, f.Reason)
+	}
+
+	return fmt.Sprintf("at %s, step %s (%s)", f.Machine, f.Step, f.Reason)
+}
+
 // progressOf describes where the operation in flight stands, for a condition. note is what it
 // waits for, if anything.
 func progressOf(op *talosv1alpha1.Operation, note string) string {

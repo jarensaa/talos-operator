@@ -410,7 +410,7 @@ func reportOperation(tc *talosv1alpha1.TalosCluster, obs observation, note strin
 	}
 
 	if f := op.Failure; f != nil {
-		msg := fmt.Sprintf("the rollout halted at %s, step %s (%s): %s", f.Machine, f.Step, f.Reason, f.Message)
+		msg := fmt.Sprintf("the rollout halted %s: %s", haltedAt(f), f.Message)
 
 		setCondition(st, gen, talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonOperationFailed, msg)
 		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed,

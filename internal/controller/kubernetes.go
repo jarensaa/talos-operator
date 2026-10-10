@@ -389,7 +389,7 @@ func reportKubernetesOperation(tc *talosv1alpha1.TalosCluster, obs observation, 
 	}
 
 	if f := op.Failure; f != nil {
-		msg := fmt.Sprintf("the upgrade to Kubernetes %s halted at %s, step %s (%s): %s", op.Target, f.Machine, f.Step, f.Reason, f.Message)
+		msg := fmt.Sprintf("the upgrade to Kubernetes %s halted %s: %s", op.Target, haltedAt(f), f.Message)
 		setCondition(st, gen, talosv1alpha1.ConditionKubernetesUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonOperationFailed, msg)
 		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed,
 			msg+" "+f.Remediation)
