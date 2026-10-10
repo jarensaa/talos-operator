@@ -1729,6 +1729,33 @@ var _ = Describe("Config rollout", func() {
 				Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}))
 			})
 
+			It("begins no other node while the gate is closed, and halts when it stays closed", func() {
+				storage(healthy)
+
+				// The gate closes the moment the first node is done.
+				kubelets = func() {
+					GinkgoHelper()
+
+					if slices.Contains(applies(), confirmed(worker1)) {
+						storage(degraded)
+					}
+				}
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the first node is done", func() bool { return started() && len(operation().Completed) == 1 })
+				advance(time.Minute)
+
+				Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1)}), "nothing is sent to a node behind a closed gate")
+				Expect(inSync().Message).To(ContainSubstring("gate storage-healthy"))
+				Expect(failed()).To(BeFalse())
+
+				// Like the cluster's own health: a wait for it is bounded, and ends in a halt.
+				runUntil("the wait for the gate runs out", failed)
+				Expect(operation().Failure.Reason).To(Equal(plan.FailTimeout))
+				Expect(operation().Failure.Message).To(ContainSubstring("gate storage-healthy"))
+				Expect(applies()).To(HaveLen(2))
+			})
+
 			It("lets Talos take a config back when the gate stays closed for the whole try", func() {
 				storage(healthy)
 				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
@@ -2510,6 +2537,28 @@ var _ = Describe("Config rollout", func() {
 
 			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Paused = false })
 			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+		})
+
+		It("pulls nothing while paused, and does not count the pause against the turn", func() {
+			// The first pull does not get through, so the turn is still at its beginning when the
+			// pause comes.
+			scenario.FailNext(fake.MethodKubernetesImagePull, cpAddr, status.Error(codes.Unavailable, "connection refused"))
+			upgradeKubernetes(patch)
+			runUntil("the first turn begins", turnIs(plan.ComponentAPIServer, cp1Machine, plan.StepPulling))
+
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Paused = true })
+			scenario.FailNext(fake.MethodKubernetesImagePull, cpAddr, nil)
+			tries := len(scenario.CallsFor(fake.MethodKubernetesImagePull))
+			advance(time.Hour)
+
+			Expect(scenario.CallsFor(fake.MethodKubernetesImagePull)).To(HaveLen(tries), "a paused upgrade asks nothing of a node")
+			Expect(applies()).To(BeEmpty())
+			Expect(failed()).To(BeFalse(), "a pause is not a timeout")
+			Expect(operation().Current).To(BeNil(), "the turn is dropped, and begins again later")
+
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Paused = false })
+			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+			Expect(kubernetesOperations()[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
 		})
 
 		It("does not start on a cluster that is not healthy", func() {

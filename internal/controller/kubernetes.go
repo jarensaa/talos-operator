@@ -572,7 +572,7 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 		return hold.Reason, nil
 	}
 
-	pre := plan.TouchGate(passOf(obs), v.hostname()).And(obs.policy.Gates())
+	pre := hold.And(plan.TouchGate(passOf(obs), v.hostname())).And(obs.policy.Gates())
 	if v.tm == nil {
 		pre = plan.Gate{Reason: "the TalosMachine no longer exists"}
 	}
