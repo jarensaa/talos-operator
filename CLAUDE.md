@@ -116,7 +116,7 @@ make manifests        # CRDs + RBAC; also syncs them and config/admission into c
 make helm-lint        # chart lint
 ```
 
-e2e runs in CI (`.github/workflows/e2e.yml`) against a QEMU Talos cluster; see docs/dev/e2e.md. e2e tests must be named `TestE2E*` and carry the `e2e` build tag.
+e2e runs in CI (`.github/workflows/e2e.yml`) against a QEMU Talos cluster; see docs/dev/e2e.md. e2e tests must be named `TestE2E*` and carry the `e2e` build tag. A pull request's check has one control plane and one worker. A change to how control planes are handled (rollout order and gates, upgrades, etcd membership, adding or removing one) must also be shown on three: `gh workflow run e2e.yml --ref <branch> -f controlplanes=3 -f workers=1`, with the run linked in the pull request. A spec that needs several control planes skips on a smaller cluster and says why.
 
 CI Go setup goes through `.github/actions/setup-go`, which restores the newest build cache saved from `main` (only the "Unit and envtest" job saves it, via `.github/actions/save-go-cache`). Do not re-enable setup-go's own cache: its single go.sum key freezes the build cache. Caches are written from `main` only, never from pull requests (a PR's cache is visible to that PR alone), and saves prune the entries they supersede (`.github/actions/prune-caches`). The image is built from binaries cross-compiled on the host (`make build-image-binaries`); the Dockerfile only packages them, so never compile inside Docker or add a BuildKit layer cache. Local runs are optional: `make e2e-cluster-up` / `make test-e2e` / `make e2e-cluster-down`, which prompt for sudo on macOS. Docker-based Talos clusters do not work for Talos 1.14 on Docker Desktop.
 
