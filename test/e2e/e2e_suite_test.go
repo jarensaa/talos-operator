@@ -23,6 +23,7 @@ package e2e
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -180,75 +181,118 @@ func metricsToken(ctx context.Context) string {
 
 // operatorCounter sums a counter over every replica, read from each pod's own metrics endpoint.
 // A replica counts from its start, so this is what the replicas running now have counted.
+//
+// It waits for every replica to be ready and reads again when a read fails. The scenarios take
+// nodes away and restart the API server; a pod can be Running, on a node that just came back,
+// before its endpoint answers, and a read that fails then says nothing about the counter.
 func operatorCounter(ctx context.Context, name string) float64 {
 	GinkgoHelper()
 
 	token := metricsToken(ctx)
 
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	Expect(err).NotTo(HaveOccurred())
-
-	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
-	Expect(err).NotTo(HaveOccurred())
-
 	var total float64
 
-	for _, pod := range operatorPods(ctx, Default) {
-		if pod.Status.Phase != corev1.PodRunning {
-			continue
+	Eventually(func(g Gomega) {
+		deployment := &appsv1.Deployment{}
+		g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNamespace, Name: operatorName}, deployment)).To(Succeed())
+		g.Expect(deployment.Status.ReadyReplicas).To(Equal(*deployment.Spec.Replicas), "every replica must be ready to be asked")
+
+		sum := 0.0
+
+		for _, pod := range operatorPods(ctx, g) {
+			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+				continue
+			}
+
+			value, err := scrapePod(ctx, &pod, token, name)
+			g.Expect(err).NotTo(HaveOccurred(), "metrics of %s", pod.Name)
+
+			sum += value
 		}
 
-		url := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(pod.Namespace).Name(pod.Name).
-			SubResource("portforward").URL()
-		stop, ready := make(chan struct{}), make(chan struct{})
-
-		forwarder, err := portforward.New(spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, url),
-			[]string{"0:8443"}, stop, ready, io.Discard, io.Discard)
-		Expect(err).NotTo(HaveOccurred())
-
-		failed := make(chan error, 1)
-		go func() { failed <- forwarder.ForwardPorts() }()
-
-		select {
-		case <-ready:
-		case err := <-failed:
-			Fail(fmt.Sprintf("port-forward to %s: %v", pod.Name, err))
-		case <-ctx.Done():
-			Fail("port-forward to " + pod.Name + " did not become ready")
-		}
-
-		ports, err := forwarder.GetPorts()
-		Expect(err).NotTo(HaveOccurred())
-
-		total += scrape(ctx, fmt.Sprintf("https://127.0.0.1:%d/metrics", ports[0].Local), token, name)
-
-		close(stop)
-	}
+		total = sum
+	}).WithContext(ctx).WithTimeout(5 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 
 	return total
 }
 
-func scrape(ctx context.Context, url, token, name string) float64 {
-	GinkgoHelper()
+// scrapePod reads a counter from one pod's metrics endpoint, through a port-forward to the pod.
+func scrapePod(ctx context.Context, pod *corev1.Pod, token, name string) (float64, error) {
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return 0, err
+	}
+
+	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
+	if err != nil {
+		return 0, err
+	}
+
+	url := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(pod.Namespace).Name(pod.Name).
+		SubResource("portforward").URL()
+	stop, ready := make(chan struct{}), make(chan struct{})
+
+	defer close(stop)
+
+	forwarder, err := portforward.New(spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, url),
+		[]string{"0:8443"}, stop, ready, io.Discard, io.Discard)
+	if err != nil {
+		return 0, err
+	}
+
+	failed := make(chan error, 1)
+	go func() { failed <- forwarder.ForwardPorts() }()
+
+	select {
+	case <-ready:
+	case err := <-failed:
+		return 0, fmt.Errorf("port-forward: %w", err)
+	case <-time.After(30 * time.Second):
+		return 0, errors.New("port-forward did not become ready")
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+
+	ports, err := forwarder.GetPorts()
+	if err != nil {
+		return 0, err
+	}
+
+	return scrape(ctx, fmt.Sprintf("https://127.0.0.1:%d/metrics", ports[0].Local), token, name)
+}
+
+// scrape reads a counter from a metrics endpoint as a reader the Kubernetes API authorizes.
+func scrape(ctx context.Context, url, token, name string) (float64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	Expect(err).NotTo(HaveOccurred())
+	if err != nil {
+		return 0, err
+	}
+
 	req.Header.Set("Authorization", "Bearer "+token)
 
 	// The endpoint's certificate is the pod's own self-signed one; the forwarded port is the pod.
 	scraper := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // see above
 
 	resp, err := scraper.Do(req)
-	Expect(err).NotTo(HaveOccurred())
+	if err != nil {
+		return 0, err
+	}
 
 	defer resp.Body.Close() //nolint:errcheck // a read-only response body
 
-	Expect(resp.StatusCode).To(Equal(http.StatusOK), "the metrics endpoint must serve an authorized reader")
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("the metrics endpoint must serve an authorized reader, and answered %s", resp.Status)
+	}
 
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 
 	families, err := parser.TextToMetricFamilies(resp.Body)
-	Expect(err).NotTo(HaveOccurred())
+	if err != nil {
+		return 0, err
+	}
 
 	var total float64
 
@@ -258,7 +302,7 @@ func scrape(ctx context.Context, url, token, name string) float64 {
 		}
 	}
 
-	return total
+	return total, nil
 }
 
 // createCredentialsSecret stores the e2e cluster's admin talosconfig as the operator expects it.
