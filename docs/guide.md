@@ -130,6 +130,62 @@ If someone changes a node's config outside the operator, `ConfigInSync` goes fal
 - Once a config is confirmed, it stays until the spec changes. If it breaks a node hours later, revert the spec: the operator starts with the unhealthy node and puts its previous config back. That works while it is the only unhealthy node and its Talos API still answers. If the config broke several nodes, the operator touches none of them.
 - A cluster with one control plane has no other node to check that control plane through.
 
+## Upgrading Talos
+
+Set `management.upgrades` to `Enabled` and change `versions.talos`, or the schematic of the cluster's or a pool's installer. The API server refuses `upgrades: Enabled` unless `config` is `Manage`.
+
+Without `upgrades: Enabled` the operator only says what is behind: `TalosUpToDate` is false with reason `UpgradesDisabled`, and the config rollout waits with `AwaitingUpgrade`, because the config now names an installer the nodes don't run.
+
+### What happens to a node
+
+One node at a time, workers first; the etcd leader and the node the operator itself runs on go last in their group.
+
+1. The installer image is pulled to the node and the new system is written to its inactive boot slot. The node keeps running what it runs. Nothing has been taken from the cluster yet.
+2. The node is cordoned and its pods are evicted. Evictions respect PodDisruptionBudgets. Static pods and DaemonSet pods stay.
+3. A control plane hands off etcd leadership. The node reboots.
+4. The operator waits for it to come back on the new system, running and ready.
+5. Once Kubernetes reports the node Ready it is uncordoned, and the whole cluster has to stay healthy for `soak` before the next node begins.
+
+When every node is done, a config rollout follows on its own and brings each node's config in line with the installer it now runs. That rollout reboots nothing.
+
+```bash
+kubectl -n talos-operator get taloscluster my-cluster -o jsonpath='{.status.operation}' | jq
+kubectl -n talos-operator describe taloscluster my-cluster   # TalosUpToDate carries the progress
+```
+
+### What is refused before any node is touched
+
+`TalosUpToDate` is false with reason `Incompatible`, and says which of these it is:
+
+- a version this operator doesn't support: older than 1.13, or newer than the Talos it was built for;
+- a downgrade;
+- a jump Talos doesn't allow in one step;
+- a Kubernetes version the new Talos release doesn't run. Upgrade Kubernetes first then.
+
+### When a node doesn't come through
+
+The upgrade halts, no other node is touched, and `status.operation.failure` says what happened. The annotations are the same three as for a config change (`retry`, `skip-machine`, `abort`), each with the failure's token.
+
+| Reason | What it means | State of the node |
+|---|---|---|
+| `ImagePullFailed` | The installer image couldn't be pulled. Check that it exists: the schematic, and the version. | Unchanged. |
+| `InstallFailed` | The installer ran and failed. | Unchanged; it runs what it ran. |
+| `DrainTimeout` | Pods were still on the node after `drainTimeout` (10m). A disruption budget that never lets a pod go ends here. | Cordoned, not rebooted. |
+| `FellBack` | The node rebooted and is running, but on the system it had before. Talos does that by itself when the new one doesn't boot. Its console says why. | Cordoned, on the old system. |
+| `Timeout` | A wait ran out: the cluster didn't get healthy, the node didn't come back, or Kubernetes never called it Ready. | Depends on the step; the message says. |
+
+A node the operator cordoned stays cordoned through a failure, and through a skip or an abort: it didn't come back as expected, so it isn't handed back to the scheduler without someone looking. A retry picks it up where the node is now and uncordons it at the end.
+
+After a skip or an abort the operator doesn't come back with the same installer for those machines. Ask for another version, or the one the nodes run, and it starts afresh.
+
+### Limits to know about
+
+- **One control plane means downtime.** While that node reboots there is no Kubernetes API. The upgrade carries on when it is back.
+- **Two control planes can't be upgraded.** With two etcd members, taking either down loses quorum, so the operator refuses to reboot one. Run one or three.
+- **Workers go one at a time.**
+- **Only the installer image is upgraded.** A change that only a fresh install can make (kernel arguments, the install disk, disk encryption) stays refused, with reason `RequiresReinstall`.
+- **Pausing** (`spec.paused`) leaves alone a node nothing was taken from. A node that is already cordoned is finished.
+
 ## Backing out
 
 Set `config` back to `Observe` and the operator stops writing to your nodes at once. A rollout in flight ends there; a config that was being tried is reverted by Talos when its window ends.

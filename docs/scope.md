@@ -130,7 +130,7 @@ Self-hosted on a 3-CP-only cluster means the operator will drain and reboot its 
 - **Every step is persisted before its side effect** (CACPPT's "annotate before etcd-leave" pattern). Example: `status.operation.step = Draining(node-2)` is written before the drain starts. If the leader is evicted, the standby resumes at that step.
 - **Steps are keyed on observed facts, not memory.** A reboot step stores the pre-reboot boot ID. On resume, a changed boot ID means "reboot happened".
 - **Talos calls are never routed through the target node.** `WithEndpoints` uses the IPs of healthy non-target CPs, and `client.WithNode(target)` reaches the target through apid proxying. Endpoints are re-resolved after every reboot.
-- **The node hosting the current leader is upgraded last** in a rollout. This minimises failovers; it is not required for correctness.
+- **The node hosting the current leader is upgraded last** in its group. This minimises failovers; it is not required for correctness.
 
 What self-hosted cannot do: recover from quorum loss, or bootstrap the cluster it lives in. Both remain out-of-band (talosctl + the existing runbook) and are documented, not automated.
 
@@ -224,6 +224,7 @@ spec:
     tryTimeout: 5m                    # how long Talos keeps a tried config before reverting it (§8.5.1)
     soak: 2m                          # how long a node must stay healthy before its config is confirmed
     stepTimeout: 10m                  # every other wait of a node step; a timeout is a failure
+    drainTimeout: 10m                 # how long an upgrade waits for a node's pods to be evicted (§7.3)
     maintenanceWindows:               # empty = always allowed
       - { schedule: "0 2 * * *", duration: 3h, timeZone: Europe/Oslo }
     drainTimeout: 10m
@@ -246,7 +247,7 @@ spec:
 
 status:
   phase: Adopting | Adopted | Managed | Degraded   # only moves forward (§12.14)
-  conditions:                         # ResourcesDerived, ConfigProven, ConfigHandover, ConfigInSync, Healthy, RolloutBlocked, ...
+  conditions:                         # ResourcesDerived, ConfigProven, ConfigHandover, ConfigInSync, TalosUpToDate, Healthy, RolloutBlocked, ...
   observed:
     talosVersions: { v1.14.0: 3 }
     kubernetesVersion: 1.37.0
@@ -263,11 +264,14 @@ status:
   operation:                          # THE disruption lock; at most one at a time
     id: 3f1c…
     type: TalosUpgrade                # ConfigRollout | TalosUpgrade | KubernetesUpgrade | AddControlPlane | RemoveMachine | Bootstrap
-    target: v1.14.2                   # for a ConfigRollout: the hash of the change (§6.3)
+    target: 9c1e…                     # the hash of the change: which machines go from what to what (§6.3, §7.3)
     plan: [talos-cp-2, talos-cp-3, talos-cp-1]
     targets: { talos-cp-2: sha256:… } # ConfigRollout: the rendered config each machine is to reach,
     bases: { talos-cp-2: sha256:… }   #   and the live config it had when the rollout was planned
-    current: { machine: talos-cp-3, step: Rebooting, preRebootBootID: …, since: … }
+                                      # TalosUpgrade: targets holds the installer image for each machine
+    current: { machine: talos-cp-3, step: Rebooting, image: …, cordoned: true, preRebootBootID: …, since: … }
+                                      # TalosUpgrade: step Pulling | Installing | Draining | Rebooting | Booting |
+                                      #   Uncordoning | Verifying (§7.3)
                                       # ConfigRollout: step Trying | Verifying | Confirming | RollingBack,
                                       #   with class, previousHash, desiredHash, deadline, healthySince, attempt
     completed: [talos-cp-2]
@@ -276,6 +280,7 @@ status:
                                       #   message, remediation, token
   approval: { hash: 9c1e…, machines: [ … ] }   # a change waiting for a human (§6.3)
   abortedTargets: {}                  # what an aborted rollout was applying; not started again (§8.3)
+  upgrades: { skipped: {}, aborted: {} }   # machine -> installer image a human took out of an upgrade (§7.3)
   history: []                         # the last 10 operations: outcome Succeeded | Aborted | Superseded
 ```
 
@@ -425,7 +430,8 @@ Implemented in `internal/classify` (what kind of change), `internal/plan` (what 
 | Class | Examples | What happens |
 |-------|----------|--------------|
 | Protected | `machine.ca`, `cluster.etcd.ca`, K8s/aggregator/SA CA docs, `KubeEtcdEncryptionConfig`, `DiscoveryIdentityConfig`, tokens, `KubeClusterConfig`, `HostnameConfig`, `machine.type` | **Blocked** (`RolloutBlocked=ProtectedChange`). Only an explicit, future rotation workflow may change these. |
-| Boot-time | installer image / schematic (`UnattendedInstallConfig`), kernel args, system disk encryption | **Blocked** (`RequiresReinstall`) until M4: it becomes a reinstall (upgrade to the same version with the new installer image, §7.3). |
+| Installer | the installer image alone: another Talos version, or another schematic | **Blocked** (`AwaitingUpgrade`) while the node runs something else: an upgrade brings it about (§7.3). Applied like any other change once the node runs what the image installs. |
+| Boot-time | everything else only an install can change: the install disk, kernel args, system disk encryption | **Blocked** (`RequiresReinstall`). The operator does not reinstall a node for these. |
 | Unknown | any document kind or field the classifier has no rule for | Requires approval, so a kind Talos adds later is never treated as safe by default. |
 | Storage | `VolumeConfig`, `UserVolumeConfig`, `RawVolumeConfig`, LVM, RAID | Requires approval. |
 | Connectivity | `BondConfig`, `LinkConfig`, `VLANConfig`, `DHCPv*Config`, resolvers, routes, firewall rules, `KubePrismConfig`, `DiscoveryServiceConfig` | Applied. |
@@ -585,37 +591,49 @@ The flow is: the user edits config (on the cluster, a pool, a machine or a share
 
 ### 7.3 Talos OS upgrade (R2)
 
-The trigger is a change to `spec.versions.talos`, or to the effective schematic of any machine (a reinstall).
+An upgrade is due when a node does not run the Talos version in `spec.versions.talos`, or was not installed from the schematic its spec asks for (the cluster's, or its pool's own). It needs `management.upgrades: Enabled`. Without it the operator only reports what is behind (`TalosUpToDate=False`, `UpgradesDisabled`).
 
-**Pre-rollout checks**
-1. `compatibility.ParseTalosVersion(target).UpgradeableFrom(current)` for every node. Talos allows skipping minors when its table permits, e.g. 1.12→1.14.
-2. `KubernetesVersion(current k8s).SupportedWith(target Talos)`. If this fails, the Kubernetes upgrade must happen first, so block with a clear message.
-3. The target must be within the operator's supported Talos range.
-4. Resolve each node's installer as `<factory>/<platform>-installer/<schematic>:<target>`. Verify the schematic exists for that version. **Never** fall back to a vanilla image; that would silently drop extensions.
+**The system first, its config second.** An upgrade changes what a node runs, not its config. The config also names the installer, and so differs from what the node has once the spec changes; that difference is a class of its own (`Installer`, §6.3). A config rollout refuses it while the node runs something else (`AwaitingUpgrade`) and applies it like any other change once the node runs what it names. So a version change is two operations, one after the other: the upgrade of every node, then a config rollout that brings every node's config in line. The second reboots nothing.
 
-**Plan.** Workers first (configurable parallelism, default 1), then CPs strictly one at a time. The CP hosting the operator leader and the etcd leader go last.
+**Refused up front** (`talos.UpgradeProblem`; `TalosUpToDate=False`, `Incompatible`), before any node is touched:
+1. A target outside the operator's supported Talos range.
+2. A downgrade. Talos allows some, but a downgraded node may not understand the config it has, and nothing here can prove that it does.
+3. A jump Talos does not allow: `compatibility.ParseTalosVersion(target).UpgradeableFrom(current)`. Talos allows skipping minors when its table permits, for instance 1.12 to 1.14.
+4. A Kubernetes version the target does not run: `KubernetesVersion(current).SupportedWith(target)`. The Kubernetes upgrade then has to come first.
 
-**Per-node state machine**
-(each step is persisted first and is idempotent on resume)
+An installer image that does not exist is found at the first node's pull, which is before anything on any node changed. The node is where the answer is: it pulls through its own registry configuration, and the operator may not be able to reach the registry at all.
 
-```
-Gate        cluster health (ClusterService.HealthCheck, excluding "schedulable" check) + custom gates;
-            for CP: EtcdMemberList: not exactly 2 members, all started, no learners; EtcdStatus per member OK;
-            all other CPs Ready.  (Re-implements the guard LifecycleService dropped.)
-PreHook     optional Jobs (e.g. ceph osd set noout)
-Pull        ImageService.Pull(installer)  — before cordon, so drain time is not spent pulling
-Install     LifecycleService.Upgrade(installer) → require exit_code == 0
-            (failure here is harmless: node still runs old version; mark failed, halt)
-Drain       cordon + go-kubernetes nodedrain (PDB-respecting) with drainTimeout; on timeout → halt, leave cordoned
-Leadership  CP only: EtcdForfeitLeadership if leader
-Reboot      record bootID; MachineService.Reboot(DEFAULT)
-WaitBoot    BootID changed AND MachineStatus Running+Ready AND Version == target AND schematic == expected
-            (version/schematic mismatch = A/B auto-rollback happened → halt, do NOT retry)
-Uncordon    wait for Node Ready, then uncordon
-PostGate    same gates as Gate; PostHook
-```
+**Plan** (`plan.PlanUpgrade`). One node at a time. A machine whose node is unhealthy first, for the reason a config rollout has (§6.3). Then workers before control planes. Within a group the etcd leader and the node the operator itself runs on go last: each is a handover that upgrading that node costs, and neither is needed more than once.
 
-The operator never sets `force`. It never writes Talos-owned META keys, which 1.14 rejects (see Omni #3355). It never drains through talosctl as well as itself; tuppr #575 was a double-drain bug.
+**The gate before a node is taken down** (`plan.RebootGate`) is the gate of a config rollout (§6.3), and for a control plane also the guard Talos's own upgrade path dropped (§3.2): etcd must not have exactly two members. With two, losing either loses quorum. With one there is no quorum to protect beyond the node itself, and a cluster with a single control plane is down for the length of that node's reboot. With three or more the others hold quorum, which the gate has already established: every other member is a started voter that reports no errors. A node in the middle of its own upgrade is cordoned, which Talos's cluster-wide checks fail on; like a node that is unhealthy, it is the one node those checks are set aside for, and a cordoned node that is *not* the one being upgraded closes the gate for every other.
+
+**Per-node steps** (`plan.NextUpgradeStep`). Each is persisted before it is acted on, and can be repeated or resumed from what the node says. The order is Talos's own since 1.13 (§3.1): everything before the cordon leaves the node exactly as useful as it was.
+
+| Step | What happens | If it does not work |
+|---|---|---|
+| `Pulling` | Wait for the gate, then `ImageService.Pull` of the installer to the node's system image store. | `ImagePullFailed`. Nothing changed. |
+| `Installing` | `LifecycleService.Upgrade` writes the new system to the inactive boot slot. The installer's exit code arrives as a message on the stream, not as an error of the call. | `InstallFailed`. The node runs what it ran. |
+| `Draining` | Ask the gate again. Record that the node is about to be cordoned, cordon it, then evict its pods through the eviction API, so PodDisruptionBudgets count. Static pods, DaemonSet pods and finished pods stay. | `DrainTimeout` after `drainTimeout` (10m). The node stays cordoned and is not rebooted. |
+| `Rebooting` | Record the boot ID, ask the gate once more, hand off etcd leadership if the node is a control plane, `MachineService.Reboot` in the default, graceful mode. | `Timeout`. |
+| `Booting` | Wait for another boot ID, for the node to be running and ready, and for its version and schematic to be the ones installed. | A node that is back and ready on anything else is `FellBack`: Talos reverts to the previous boot slot by itself when the new one does not come up (§8.5.2). A node that does not come back is `Timeout`. |
+| `Uncordoning` | Once Kubernetes reports the node Ready, uncordon it, if the operator cordoned it. | `Timeout`. The node stays cordoned. |
+| `Verifying` | The whole cluster, this node included, healthy for the soak, as after a config change (§8.5.1). | `Timeout`. |
+
+Rules the planner never breaks, checked over every combination of step, observation, gate and time:
+- a node is not cordoned, and not rebooted, while the gate is closed;
+- a reboot is only asked of a node that still has the recorded boot ID, so a node that rebooted is never rebooted again, whatever became of the pass that asked;
+- a node that came back on anything but the installed system is a failure, never a success;
+- only a cordon the operator set is undone by the operator. A node someone else cordoned is drained as it is and left cordoned.
+
+**Draining is done once, by the operator.** Talos leaves it to the client since 1.13, so nothing drains a second time (tuppr #575 was a double drain). Evictions go out without the Kubernetes client's own retries: a budget that has nothing to give answers 429 with `Retry-After`, and the client would sleep through ten of those, well over a minute per pod, inside a reconcile. The operator's own loop is what asks again.
+
+**Failures** halt the operation as a config rollout's do (§8.3), with the same three annotations. A skip or an abort covers one installer image for the machines concerned (`status.upgrades`) and is spent when the spec asks for another. A retry starts the machine's turn over from what the node runs now, and a cordon the operator set stays its own to undo.
+
+**Pausing** leaves alone a node nothing was taken from yet. A node that is already cordoned is finished: stopping there would leave it out of the cluster.
+
+**The Talos access** is a third kind of connection (`talos.Upgrader`), next to reading and applying config: pull, install to the inactive slot, hand off etcd leadership, reboot, and nothing else. It cannot apply config, install from scratch, reset, roll back, or change etcd membership, and the deprecated `MachineService.Upgrade`, which takes `force`, is not on its list. It is handed out only while `upgrades` is `Enabled`.
+
+Not built: hooks and gates of the user's own (M4c), more than one worker at a time, and reinstalling a node for a change that only an install can make (kernel arguments, the install disk, disk encryption). Those stay refused as `RequiresReinstall`.
 
 ### 7.4 Kubernetes upgrade (R2)
 
@@ -847,6 +865,8 @@ Task beads under a milestone are cut when the milestone starts, for the same rea
 | **M1 Observe** | Read-only status of a cluster and its machines, with writes impossible by construction | v0.1.0 |
 | **M2 Adoption** | Resources that reproduce a running cluster, written by the operator (§12.14), proven by Talos's own dry run to change nothing, then a gated switch to `config: Manage`; pools and shared configs; Talos-issued credentials | v0.2.0, v0.3.0 |
 | **M3 Config management** | Classified config changes rolled out one node at a time, tried and confirmed only after verification from outside; drift reporting and enforcement; fail-closed with retry, skip and abort | v0.4.0 |
+| **M4a Run as deployed** | The e2e tests the chart's image as installed: two replicas, the chart's CRDs, admission policies and permissions; a leader killed in the middle of a rollout is replaced and the rollout finishes | v0.7.0 |
+| **M4b Talos upgrades** | A version or installer change takes every node there, one at a time: installed, drained, rebooted, verified; the operator upgrades the nodes it runs on; the config that names the installer follows (§7.3) | v0.7.0 |
 
 ### What every remaining milestone builds on
 
@@ -858,24 +878,16 @@ Task beads under a milestone are cut when the milestone starts, for the same rea
 
 Not a milestone, and not blocked on one: adopting a real cluster, switching it to `config: Manage`, and rolling out one harmless config change. It needs the adoption runbook. It is the only place the operator meets a real CNI, storage on the nodes and real hardware, so what it turns up feeds every milestone below, and M4 should not be called done on QEMU alone.
 
-### M4 Talos upgrades
+### M4 Rollout policy
 
-Three slices, in this order.
+M4a (run as deployed) and M4b (Talos upgrades) are delivered; §7.3 describes upgrades as built. What is left of M4 is the slice a cluster with storage on its nodes needs before upgrades are safe to use on it.
 
-**M4a: run as deployed.** So far the e2e runs the controllers inside the test process. After this slice the chart's image runs in the test cluster with two replicas, and a rollout that takes down the node its leader runs on is finished by the other replica. That is the clause of M3's acceptance not yet shown.
+**M4c: rollout policy.** Maintenance windows, gates the user defines on objects in the cluster (Ceph health, for one), and hooks before and after a rollout or a node. These apply to config rollouts as well.
 
-Two things ride along, because this is where the chart is first installed, upgraded and adopted with under test:
-- **Adoption creates the resources** (§12.14). Installing the operator and adding a minimal TalosCluster is enough to arrive at `Adopted`, with nothing applied by hand in between.
-- **The chart upgrades its CRDs** (§12.15). An upgrade of the chart leaves the cluster with the CRDs of the new release, and uninstalling it leaves the CRDs and every object of theirs in place.
-
-**M4b: upgrades.** Changing the Talos version in the spec, or the installer a machine is built from, takes every node there one at a time, draining it first. A node that does not come back as expected halts the rollout, and Talos's own fallback to the previous boot is recognised for what it is. Config changes that only take effect through a reinstall, refused today (`RequiresReinstall`), roll out the same way.
-- In: refusing up front what cannot work (a jump Talos does not allow, a version this operator does not support, an installer that does not exist); workers before control planes, control planes one at a time with etcd never at risk; drains that respect disruption budgets and time out; retry, skip and abort as in M3.
-- Out: Kubernetes versions (M5); learning that a new version exists (M6).
-
-**M4c: rollout policy.** Maintenance windows, gates the user defines on objects in the cluster (Ceph health, for one), and hooks before and after a rollout or a node. These apply to config rollouts as well. On a cluster with storage on its nodes this slice is what makes M4b safe to use, so a real cluster gets M4b and M4c together.
-
-- **Done when:** a multi-node QEMU cluster goes through a patch upgrade with its workloads up; the operator upgrades the node it runs on and carries on; an injected failure halts with the node still cordoned, and a retry resumes; an installer change reinstalls; a real cluster takes a patch release inside a window, behind a storage-health gate.
-- **To decide:** where three-control-plane scenarios run (see below); whether downgrades are refused outright; whether workers may go more than one at a time yet.
+- **Done when:** an upgrade waits for a window and for a storage-health gate, and a hook runs before and after a node; a real cluster takes a patch release inside a window, behind such a gate.
+- **Shown so far, on QEMU:** a patch upgrade of every node with a workload kept up behind a disruption budget; the operator upgrading the nodes it runs on and carrying on; the leader killed in the middle of a config rollout.
+- **Shown so far, against the fake only:** a node that falls back to its previous boot, a drain a budget never allows, an installer that cannot be pulled, each halting with the node as the failure left it and resuming on retry.
+- **To decide:** whether workers may go more than one at a time; whether a manual rollback to the previous boot slot (`MachineService.Rollback`) is worth an annotation.
 
 ### M5 Kubernetes upgrades
 
@@ -942,11 +954,10 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 ### Suggested order
 
 1. The real cluster, alongside everything else, at its owner's pace.
-2. M4a, because every later milestone is tested through it.
-3. M10a and M11a: small, independent, and wanted before upgrades touch a real control plane.
-4. M4b with M4c, then M5, then M6.
-5. M7, then M8.
-6. M10b, M11b, and whatever of M9 has earned it.
+2. M10a and M11a: small, independent, and wanted before upgrades touch a real control plane.
+3. M4c, which a cluster with storage on its nodes needs before it uses upgrades; then M5, then M6.
+4. M7, then M8.
+5. M10b, M11b, and whatever of M9 has earned it.
 
 R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
 
@@ -1017,6 +1028,9 @@ Decided 2026-10-08:
    - **The operator never overwrites what someone else set**, also while adopting: it applies without force, so a field another manager changed is a conflict and the object is left alone (§7.1). The phase lives in status, and status can be lost; that must never make the operator overwrite what someone else manages.
    - **Delivery stays the owner's business** (§12.9). With Flux, a Kustomization leaves objects alone that are not in Git, and takes over the fields that are once they are committed. There is no separate proposal to review: the resources themselves are what the operator found, and a second copy would only go stale once someone edits them. Whoever wants them in Git exports them from the cluster. What is worth knowing before taking them over, such as a node whose Talos version differs from the one its config installs, is reported on the TalosCluster. Helm only takes over objects that carry its ownership labels, which is the user's to add if they deliver that way.
 15. **The chart installs and upgrades the CRDs; the operator never does** (decided 2026-10-10). An operator that registers its own CRDs needs cluster-wide rights to do it, has two replicas of different versions writing them during an upgrade, and makes a first GitOps sync fail until it has started. Helm's `crds/` directory avoids that but installs once and never upgrades. So the CRDs become chart templates: on by default, so that `helm upgrade` upgrades them, switchable off for those who manage CRDs separately, and kept on uninstall, because deleting a CRD deletes every object of its kind.
+16. **An upgrade changes the system first, and its config second** (decided 2026-10-10, with M4b). The config names the installer, so a version change is also a config change. Applying the config first would put a config on a node that says what the node does not run; folding it into the upgrade would put a tried config under a reboot, which reverts it. So the upgrade leaves config alone, and the installer image is a change class of its own that a config rollout applies once the node runs what it names (§6.3, §7.3). The cost is a second pass over the nodes, with a soak each and no reboot.
+17. **Downgrades are refused** (decided 2026-10-10, with M4b). Talos allows some. A downgraded node may not understand the config it has, and the operator has no way to prove beforehand that it does.
+18. **The e2e tests the operator as deployed** (decided 2026-10-10, with M4a). The suite starts no controllers of its own: the image built from the checkout runs in the test cluster, installed by the chart with two replicas. The image reaches the nodes through Talos's image import, with the harness's admin access, so no registry is involved and no registry configuration ends up in the nodes' config. What an in-process manager could not show is what this is for: the chart's permissions, leader election, and a rollout that outlives its leader.
 
 ## 13. Prior art summary
 

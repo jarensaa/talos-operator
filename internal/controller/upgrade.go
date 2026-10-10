@@ -660,7 +660,7 @@ func (r *TalosClusterReconciler) reboot(ctx context.Context, tc *talosv1alpha1.T
 		return "no Talos client to reboot with: " + err.Error(), nil
 	}
 
-	if v.pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane {
+	if v.pool != nil && v.pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane {
 		// A courtesy to the cluster, not a condition: etcd elects a new leader either way, only
 		// later. A single control plane has nobody to hand over to.
 		if err := upgrader.ForfeitEtcdLeadership(ctx, v.node.address); err != nil {

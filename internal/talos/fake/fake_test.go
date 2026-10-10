@@ -360,3 +360,157 @@ func TestDryRunsAreNotMutations(t *testing.T) {
 		t.Fatal("a dry run changes nothing")
 	}
 }
+
+// The fake upgrades the way a node does: an install only fills the other boot slot, and nothing
+// about the node changes until it has rebooted and booted again.
+func TestAnInstallTakesEffectOnlyThroughAReboot(t *testing.T) {
+	s, cp, worker := clusterScenario()
+	u := s.Upgrader()
+	ctx := context.Background()
+
+	const image = "factory.example.com/metal-installer/bbb:v1.14.9"
+
+	if err := u.Install(ctx, worker, image); err == nil {
+		t.Fatal("an image that was not pulled cannot be installed")
+	}
+
+	if err := u.PullImage(ctx, worker, image); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := u.Install(ctx, worker, image); err != nil {
+		t.Fatal(err)
+	}
+
+	before := s.Node(worker)
+	if before.Version.Tag != startVersion || s.Down(worker) {
+		t.Fatalf("an install changes nothing on the running node: %+v", before.Version)
+	}
+
+	if err := u.Reboot(ctx, worker); err != nil {
+		t.Fatal(err)
+	}
+
+	if !s.Down(worker) {
+		t.Fatal("a rebooted node is down until it boots")
+	}
+
+	if _, err := s.Reader().Version(ctx, worker); status.Code(err) != codes.Unavailable {
+		t.Fatalf("a node that is down answers nothing: %v", err)
+	}
+
+	if _, err := s.Reader().Version(ctx, cp); err != nil {
+		t.Fatalf("the other node is not affected: %v", err)
+	}
+
+	if !s.Boot(worker) || s.Boot(worker) {
+		t.Fatal("Boot brings a node back once")
+	}
+
+	after := s.Node(worker)
+	if after.Version.Tag != "v1.14.9" || after.Schematic.ID != "bbb" || after.BootID == before.BootID {
+		t.Fatalf("after the reboot the node runs what was installed, under another boot ID: %+v", after)
+	}
+
+	if got := s.CallsFor(fake.MethodInstall); len(got) != 2 || got[1].Image != image {
+		t.Fatalf("installs are recorded with their image: %+v", got)
+	}
+}
+
+func TestANodeThatFallsBackKeepsItsSystemAndATriedConfigDoesNotSurviveAReboot(t *testing.T) {
+	s, _, worker := clusterScenario()
+	u := s.Upgrader()
+	ctx := context.Background()
+
+	const image = "factory.example.com/metal-installer/bbb:v1.14.9"
+
+	s.UpdateNode(worker, func(n *fake.Node) {
+		n.FallsBack = true
+		n.Config = talos.MachineConfigs{Active: minimalConfig("a"), Persistent: minimalConfig("a")}
+	})
+
+	if err := s.Writer().ApplyConfig(ctx, worker, minimalConfig("b"), talos.ApplyTry, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, call := range []func() error{
+		func() error { return u.PullImage(ctx, worker, image) },
+		func() error { return u.Install(ctx, worker, image) },
+		func() error { return u.Reboot(ctx, worker) },
+	} {
+		if err := call(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s.Boot(worker)
+
+	after := s.Node(worker)
+	if after.Version.Tag != startVersion {
+		t.Fatalf("a node that falls back runs what it ran: %s", after.Version.Tag)
+	}
+
+	if string(after.Config.Active) != string(minimalConfig("a")) || s.TryPending(worker) {
+		t.Fatal("a reboot boots the persistent config: a tried one is gone")
+	}
+}
+
+func TestAFailingInstallerLeavesNothingToBoot(t *testing.T) {
+	s, _, worker := clusterScenario()
+	u := s.Upgrader()
+	ctx := context.Background()
+
+	const image = "factory.example.com/metal-installer/bbb:v1.14.9"
+
+	s.UpdateNode(worker, func(n *fake.Node) { n.InstallExitCode = 1 })
+
+	if err := u.PullImage(ctx, worker, image); err != nil {
+		t.Fatal(err)
+	}
+
+	var failed *talos.InstallError
+	if err := u.Install(ctx, worker, image); !errors.As(err, &failed) || failed.ExitCode != 1 {
+		t.Fatalf("a failing installer is an InstallError: %v", err)
+	}
+
+	if err := u.Reboot(ctx, worker); err != nil {
+		t.Fatal(err)
+	}
+
+	s.Boot(worker)
+
+	if got := s.Node(worker).Version.Tag; got != startVersion {
+		t.Fatalf("nothing was installed, so the node boots what it had: %s", got)
+	}
+}
+
+func TestForfeitingEtcdLeadershipMovesItToAnotherMember(t *testing.T) {
+	cp1, cp2 := netip.MustParseAddr("10.5.0.2"), netip.MustParseAddr("10.5.0.3")
+	s := fake.NewScenario(
+		fake.Node{Addr: cp1, MachineType: fake.TypeControlPlane, Nodename: "first", EtcdMemberID: 0xa1},
+		fake.Node{Addr: cp2, MachineType: fake.TypeControlPlane, Nodename: "second", EtcdMemberID: 0xa2},
+	)
+	ctx := context.Background()
+
+	leader := func(node netip.Addr) uint64 {
+		st, err := s.Reader().EtcdStatus(ctx, node)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return st.Leader
+	}
+
+	if leader(cp1) != 0xa1 {
+		t.Fatal("the first control plane leads to begin with")
+	}
+
+	// A member that does not lead has nothing to give up.
+	if err := s.Upgrader().ForfeitEtcdLeadership(ctx, cp2); err != nil || leader(cp1) != 0xa1 {
+		t.Fatalf("only the leader forfeits: %v", err)
+	}
+
+	if err := s.Upgrader().ForfeitEtcdLeadership(ctx, cp1); err != nil || leader(cp2) != 0xa2 {
+		t.Fatalf("the leader hands over to another member: %v", err)
+	}
+}

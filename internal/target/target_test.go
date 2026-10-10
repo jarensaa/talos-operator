@@ -356,3 +356,47 @@ func TestResolveMarksKubernetesAPIFailures(t *testing.T) {
 		t.Fatalf("a missing Secret must stay a credentials problem: %v", err)
 	}
 }
+
+// A client that can reboot a node is handed out only while upgrades are enabled, on a cluster
+// whose config the operator owns. Nothing that only observes, or only manages config, gets one.
+func TestResolveUpgraderNeedsUpgradesEnabled(t *testing.T) {
+	tc := cluster("happy", "talosconfig")
+	r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
+	outside := talos.SelectOptions{Exclude: netip.MustParseAddr("10.0.0.11")}
+
+	refused := []talosv1alpha1.Management{
+		{},
+		{Config: talosv1alpha1.ConfigManagementObserve, Upgrades: talosv1alpha1.CapabilityEnabled},
+		{Config: talosv1alpha1.ConfigManagementManage},
+		{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityDisabled},
+	}
+
+	for _, m := range refused {
+		tc.Spec.Management = m
+
+		if _, err := r.ResolveUpgrader(context.Background(), tc, outside); !errors.Is(err, target.ErrUpgradesDisabled) {
+			t.Fatalf("management %+v: expected ErrUpgradesDisabled, got %v", m, err)
+		}
+	}
+
+	if len(f.UpgraderTargets()) != 0 {
+		t.Fatal("no upgrade client may even be built while upgrades are off")
+	}
+
+	tc.Spec.Management = talosv1alpha1.Management{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityEnabled}
+
+	u, err := r.ResolveUpgrader(context.Background(), tc, outside)
+	if err != nil || u == nil {
+		t.Fatalf("expected an upgrader once upgrades are enabled: %v", err)
+	}
+
+	// It reaches the node through another one, like every other client.
+	targets := f.UpgraderTargets()
+	if len(targets) != 1 || len(targets[0].Endpoints) != 1 || targets[0].Endpoints[0].Addr != netip.MustParseAddr("10.0.0.12") {
+		t.Fatalf("upgrader targets: %+v", targets)
+	}
+
+	if len(f.Targets())+len(f.WriterTargets()) != 0 {
+		t.Fatal("an upgrader is its own client, not the reader's or the config writer's")
+	}
+}
