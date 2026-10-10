@@ -102,7 +102,7 @@ const (
 	tokenPatch   = "machine:\n  token: aaaaaa.bbbbbbbbbbbbbbbb\n"
 	// A flag no kubelet knows: it exits at once, every time Talos starts it.
 	unknownKubeletFlag = "no-such-flag"
-	brokenKubeletPatch = "machine:\n  kubelet:\n    extraArgs:\n      " + unknownKubeletFlag + ": \"true\"\n"
+	brokenKubeletPatch = "apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  " + unknownKubeletFlag + ": \"true\"\n"
 )
 
 func labelDocument(value string) string {
