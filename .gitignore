@@ -64,3 +64,7 @@ go.work
 
 # Release tooling (package.json)
 node_modules/
+
+# The issue tracker's local database and its export. It holds working notes, not text vetted
+# for publication, and is never committed or pushed.
+.beads/

@@ -1,5 +1,7 @@
 # Agent Instructions
 
+**This repository is public.** Treat every push, pull request and CI log line as publication: no secrets, and nothing about a real cluster or its owner. The rules are in the "This repository is public" section of [CLAUDE.md](CLAUDE.md); they apply to every agent.
+
 This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
 
 > **Architecture in one line:** Issues live in a local Dolt database
