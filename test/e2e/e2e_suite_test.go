@@ -235,11 +235,14 @@ func deleteMachine(ctx context.Context, tm *talosv1alpha1.TalosMachine) {
 		Expect(err).NotTo(HaveOccurred())
 	}
 
-	if current.Annotations == nil {
-		current.Annotations = map[string]string{}
+	// A patch of the one annotation, not an update of the object as it was read: the machine's
+	// controller writes its status at any moment, and an update would lose to it.
+	released := current.DeepCopy()
+	if released.Annotations == nil {
+		released.Annotations = map[string]string{}
 	}
 
-	current.Annotations[talosv1alpha1.AnnotationOrphan] = "true"
-	Expect(k8sClient.Update(ctx, current)).To(Succeed())
-	Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, current))).To(Succeed())
+	released.Annotations[talosv1alpha1.AnnotationOrphan] = "true"
+	Expect(client.IgnoreNotFound(k8sClient.Patch(ctx, released, client.MergeFrom(current)))).To(Succeed())
+	Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, released))).To(Succeed())
 }
