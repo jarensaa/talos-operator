@@ -73,6 +73,11 @@ type Reader interface {
 	// mode, even in a dry run. Only the verdict is returned, because the server's diff is an
 	// unredacted, order-sensitive text diff of the whole config.
 	DryRunApply(ctx context.Context, node netip.Addr, machineConfig []byte) (DryRunResult, error)
+	// KubernetesUpgradeChecks reads how the Kubernetes components on the given nodes are started,
+	// and describes every flag, feature gate and admission plugin that the upgrade from
+	// Kubernetes from to to removes. Empty means nothing stands in the way; an error, that it
+	// could not be told.
+	KubernetesUpgradeChecks(ctx context.Context, from, to string, nodes ClusterInfo) ([]string, error)
 }
 
 // Upgrader is the Talos access of upgrades: Enabled: everything a Reader can do, plus the calls an
@@ -88,6 +93,10 @@ type Upgrader interface {
 	// PullImage fetches the installer image to node. It takes as long as the download does, so the
 	// caller's context bounds it.
 	PullImage(ctx context.Context, node netip.Addr, image string) error
+	// PullKubernetesImage fetches the image of a Kubernetes component to node, to where that
+	// component is run from, so that a Kubernetes upgrade restarts it without waiting for a
+	// download (docs/scope.md §7.4).
+	PullKubernetesImage(ctx context.Context, node netip.Addr, component, image string) error
 	// Install writes the system from a pulled installer image to node's inactive boot slot. The node
 	// keeps running what it runs until it reboots. A failed install is reported as an
 	// *InstallError; the caller's context bounds the call.
