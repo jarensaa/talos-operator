@@ -18,53 +18,15 @@ It is built for clusters that already exist. The operator derives its resources 
 - **Hardware identity.** Every machine is pinned to an SMBIOS system UUID. A node whose UUID does not match is never acted on.
 - **Admission rules in the API server.** `ValidatingAdmissionPolicy` resources prevent enabling management before adoption, and prevent deleting a machine that is still part of the cluster. They do not depend on the operator being available.
 
-## Example
-
-```yaml
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosMachineConfig
-metadata:
-  name: bonded-network
-spec:
-  documents: |
-    apiVersion: v1alpha1
-    kind: BondConfig
-    name: bond0
-    links: [eth0, eth1]
-    bondMode: 802.3ad
----
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosMachinePool
-metadata:
-  name: control-plane
-spec:
-  clusterRef: { name: my-cluster }
-  role: ControlPlane
-  config:
-    - configRef: { name: bonded-network }
----
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosMachine
-metadata:
-  name: cp-1
-spec:
-  poolRef: { name: control-plane }
-  address: 10.0.0.11
-  identity:
-    systemUUID: aaaaaaaa-bbbb-4ccc-8ddd-000000000001
-```
-
-```console
-$ kubectl get taloscluster
-NAME         PHASE       TALOS     KUBERNETES   ADOPTED   AGE
-my-cluster   Observing   v1.14.0   1.37.0       True      2d
-```
-
 ## Getting started
 
-Nothing on a node changes before step 6. [The full guide](docs/getting-started.md) covers each step in more detail, and what to do when something does not match.
+You need:
 
-> Steps 4 and 5 describe adoption as it works from the next release on. In the current release the operator writes the same resources to a ConfigMap and you apply them yourself; the full guide has those steps.
+- Talos 1.13 or 1.14;
+- Kubernetes 1.30 or newer;
+- installer images from [Image Factory](https://factory.talos.dev).
+
+Nothing on a node changes before step 6. The [guide](docs/guide.md) has what these steps leave out: what the conditions mean while a cluster is adopted, and what to do when a rollout halts, asks for approval, or finds a node changed by hand.
 
 ### 1. Allow the operator to request Talos credentials
 
@@ -150,7 +112,7 @@ Leave the two Secrets where they are. They hold the cluster's keys and do not be
 
 ### 6. Switch management on
 
-Set `management.config` to `Manage` in the `TalosCluster`. In the exported file it is the one line that changes; everything else is what adoption filled in:
+Set `management.config` to `Manage` in the `TalosCluster`. It is the one line that changes:
 
 ```yaml
 apiVersion: talos.jarensaa.github.io/v1alpha1
@@ -160,25 +122,8 @@ metadata:
   namespace: talos-operator
 spec:
   management:
-    config: Manage          # was Observe
-    upgrades: Disabled
-    membership: Disabled
-  clusterName: my-cluster
-  controlPlaneEndpoint: https://cluster.example.com:6443
-  versions:
-    talos: v1.14.0
-    kubernetes: 1.37.0
-  configGeneration:
-    versionContract: v1.14
-    installer:
-      factoryURL: https://factory.talos.dev
-      platform: metal
-      schematicID: 376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba
-  config:                   # whatever every node sets beyond Talos's defaults
-    - inline: |
-        apiVersion: v1alpha1
-        kind: KubeProxyConfig
-        enabled: false
+    config: Manage   # was Observe
+  # ...the rest stays as adoption wrote it
 ```
 
 Commit it, or without Git:
@@ -192,7 +137,7 @@ The API server accepts this only while the resources still render exactly what t
 
 ### 7. Change something
 
-A node label on the workers is a good first change. Add it to the pool's `config`:
+Config is layered: the cluster's applies to every node, then the pool's, then the machine's. A node label on the workers is a good first change. Add it to the pool's `config`:
 
 ```yaml
 apiVersion: talos.jarensaa.github.io/v1alpha1
@@ -213,12 +158,40 @@ spec:
 
 The operator applies it to one node at a time in Talos's try mode, and confirms it only after the node stayed healthy. A node that does not come out healthy gets its previous config back from Talos, and the rollout stops there.
 
+Config that several layers share can live in a `TalosMachineConfig` and be referenced from any of them:
+
+```yaml
+apiVersion: talos.jarensaa.github.io/v1alpha1
+kind: TalosMachineConfig
+metadata:
+  name: bonded-network
+  namespace: talos-operator
+spec:
+  documents: |
+    apiVersion: v1alpha1
+    kind: BondConfig
+    name: bond0
+    links: [eth0, eth1]
+    bondMode: 802.3ad
+---
+apiVersion: talos.jarensaa.github.io/v1alpha1
+kind: TalosMachinePool
+metadata:
+  name: my-cluster-control-plane
+  namespace: talos-operator
+spec:
+  clusterRef: { name: my-cluster }
+  role: ControlPlane
+  config:
+    - configRef: { name: bonded-network }
+```
+
 ## Project status
 
 | Area | State |
 |---|---|
 | Observing clusters and machines | Implemented |
-| Adoption: proposal, config comparison, dry-run proof, gated switch to `Manage` | Implemented |
+| Adoption: resources created from the live cluster, dry-run proof, gated switch to `Manage` | Implemented |
 | Machine pools and reusable config | Implemented |
 | Drift reporting and enforcement | Implemented |
 | Applying config changes, with Talos try-mode rollback | Implemented |
@@ -231,12 +204,6 @@ The API is `v1alpha1` and may change incompatibly between releases.
 
 Adoption and config rollouts are tested in CI against Talos clusters running in QEMU. The tests assert that adoption leaves boot IDs and config hashes unchanged, that a label reaches a node without a reboot, and that a config which cuts a node off is reverted and never confirmed.
 
-### Requirements
-
-- Talos 1.13 or 1.14
-- Kubernetes 1.30 or newer
-- Installer images from [Image Factory](https://factory.talos.dev)
-
 ## Non-goals
 
 - **Hardware provisioning.** Machines are expected to exist and to boot Talos.
@@ -246,7 +213,7 @@ Adoption and config rollouts are tested in CI against Talos clusters running in 
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md): the steps above in detail, with what to do when a rollout halts, needs approval, or a node was changed by hand.
+- [Guide](docs/guide.md): what the steps above leave out, from reading adoption's conditions to halted rollouts, approvals, drift and backing out.
 - [Design](docs/scope.md): the API, the adoption process, the safety model and the roadmap.
 - [End-to-end tests](docs/dev/e2e.md): how the QEMU test cluster works.
 
