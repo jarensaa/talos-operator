@@ -18,8 +18,10 @@ package controller
 
 import (
 	"net/netip"
+	"slices"
 
-	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/jarensaa/talos-operator/internal/plan"
 	"github.com/jarensaa/talos-operator/internal/talos"
 )
@@ -46,6 +48,9 @@ type nodeFacts struct {
 	// etcdStatusRead is set. Control planes only.
 	etcdErrors     []string
 	etcdStatusRead bool
+	// kubeNode is what the Kubernetes API says about the member's Node; nil when the Nodes were
+	// not read.
+	kubeNode *plan.KubernetesNode
 	// read is true when every read of the node succeeded; readErr is the first failure otherwise.
 	read    bool
 	readErr string
@@ -74,6 +79,7 @@ func (f clusterFacts) judged() plan.Cluster {
 			ConfigSettled:  n.configSettled,
 			EtcdStatusRead: n.etcdStatusRead,
 			EtcdErrors:     n.etcdErrors,
+			Node:           n.kubeNode,
 		}
 
 		if n.status != nil {
@@ -99,9 +105,42 @@ func (f clusterFacts) judged() plan.Cluster {
 	return c
 }
 
-// passOf is this pass over the cluster as the rollout's cluster gate sees it.
-func passOf(st *talosv1alpha1.TalosClusterStatus, obs observation) plan.Pass {
+// observeKubeNodes records, for every member, what the Kubernetes API says about its Node. A
+// member's Node is the one carrying the member's address, or else the one named like it.
+func (f *clusterFacts) observeKubeNodes(nodes []corev1.Node) {
+	for i := range f.nodes {
+		n := &f.nodes[i]
+		n.kubeNode = &plan.KubernetesNode{}
+
+		at := slices.IndexFunc(nodes, func(node corev1.Node) bool { return hasAddress(node, n.address) })
+		if at < 0 {
+			at = slices.IndexFunc(nodes, func(node corev1.Node) bool { return node.Name == n.hostname })
+		}
+
+		if at >= 0 {
+			n.kubeNode.Registered = true
+			n.kubeNode.Ready = nodeConditionTrue(&nodes[at], corev1.NodeReady) &&
+				!nodeConditionTrue(&nodes[at], corev1.NodeNetworkUnavailable)
+		}
+	}
+}
+
+func hasAddress(node corev1.Node, addr netip.Addr) bool {
+	return slices.ContainsFunc(node.Status.Addresses, func(a corev1.NodeAddress) bool {
+		parsed, err := netip.ParseAddr(a.Address)
+
+		return err == nil && addr.IsValid() && parsed == addr
+	})
+}
+
+// passOf is this pass over the cluster as the rollout's gates see it.
+func passOf(obs observation) plan.Pass {
 	p := plan.Pass{Reached: obs.facts != nil, Matched: obs.unmatched != nil, Unmatched: obs.unmatched}
+
+	if obs.facts != nil {
+		c := obs.facts.judged()
+		p.Cluster = &c
+	}
 
 	if obs.err != nil {
 		p.Incomplete = obs.err.Error()
@@ -109,12 +148,6 @@ func passOf(st *talosv1alpha1.TalosClusterStatus, obs observation) plan.Pass {
 
 	if obs.kubeErr != nil {
 		p.KubernetesUnread = obs.kubeErr.Error()
-	}
-
-	// applyObservation evaluated them from this pass's facts; without facts the gate is closed
-	// before it looks at them.
-	if st.Adoption != nil {
-		p.Preconditions = st.Adoption.Preconditions
 	}
 
 	if obs.health == nil {

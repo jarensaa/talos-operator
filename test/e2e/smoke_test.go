@@ -201,6 +201,27 @@ func machinesForLiveNodes(ctx context.Context, cluster string) []*talosv1alpha1.
 // harnessReader reads the e2e cluster with the harness's own admin talosconfig, independently of
 // the operator, so specs can check what the operator did and did not do.
 func harnessReader(ctx context.Context) talos.Reader {
+	f, target := harnessTarget()
+
+	r, err := f.Reader(ctx, target)
+	Expect(err).NotTo(HaveOccurred())
+
+	return r
+}
+
+// harnessWriter is the cluster admin changing a node behind the operator's back. Specs use it
+// for what the operator is then expected to notice or undo, never to help the operator along.
+func harnessWriter(ctx context.Context) talos.ConfigWriter {
+	f, target := harnessTarget()
+
+	w, err := f.ConfigWriter(ctx, target)
+	Expect(err).NotTo(HaveOccurred())
+
+	return w
+}
+
+// harnessTarget is the harness cluster as its admin talosconfig reaches it.
+func harnessTarget() (*talos.Factory, talos.Target) {
 	data, err := os.ReadFile(talosconfigPath)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -210,10 +231,7 @@ func harnessReader(ctx context.Context) talos.Reader {
 	f := talos.NewFactory()
 	DeferCleanup(f.Close)
 
-	r, err := f.Reader(ctx, talos.Target{Key: "harness", Credentials: c, Endpoints: c.Endpoints})
-	Expect(err).NotTo(HaveOccurred())
-
-	return r
+	return f, talos.Target{Key: "harness", Credentials: c, Endpoints: c.Endpoints}
 }
 
 // harnessNodes returns the addresses of every configured harness node.

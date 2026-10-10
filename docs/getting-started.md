@@ -146,7 +146,7 @@ spec:
 
 Each affected `TalosMachine` shows what would change before anything does: `status.config.diff`, and `status.config.changeClass`.
 
-The operator then rolls the change out one node at a time, workers first. On each node it:
+The operator then rolls the change out one node at a time, workers first. No node is touched while another node is unhealthy. On each node it:
 
 1. applies the config in Talos's try mode, which Talos reverts by itself after `tryTimeout` (5m) unless it is confirmed;
 2. checks the node from outside: its Talos API answers through another control plane, Kubernetes sees it Ready, its kubelet is sending heartbeats, etcd and the rest of the cluster are healthy;
@@ -188,7 +188,7 @@ After an abort the same change isn't started again. Change the spec, or revert i
 | `ProtectedChange` | The change touches cluster identity: a CA, a token, the cluster name, a hostname. The operator never applies these. |
 | `RequiresReinstall` | The change only takes effect through a reinstall, such as a different installer image. Not supported yet. |
 | `AwaitingApproval` | The change touches storage, or something the operator has no rule for. Review each machine's `status.config.diff`, then approve with the hash from `status.approval`: `kubectl annotate taloscluster my-cluster talos.jarensaa.github.io/approve-diff=<hash>`. The approval is for exactly that change. |
-| `GateClosed` | The cluster isn't healthy, so no node is touched. The message says what is wrong. |
+| `GateClosed` | A node other than the one to be changed isn't healthy, or the cluster as a whole isn't, so no node is touched. The message says what is wrong. |
 | `Paused` | `spec.paused` is set. |
 
 One blocked machine blocks the whole rollout.
@@ -199,7 +199,7 @@ If someone changes a node's config outside the operator, `ConfigInSync` goes fal
 
 ### Limits to know about
 
-- Once a config is confirmed, it stays. If it breaks the node hours later, the operator won't touch an unhealthy cluster, so that node needs fixing by hand.
+- Once a config is confirmed, it stays until the spec changes. If it breaks a node hours later, revert the spec: the operator starts with the unhealthy node and puts its previous config back. That works while it is the only unhealthy node and its Talos API still answers. If the config broke several nodes, the operator touches none of them.
 - A cluster with one control plane has no other node to check that control plane through.
 
 ## Backing out
