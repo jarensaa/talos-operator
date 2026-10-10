@@ -8,7 +8,7 @@ It is built for clusters that already exist. The operator derives its resources 
 
 ## Features
 
-- **Adoption without changes.** The operator reads every node and creates the `TalosMachinePool` and `TalosMachine` resources that reproduce the cluster as it runs. They contain only what differs from Talos's generated defaults. Adoption completes when a dry-run apply on every node reports no changes. No node is rebooted or reconfigured, and from then on the resources are yours to manage.
+- **Adoption without changes.** The operator reads every node and proposes the `TalosCluster`, `TalosMachinePool` and `TalosMachine` resources that reproduce the cluster as it runs. The proposal contains only what differs from Talos's generated defaults. Adoption completes when a dry-run apply on every node reports no changes. No node is rebooted or reconfigured.
 - **Read-only observation.** Until management is enabled, the operator uses a Talos client that rejects every API call that would modify a node.
 - **Config changes that revert by themselves.** Every change is applied in Talos's try mode, one node at a time. The operator confirms it only after the node answered through another node, sent kubelet heartbeats and stayed healthy for a soak period. Otherwise Talos restores the previous config and the rollout halts before the next node.
 - **Classified changes.** Changes to CAs, tokens and other cluster identity are refused. Changes to storage, and anything the operator has no rule for, wait for approval of that exact change.
@@ -60,158 +60,15 @@ NAME         PHASE       TALOS     KUBERNETES   ADOPTED   AGE
 my-cluster   Observing   v1.14.0   1.37.0       True      2d
 ```
 
-## Getting started
+## How adoption works
 
-Nothing on a node changes before step 6. [The full guide](docs/getting-started.md) covers each step in more detail, and what to do when something does not match.
+1. A `TalosCluster` with an empty spec puts the operator in observe mode.
+2. The operator checks that the cluster is safe to adopt, recovers the secrets bundle from a control plane, backs up every node's config, and writes a proposal to a ConfigMap.
+3. The proposed resources are applied, by any means. Each `TalosMachine` then reports `ConfigMatchesLive`.
+4. When every node has a matching machine, the operator sends each node a dry-run apply. `Adopted` becomes true only if every node reports no changes.
+5. `config: Manage` is accepted by the API server only while `Adopted` is true. On entering it, the dry-run check runs once more.
 
-> Steps 4 and 5 describe adoption as it works from the next release on. In the current release the operator writes the same resources to a ConfigMap and you apply them yourself; the full guide has those steps.
-
-### 1. Allow the operator to request Talos credentials
-
-The operator takes no talosconfig. Talos issues it a short-lived certificate once you allow that for the operator's namespace. Add this document to the machine config of every control plane:
-
-```yaml
-apiVersion: v1alpha1
-kind: KubeTalosAPIAccessConfig
-allowedRoles: [os:admin]
-allowedKubernetesNamespaces: [talos-operator]
-```
-
-```bash
-talosctl -n <node-ip> patch machineconfig --patch @talos-api-access.yaml
-```
-
-### 2. Install the chart
-
-```bash
-helm install talos-operator oci://ghcr.io/jarensaa/charts/talos-operator \
-  --version <version> --namespace talos-operator --create-namespace
-```
-
-The chart includes the CRDs, and upgrading the chart upgrades them. Take the version from the [latest release](https://github.com/jarensaa/talos-operator/releases/latest).
-
-### 3. Add a TalosCluster
-
-An empty spec is enough. It tells the operator to adopt the cluster it runs on, and nothing more:
-
-```bash
-kubectl apply -f - <<'EOF'
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosCluster
-metadata:
-  name: my-cluster
-  namespace: talos-operator
-EOF
-```
-
-### 4. Wait for adoption
-
-The operator reads every node and writes down what it finds:
-
-- two `TalosMachinePool`s, `my-cluster-control-plane` and `my-cluster-workers`, each with the config its nodes share (a cluster without workers gets only the first);
-- one `TalosMachine` per node, named after the node and pinned to its hardware UUID;
-- the versions, the endpoint and the config every node shares, in the `TalosCluster`'s own spec, where you left them empty;
-- two Secrets: the cluster's secrets bundle, and a backup of every node's config as it was.
-
-It then sends each node a dry-run apply of the config these resources render. When every node answers "no changes", the cluster is adopted:
-
-```console
-$ kubectl -n talos-operator get taloscluster
-NAME         PHASE     TALOS     KUBERNETES   ADOPTED   AGE
-my-cluster   Adopted   v1.14.0   1.37.0       True      4m
-
-$ kubectl -n talos-operator get talosmachinepools
-NAME                       CLUSTER      ROLE           MEMBERS   MATCHED   AGE
-my-cluster-control-plane   my-cluster   ControlPlane   3         3         3m
-my-cluster-workers         my-cluster   Worker         2         2         3m
-```
-
-If the phase stays `Adopting`, the conditions say what is in the way:
-
-```bash
-kubectl -n talos-operator describe taloscluster my-cluster
-```
-
-### 5. Take over the resources
-
-From `Adopted` on the operator never writes to these resources again. They are yours, and there is no way back to `Adopting`.
-
-You can leave them in the cluster and edit them with `kubectl`. To manage them from Git, export them and strip what the API server added (this uses [yq](https://github.com/mikefarah/yq)):
-
-```bash
-kubectl -n talos-operator get talosclusters,talosmachinepools,talosmachines -o yaml \
-  | yq '.items[] | del(.status) | .metadata |= pick(["name", "namespace", "labels", "annotations"]) | split_doc' \
-  > my-cluster.yaml
-```
-
-Commit the file and point your GitOps tool at it. Any tool works; a Flux Kustomization, for instance, takes the existing objects over as they are.
-
-Leave the two Secrets where they are. They hold the cluster's keys and do not belong in Git unencrypted, and the operator does not need them delivered from outside.
-
-### 6. Switch management on
-
-Set `management.config` to `Manage` in the `TalosCluster`. In the exported file it is the one line that changes; everything else is what adoption filled in:
-
-```yaml
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosCluster
-metadata:
-  name: my-cluster
-  namespace: talos-operator
-spec:
-  management:
-    config: Manage          # was Observe
-    upgrades: Disabled
-    membership: Disabled
-  clusterName: my-cluster
-  controlPlaneEndpoint: https://cluster.example.com:6443
-  versions:
-    talos: v1.14.0
-    kubernetes: 1.37.0
-  configGeneration:
-    versionContract: v1.14
-    installer:
-      factoryURL: https://factory.talos.dev
-      platform: metal
-      schematicID: 376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba
-  config:                   # whatever every node sets beyond Talos's defaults
-    - inline: |
-        apiVersion: v1alpha1
-        kind: KubeProxyConfig
-        enabled: false
-```
-
-Commit it, or without Git:
-
-```bash
-kubectl -n talos-operator patch taloscluster my-cluster --type merge \
-  -p '{"spec":{"management":{"config":"Manage"}}}'
-```
-
-The API server accepts this only while the resources still render exactly what the nodes run. The operator repeats the dry run on every node, and the phase becomes `Managed`. From here on the resources are the truth, and the operator makes the nodes follow them.
-
-### 7. Change something
-
-A node label on the workers is a good first change. Add it to the pool's `config`:
-
-```yaml
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosMachinePool
-metadata:
-  name: my-cluster-workers
-  namespace: talos-operator
-spec:
-  clusterRef: { name: my-cluster }
-  role: Worker
-  config:
-    - inline: |
-        apiVersion: v1alpha1
-        kind: KubeNodeConfig
-        labels:
-          example.com/pool: general
-```
-
-The operator applies it to one node at a time in Talos's try mode, and confirms it only after the node stayed healthy. A node that does not come out healthy gets its previous config back from Talos, and the rollout stops there.
+[Getting started](docs/getting-started.md) walks through these steps.
 
 ## Project status
 
@@ -246,7 +103,7 @@ Adoption and config rollouts are tested in CI against Talos clusters running in 
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md): the steps above in detail, with what to do when a rollout halts, needs approval, or a node was changed by hand.
+- [Getting started](docs/getting-started.md): install the operator, adopt a cluster and change its config.
 - [Design](docs/scope.md): the API, the adoption process, the safety model and the roadmap.
 - [End-to-end tests](docs/dev/e2e.md): how the QEMU test cluster works.
 
