@@ -65,9 +65,16 @@ A Kubernetes operator that manages Talos Linux clusters declaratively through CR
 
 Milestones M0–M9 are tracked as beads epics; run `bd ready` for unblocked work.
 
-**The beads database stays on the machine it lives on.** Its issue text is working notes, not vetted for publication: never commit `.beads/`, and never run a Dolt remote sync against this repository's remote.
+## This repository is public
 
-**Nothing about a real cluster belongs in this repository.** Docs, samples and test fixtures use invented names, addresses and hardware identifiers (`my-cluster`, `10.0.0.11`, `cluster.example.com`, `aaaaaaaa-bbbb-4ccc-8ddd-000000000001`). Never copy a value read from a live cluster or from someone's infrastructure repository into a file here, a commit message or a pull request.
+Treat every push as publication. Anyone can read every file, every commit message and branch name, every pull request title, description and comment, and every line a CI job prints, and none of it can be taken back: a later commit does not remove what an earlier one published, and GitHub keeps a pull request's commits for good.
+
+- **No secrets, ever.** No tokens, keys, certificates, kubeconfigs, talosconfigs, secrets bundles, age or SOPS keys, or `.env` files, in files or in text. A machine config from a real cluster is a secret: it carries the cluster's CA keys. Tests generate their key material when they run; none is checked in.
+- **Nothing about a real cluster or its owner.** Docs, samples and test fixtures use invented names, addresses and hardware identifiers (`my-cluster`, `10.0.0.11`, `cluster.example.com`, `aaaaaaaa-bbbb-4ccc-8ddd-000000000001`, `eth0`). Never copy a value read from a live cluster or from someone's infrastructure repository: no cluster or node names, IP addresses, DNS names, NIC names, disk or system identifiers, no names of private repositories, no local filesystem paths, no personal email addresses. Describe the kind of thing, never the instance.
+- **CI output is public too.** Do not let a job print a machine config, a secrets bundle, or the output of a command that contains one. Check what a command writes to stderr as well as stdout: `talosctl apply-config --dry-run` prints the whole config, keys included, on stderr. Artifacts uploaded on failure are as public as the log.
+- **Workflows run for pull requests from anyone.** Never use `pull_request_target`, never hand a secret to a job that runs on a pull request, and keep releasing and publishing on pushes to `main` only.
+- **The beads database stays on the machine it lives on.** Its issue text is working notes, not vetted for publication: never commit `.beads/`, and never run a Dolt remote sync against this repository's remote.
+- **If something sensitive does get pushed, stop and tell the owner at once.** Do not try to bury it under another commit. A leaked credential has to be revoked, not hidden.
 
 ## Guiding principles
 
