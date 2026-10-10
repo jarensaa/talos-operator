@@ -908,7 +908,6 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 
 ### Owned by no milestone, and needing a decision
 
-- **Where multi-control-plane tests run.** CI has one control plane and one worker, which is what a standard runner fits. Serialising control planes (M4b), growing them (M7) and replacing one (M8) cannot be shown there. A larger runner, a self-hosted one, or a nightly run on other hardware: this has to be settled before M4b.
 - **Upgrading the operator itself.** The API is `v1alpha1` and may change between releases, but nothing says how an installed operator and its stored objects get from one release to the next, and Helm does not upgrade the CRDs a chart ships. This needs a rule before a real cluster depends on it.
 - **Scale.** Nodes are read one after the other and workers roll one at a time. Both are right for a handful of nodes and wrong for a hundred.
 
@@ -978,6 +977,11 @@ Decided 2026-10-08:
    - Config is declared as documents layered onto the generated defaults, not as a complete config. Talos's defaults are never maintained by hand, secrets are generated from the bundle, and new defaults arrive with the version contract.
 11. **Every config change is tried** (decided 2026-10-10, with M3). The first design applied only connectivity changes with `TRY` and everything else with `NO_REBOOT`. That makes safety depend on the classifier knowing what can break a node, and leaves a node broken by a "safe" change with no way back that the operator would take (§6.3). The class now decides only whether a change is applied and whether it needs approval. The cost is that every node takes at least the soak, also for a label.
 12. **Approvals and escape hatches name what they act on** (decided 2026-10-10, with M3). An approval carries the hash of the change, and `retry`, `skip-machine` and `abort` carry the token of the failure. An annotation is a standing instruction, and Git keeps it around; bound to a hash or token it can only ever mean the thing a human looked at.
+13. **Multi-control-plane tests run on the standard hosted runner, weekly and on request** (decided 2026-10-10). Serialising control planes (M4b), growing them (M7) and replacing one (M8) cannot be shown on the one control plane a pull request's check runs.
+   - **Where:** GitHub's standard hosted runner. For a public repository it has 4 vCPUs and 16 GB, and three control planes with a worker have passed on it in about the time a pull request's run takes. A larger runner needs a paid organisation, and a self-hosted runner attached to a public repository is a risk of its own; neither is needed.
+   - **When:** the weekly run uses three control planes, so the shape is exercised without anyone remembering it. A manual run takes the shape as inputs and is how a branch is shown before it is merged. Pull requests keep one control plane and one worker as their required check, because that is quick and every change needs it.
+   - **What depends on people:** a change to how control planes are handled is run on three control planes before it is merged, and its pull request links the run (docs/dev/e2e.md). If that proves easy to forget, the next step is to run the larger shape on every pull request, which costs a few minutes each and nothing else.
+   - **What would change this:** a scenario that does not fit 16 GB, for instance several upgrades with image pulls in flight, or a hosted runner that turns out too slow for the timeouts a real cluster would use.
 
 ## 13. Prior art summary
 
