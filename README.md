@@ -8,7 +8,7 @@ It is built for clusters that already exist. The operator derives its resources 
 
 ## Features
 
-- **Adoption without changes.** The operator reads every node and creates the `TalosMachinePool` and `TalosMachine` resources that reproduce the cluster as it runs. They contain only what differs from Talos's generated defaults. Adoption completes when a dry-run apply on every node reports no changes. No node is rebooted or reconfigured, and from then on the resources are yours to manage.
+- **Adoption without changes.** The operator reads every node and derives the `TalosMachinePool` and `TalosMachine` resources that reproduce the cluster as it runs. They contain only what differs from Talos's generated defaults. Adoption completes when a dry-run apply on every node reports no changes. No node is rebooted or reconfigured, and from then on the resources are yours to manage.
 - **Read-only observation.** Until management is enabled, the operator uses a Talos client that rejects every API call that would modify a node.
 - **Config changes that revert by themselves.** Every change is applied in Talos's try mode, one node at a time. The operator confirms it only after the node answered through another node, sent kubelet heartbeats and stayed healthy for a soak period. Otherwise Talos restores the previous config and the rollout halts before the next node.
 - **Classified changes.** Changes to CAs, tokens and other cluster identity are refused. Changes to storage, and anything the operator has no rule for, wait for approval of that exact change.
@@ -27,6 +27,8 @@ You need:
 - installer images from [Image Factory](https://factory.talos.dev).
 
 Nothing on a node changes before step 6. The [guide](docs/guide.md) has what these steps leave out: what the conditions mean while a cluster is adopted, and what to do when a rollout halts, asks for approval, or finds a node changed by hand.
+
+> **Two things below arrive with the next release.** The operator creating the resources itself (steps 4 and 5), and the chart upgrading its CRDs (step 2). In the current release the operator writes the resources to a ConfigMap for you to apply, and CRDs are upgraded by hand. The guide has [both procedures](docs/guide.md#until-the-next-release).
 
 ### 1. Allow the operator to request Talos credentials
 
@@ -191,12 +193,13 @@ spec:
 | Area | State |
 |---|---|
 | Observing clusters and machines | Implemented |
-| Adoption: resources created from the live cluster, dry-run proof, gated switch to `Manage` | Implemented |
+| Adoption: proposal, config comparison, dry-run proof, gated switch to `Manage` | Implemented |
+| Adoption that creates the resources itself; CRDs upgraded with the chart | Planned next |
 | Machine pools and reusable config | Implemented |
 | Drift reporting and enforcement | Implemented |
 | Applying config changes, with Talos try-mode rollback | Implemented |
 | Config changes that need a reinstall (installer image, kernel arguments) | Planned |
-| Talos and Kubernetes upgrades | Planned next |
+| Talos and Kubernetes upgrades | Planned |
 | Adding and removing machines | Planned |
 | Metrics, alerts and dashboards | Planned |
 

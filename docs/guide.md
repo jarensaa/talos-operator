@@ -2,6 +2,25 @@
 
 The [README](../README.md#getting-started) takes you from installing the operator to a first config change. This guide has what those steps leave out.
 
+## Until the next release
+
+The README describes two things the current release does not do yet.
+
+**The operator does not create the resources; it proposes them.** After step 3, wait for the `AdoptionProposed` condition, then read the proposal:
+
+```bash
+kubectl -n talos-operator get configmap my-cluster-adoption-proposal -o yaml
+```
+
+It holds the `TalosCluster` spec, one `TalosMachinePool` per role and one `TalosMachine` per node, under the keys `taloscluster.yaml`, `talosmachinepools.yaml` and `talosmachines.yaml`. Apply the three documents however you manage your cluster. The rest is as the README says, with two differences: the phase column reads `Observing` until you switch management on, with `ADOPTED` showing `True` next to it; and `Adopted` goes back to false whenever the resources and the nodes stop matching.
+
+**Upgrading the chart does not upgrade the CRDs.** After a `helm upgrade`, apply them yourself:
+
+```bash
+helm show crds oci://ghcr.io/jarensaa/charts/talos-operator --version <version> \
+  | kubectl apply --server-side -f -
+```
+
 ## Allowing Talos API access
 
 The `KubeTalosAPIAccessConfig` document of step 1 is the one change you make to your nodes yourself. Patch one control plane at a time, with a dry run first to see what it changes and whether Talos wants a reboot for it:
