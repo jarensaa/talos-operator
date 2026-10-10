@@ -65,6 +65,7 @@ kind: TalosCluster
 metadata:
   name: my-cluster
   namespace: talos-operator
+spec: {}
 EOF
 ```
 
