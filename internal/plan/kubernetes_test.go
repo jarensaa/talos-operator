@@ -325,8 +325,8 @@ func TestNextKubernetesStep(t *testing.T) {
 		{"the node does not answer", Node{}, open, t0, Wait, ""},
 		{"the gate stays closed", on(prev, prev), closed, late, Fail, FailTimeout},
 		{"the node never answers", Node{}, open, late, Fail, FailTimeout},
-		// Nothing was sent yet, so a config that is not the one the turn was planned from ends it.
-		{"the config changed", on(foreign, foreign), open, t0, Fail, FailConfigChanged},
+		// Whatever config the node has by now is the one the pull starts from.
+		{"another config than before", on(foreign, foreign), open, t0, Pull, ""},
 	}
 
 	for _, tt := range tests {

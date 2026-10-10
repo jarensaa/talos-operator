@@ -392,9 +392,9 @@ func NextKubernetesStep(step Step, node Node, pre, checks Gate, t Timing, now ti
 		return NextStep(step, node, pre, checks, t, now)
 	}
 
+	// Nothing was sent yet, and nothing is recorded about the node's config: the config change
+	// that follows the pull is worked out from what the node runs then.
 	switch {
-	case node.Reachable && node.ActiveHash != step.PreviousHash:
-		return fail(FailConfigChanged, "the node's config changed while the operation was in flight")
 	case timedOut(step, t, now):
 		if !node.Reachable {
 			return fail(FailTimeout, "not pulled within %s: %s", t.StepTimeout, notReachable)

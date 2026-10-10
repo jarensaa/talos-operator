@@ -148,9 +148,17 @@ func KubernetesUpgradeProblem(from, to string, talosVersions map[string]string) 
 		return fmt.Sprintf("there is no upgrade from Kubernetes %s to %s: minors are taken one at a time, and never backwards", from, to)
 	}
 
+	return KubernetesSupportProblem(to, talosVersions)
+}
+
+// KubernetesSupportProblem says which of the nodes, by the Talos versions they run (node name to
+// tag), does not support Kubernetes version, or returns "".
+func KubernetesSupportProblem(version string, talosVersions map[string]string) string {
+	to := strings.TrimPrefix(version, "v")
+
 	target, err := compatibility.ParseKubernetesVersion(to)
 	if err != nil {
-		return fmt.Sprintf("unparsable Kubernetes version %q", to)
+		return fmt.Sprintf("unparsable Kubernetes version %q", version)
 	}
 
 	nodes := make([]string, 0, len(talosVersions))

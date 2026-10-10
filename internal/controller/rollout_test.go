@@ -18,6 +18,8 @@ package controller
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -29,14 +31,17 @@ import (
 	talosmachine "github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	batchv1 "k8s.io/api/batch/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
@@ -110,6 +115,9 @@ var _ = Describe("Config rollout", func() {
 		clock time.Time
 		// silent kubelets renew no Lease although their node's Talos API answers.
 		silent map[netip.Addr]bool
+		// kubelets, if set, is what else happens in the cluster between two passes of the
+		// operator: the controllers and kubelets a spec plays.
+		kubelets func()
 	)
 
 	node := func(machine string) rolloutNode {
@@ -138,6 +146,8 @@ var _ = Describe("Config rollout", func() {
 			APIReader: k8sClient,
 			Evictor:   evictor,
 			Now:       func() time.Time { return clock },
+			// The API server of these specs has nothing a Kubernetes upgrade would strand.
+			KubernetesChecks: KubernetesCheckerFunc(func(context.Context, string, string) ([]string, error) { return nil, nil }),
 		}
 	}
 
@@ -173,6 +183,10 @@ var _ = Describe("Config rollout", func() {
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: nodeLeaseNamespace, Name: n.node}, lease)).To(Succeed())
 			lease.Spec.RenewTime = &metav1.MicroTime{Time: clock}
 			Expect(k8sClient.Update(ctx, lease)).To(Succeed())
+		}
+
+		if kubelets != nil {
+			kubelets()
 		}
 	}
 
@@ -382,6 +396,7 @@ var _ = Describe("Config rollout", func() {
 
 		clock = time.Now().Truncate(time.Second)
 		silent = map[netip.Addr]bool{}
+		kubelets = nil
 
 		fakes := make([]fake.Node, 0, len(rolloutNodes))
 
@@ -1541,6 +1556,1028 @@ var _ = Describe("Config rollout", func() {
 
 			advance(time.Hour)
 			Expect(called(fake.MethodImagePull)).To(Equal([]string{worker1, worker1}), "and no other node is begun")
+		})
+	})
+
+	Context("the rollout policy", func() {
+		// daily is a maintenance window that opens at the given minute every day.
+		daily := func(opens time.Time, lasts time.Duration) talosv1alpha1.MaintenanceWindow {
+			utc := opens.UTC()
+
+			return talosv1alpha1.MaintenanceWindow{
+				Schedule: fmt.Sprintf("%d %d * * *", utc.Minute(), utc.Hour()), Duration: metav1.Duration{Duration: lasts},
+			}
+		}
+
+		setWindows := func(windows ...talosv1alpha1.MaintenanceWindow) {
+			GinkgoHelper()
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Rollout.MaintenanceWindows = windows })
+		}
+
+		It("starts nothing outside its maintenance windows, and starts when one opens", func() {
+			opens := clock.Truncate(time.Minute).Add(time.Hour)
+			setWindows(daily(opens, 30*time.Minute))
+			setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+			advance(10 * time.Minute)
+
+			Expect(operation()).To(BeNil())
+			Expect(applies()).To(BeEmpty())
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonOutsideWindow))
+			Expect(blocked().Message).To(ContainSubstring(opens.UTC().Format(time.RFC3339)), "it says when the next window opens")
+			Expect(inSync().Reason).To(Equal(talosv1alpha1.ReasonOutsideWindow))
+
+			at(opens.Add(-time.Second))
+			Expect(operation()).To(BeNil(), "not a second early")
+
+			at(opens)
+			runUntil("the rollout ends", func() bool { return idle() && len(tc.Status.History) == 1 })
+			Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}))
+			Expect(blocked()).To(BeNil())
+		})
+
+		It("finishes the node it is at when the window closes, and begins the next when one opens again", func() {
+			opened := clock.Truncate(time.Minute)
+			// It closes half a minute from now: time for one node's try, not for its soak.
+			setWindows(daily(opened, clock.Sub(opened)+30*time.Second))
+			setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+			settle(nil)
+			Expect(stepIs(worker1, plan.StepVerifying)()).To(BeTrue(), "%+v", operation())
+
+			advance(10 * time.Second)
+			Expect(operation().Current.HealthySince).NotTo(BeNil(), inSync().Message)
+			Expect(blocked()).To(BeNil(), "the window is still open")
+
+			// The window closes in the middle of the node's soak.
+			advance(30 * time.Second)
+			Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1)}), "the node that was being changed is finished")
+			Expect(started()).To(BeTrue(), "the rollout is not over: it waits")
+			Expect(operation().Completed).To(Equal([]string{worker1}))
+			Expect(operation().Current).To(BeNil())
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonOutsideWindow))
+			Expect(inSync().Message).To(ContainSubstring("outside the maintenance windows"))
+
+			advance(time.Hour)
+			Expect(applies()).To(HaveLen(2), "and no other node is begun")
+
+			at(opened.Add(24 * time.Hour))
+			runUntil("the rollout ends", idle)
+			Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}))
+			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+		})
+
+		It("starts nothing while a window cannot be understood, rather than at any time", func() {
+			setWindows(talosv1alpha1.MaintenanceWindow{Schedule: "61 2 * * *", Duration: metav1.Duration{Duration: time.Hour}})
+			setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(applies()).To(BeEmpty())
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonInvalidRollout))
+			Expect(blocked().Message).To(ContainSubstring("maintenanceWindows[0]"))
+
+			setWindows(talosv1alpha1.MaintenanceWindow{
+				Schedule: "0 2 * * *", Duration: metav1.Duration{Duration: time.Hour}, TimeZone: "Europe/Atlantis",
+			})
+			advance(time.Minute)
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonInvalidRollout))
+			Expect(blocked().Message).To(ContainSubstring("Europe/Atlantis"))
+			Expect(applies()).To(BeEmpty())
+		})
+
+		Context("with a gate on an object in the cluster", func() {
+			const healthy, degraded = "HEALTH_OK", "HEALTH_WARN"
+
+			// storage plays the object a gate asks about: a storage cluster's health.
+			storage := func(health string) {
+				GinkgoHelper()
+
+				cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "storage", Namespace: ns}}
+				_, err := controllerutil.CreateOrUpdate(ctx, k8sClient, cm, func() error {
+					cm.Data = map[string]string{"health": health}
+
+					return nil
+				})
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			gate := func(expression string) {
+				GinkgoHelper()
+				updateCluster(func(tc *talosv1alpha1.TalosCluster) {
+					tc.Spec.Rollout.Gates = []talosv1alpha1.RolloutGate{{
+						Name:       "storage-healthy",
+						Object:     talosv1alpha1.GateObject{APIVersion: "v1", Kind: "ConfigMap", Namespace: ns, Name: "storage"},
+						Expression: expression,
+					}}
+				})
+			}
+
+			BeforeEach(func() { gate(`object.data.health == "` + healthy + `"`) })
+
+			It("starts nothing while the gate is not true, and says what it said", func() {
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				advance(time.Minute)
+				Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonGateClosed))
+				Expect(blocked().Message).To(And(ContainSubstring("gate storage-healthy"), ContainSubstring("does not exist")))
+
+				storage(degraded)
+				advance(time.Minute)
+				Expect(blocked().Message).To(And(ContainSubstring("gate storage-healthy"), ContainSubstring("is false")))
+				Expect(operation()).To(BeNil())
+				Expect(applies()).To(BeEmpty())
+
+				// A field that is not there is not true either.
+				gate(`object.status.health == "` + healthy + `"`)
+				advance(time.Minute)
+				Expect(blocked().Message).To(ContainSubstring("no such key"))
+
+				gate(`object.data.health ==`)
+				advance(time.Minute)
+				Expect(blocked().Message).To(ContainSubstring("does not compile"))
+				Expect(applies()).To(BeEmpty())
+
+				gate(`object.data.health == "` + healthy + `"`)
+				storage(healthy)
+				runUntil("the rollout ends", func() bool { return idle() && len(tc.Status.History) == 1 })
+				Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}))
+			})
+
+			It("does not confirm a node, or begin the next, until the gate is true again after it", func() {
+				storage(healthy)
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				settle(nil)
+				Expect(stepIs(worker1, plan.StepVerifying)()).To(BeTrue(), "%+v", operation())
+
+				// The change of the node set something off that the gate watches.
+				storage(degraded)
+				advance(time.Minute)
+				Expect(applies()).To(Equal([]string{tried(worker1)}), "a node is not done while a gate is closed")
+				Expect(inSync().Message).To(ContainSubstring("gate storage-healthy"))
+
+				storage(healthy)
+				advance(10 * time.Second)
+				Expect(applies()).To(Equal([]string{tried(worker1)}), "the soak starts over once the gate is true")
+
+				runUntil("the rollout ends", idle)
+				Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}))
+			})
+
+			It("lets Talos take a config back when the gate stays closed for the whole try", func() {
+				storage(healthy)
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				settle(nil)
+				storage(degraded)
+
+				deadline := operation().Current.Deadline.Time
+				at(deadline)
+				expireTry(worker1)
+				at(deadline.Add(plan.RollbackGrace))
+
+				Expect(failed()).To(BeTrue())
+				Expect(operation().Failure.Reason).To(Equal(plan.FailRolledBack))
+				Expect(applies()).To(Equal([]string{tried(worker1)}), "never confirmed, and no other node touched")
+			})
+		})
+
+		Context("with hooks", func() {
+			var (
+				// seen lists the hooks' Jobs in the order they were created, as "<stage> <machine>".
+				seen []string
+				// jobs maps what seen lists to the Job's name.
+				jobs map[string]string
+				// outcome is what a hook's Job does: succeed, fail, or run on ("").
+				outcome func(stage, machine string) string
+			)
+
+			hook := func(name string, timeout time.Duration) talosv1alpha1.Hook {
+				h := talosv1alpha1.Hook{
+					Name: name,
+					Job:  runtime.RawExtension{Raw: []byte(`{"template":{"spec":{"containers":[{"name":"hook","image":"registry.example.com/hook:1"}]}}}`)},
+				}
+				if timeout > 0 {
+					h.Timeout = &metav1.Duration{Duration: timeout}
+				}
+
+				return h
+			}
+
+			setHooks := func(hooks talosv1alpha1.RolloutHooks) {
+				GinkgoHelper()
+				updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Rollout.Hooks = &hooks })
+			}
+
+			everyStage := func() talosv1alpha1.RolloutHooks {
+				return talosv1alpha1.RolloutHooks{
+					PreRollout: []talosv1alpha1.Hook{hook("announce", 0)}, PostRollout: []talosv1alpha1.Hook{hook("all-clear", 0)},
+					PreNode: []talosv1alpha1.Hook{hook("prepare", 0)}, PostNode: []talosv1alpha1.Hook{hook("release", 0)},
+				}
+			}
+
+			envOf := func(job *batchv1.Job) map[string]string {
+				env := map[string]string{}
+				for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+					env[e.Name] = e.Value
+				}
+
+				return env
+			}
+
+			getJob := func(key string) *batchv1.Job {
+				GinkgoHelper()
+
+				job := &batchv1.Job{}
+				Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: jobs[key]}, job)).To(Succeed(), "no Job for "+key)
+
+				return job
+			}
+
+			BeforeEach(func() {
+				seen, jobs = nil, map[string]string{}
+				outcome = func(string, string) string { return "succeed" }
+
+				// The Job controller, and the pods it would run: each hook's Job ends as the spec says.
+				kubelets = func() {
+					GinkgoHelper()
+
+					var list batchv1.JobList
+					Expect(k8sClient.List(ctx, &list, client.InNamespace(ns), client.HasLabels{LabelHook})).To(Succeed())
+
+					for i := range list.Items {
+						job := &list.Items[i]
+						env := envOf(job)
+						key := strings.TrimSpace(env["TALOS_HOOK"] + " " + env["TALOS_MACHINE"])
+
+						if _, known := jobs[key+" "+job.Name]; !known {
+							jobs[key+" "+job.Name] = job.Name
+							jobs[key] = job.Name
+							seen = append(seen, key)
+						}
+
+						if len(job.Status.Conditions) > 0 {
+							continue
+						}
+
+						now := metav1.NewTime(clock)
+
+						switch outcome(env["TALOS_HOOK"], env["TALOS_MACHINE"]) {
+						case "succeed":
+							job.Status.StartTime, job.Status.CompletionTime, job.Status.Succeeded = &now, &now, 1
+							job.Status.Conditions = []batchv1.JobCondition{
+								{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, LastTransitionTime: now},
+								{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: now},
+							}
+						case "fail":
+							job.Status.StartTime, job.Status.Failed = &now, 1
+							job.Status.Conditions = []batchv1.JobCondition{
+								{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, LastTransitionTime: now, Reason: "BackoffLimitExceeded"},
+								{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, LastTransitionTime: now, Reason: "BackoffLimitExceeded",
+									Message: "Job has reached the specified backoff limit"},
+							}
+						default:
+							continue
+						}
+
+						Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+					}
+				}
+			})
+
+			It("runs them around the rollout and around each node, in order, and ends only when the last is through", func() {
+				setHooks(everyStage())
+
+				// The first hook of a node runs on: nothing is sent to the node while it does.
+				outcome = func(stage, _ string) string {
+					if stage == talosv1alpha1.HookPreNode {
+						return ""
+					}
+
+					return "succeed"
+				}
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the node's hook is started", func() bool { return len(seen) == 2 })
+				advance(time.Minute)
+				Expect(seen).To(Equal([]string{"preRollout", "preNode " + worker1}))
+				Expect(applies()).To(BeEmpty(), "nothing is sent to a node before its preNode hooks are through")
+				Expect(inSync().Message).To(ContainSubstring("preNode hook prepare"))
+
+				job := getJob("preNode " + worker1)
+				Expect(envOf(job)).To(Equal(map[string]string{
+					"TALOS_CLUSTER": tc.Name, "TALOS_OPERATION": "ConfigRollout", "TALOS_OPERATION_ID": operation().ID,
+					"TALOS_HOOK": "preNode", "TALOS_MACHINE": worker1, "TALOS_NODE": node(worker1).node,
+				}))
+				Expect(job.Spec.Template.Spec.RestartPolicy).To(Equal(corev1.RestartPolicyNever))
+				Expect(*job.Spec.BackoffLimit).To(BeZero(), "a hook that fails is not run again behind the operator's back")
+				Expect(*job.Spec.ActiveDeadlineSeconds).To(Equal(int64(plan.DefaultStepTimeout.Seconds())))
+				Expect(metav1.IsControlledBy(job, tc)).To(BeTrue())
+				Expect(job.Name).To(HavePrefix(tc.Name + "-prepare-"))
+
+				outcome = func(string, string) string { return "succeed" }
+				runUntil("the rollout ends", idle)
+
+				Expect(seen).To(Equal([]string{
+					"preRollout",
+					"preNode " + worker1, "postNode " + worker1,
+					"preNode " + worker2, "postNode " + worker2,
+					"postRollout",
+				}))
+				Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}))
+				Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+				Expect(tc.Status.History[0].Completed).To(Equal([]string{worker1, worker2}))
+				Expect(envOf(getJob("postRollout"))).NotTo(HaveKey("TALOS_MACHINE"))
+			})
+
+			It("holds the lock until the postRollout hooks are through", func() {
+				setHooks(talosv1alpha1.RolloutHooks{PostRollout: []talosv1alpha1.Hook{hook("all-clear", 0)}})
+				outcome = func(string, string) string { return "" }
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the last hook is started", func() bool { return len(seen) == 1 })
+				advance(time.Minute)
+
+				Expect(started()).To(BeTrue(), "the operation is not over while it cleans up")
+				Expect(operation().Ending.Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+				Expect(applies()).To(HaveLen(4))
+
+				// Nothing else starts meanwhile: the lock is the operation's.
+				setPoolConfig(talosv1alpha1.MachineRoleControlPlane, labelConfig("two"))
+				advance(time.Minute)
+				Expect(applies()).To(HaveLen(4))
+
+				outcome = func(string, string) string { return "succeed" }
+				runUntil("both rollouts end", func() bool { return idle() && len(tc.Status.History) == 2 })
+				Expect(applies()).To(HaveLen(6))
+			})
+
+			It("halts on a hook that fails, with the node untouched, and runs it again on retry", func() {
+				setHooks(everyStage())
+				outcome = func(stage, machine string) string {
+					if stage == talosv1alpha1.HookPreNode && machine == worker1 {
+						return "fail"
+					}
+
+					return "succeed"
+				}
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the rollout halts", failed)
+
+				f := operation().Failure
+				Expect(f.Reason).To(Equal(plan.FailHook))
+				Expect(f.Hook).To(Equal(talosv1alpha1.HookPreNode))
+				Expect(f.Machine).To(Equal(worker1))
+				Expect(f.Step).To(Equal("preNode/prepare"))
+				Expect(f.Message).To(ContainSubstring("BackoffLimitExceeded"))
+				Expect(f.Remediation).To(And(ContainSubstring("kubectl logs -n "+ns+" job/"+jobs["preNode "+worker1]),
+					ContainSubstring(talosv1alpha1.AnnotationRetry+"="+f.Token), ContainSubstring(talosv1alpha1.AnnotationSkipMachine+"="+f.Token)))
+				Expect(applies()).To(BeEmpty())
+				Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonOperationFailed))
+				Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseDegraded))
+
+				advance(time.Hour)
+				Expect(applies()).To(BeEmpty(), "it stays halted, whatever time passes")
+
+				first := jobs["preNode "+worker1]
+				outcome = func(string, string) string { return "succeed" }
+				annotate(talosv1alpha1.AnnotationRetry, f.Token)
+				runUntil("the rollout ends", idle)
+
+				Expect(jobs["preNode "+worker1]).NotTo(Equal(first), "a retry is a Job of its own")
+				Expect(seen).To(Equal([]string{
+					"preRollout", "preNode " + worker1, "preNode " + worker1, "postNode " + worker1,
+					"preNode " + worker2, "postNode " + worker2, "postRollout",
+				}))
+				Expect(applies()).To(HaveLen(4))
+			})
+
+			It("leaves a node out when its hook failed and a human says so, and still cleans up", func() {
+				setHooks(everyStage())
+				outcome = func(stage, machine string) string {
+					if stage == talosv1alpha1.HookPreNode && machine == worker1 {
+						return "fail"
+					}
+
+					return "succeed"
+				}
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the rollout halts", failed)
+				annotate(talosv1alpha1.AnnotationSkipMachine, operation().Failure.Token)
+				runUntil("the rollout ends", idle)
+
+				Expect(applies()).To(Equal([]string{tried(worker2), confirmed(worker2)}))
+				Expect(tc.Status.History[0].Skipped).To(Equal([]string{worker1}))
+				Expect(seen).To(Equal([]string{"preRollout", "preNode " + worker1, "preNode " + worker2, "postNode " + worker2, "postRollout"}))
+
+				advance(time.Hour)
+				Expect(operation()).To(BeNil(), "and the rollout does not come back for it")
+				Expect(inSync().Reason).To(Equal(talosv1alpha1.ReasonHeld))
+			})
+
+			It("runs the postRollout hooks of a rollout a human aborts, and not of one that never announced itself", func() {
+				setHooks(everyStage())
+				outcome = func(stage, _ string) string {
+					if stage == talosv1alpha1.HookPreNode {
+						return "fail"
+					}
+
+					return "succeed"
+				}
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the rollout halts", failed)
+				annotate(talosv1alpha1.AnnotationAbort, operation().Failure.Token)
+				runUntil("the rollout ends", idle)
+
+				Expect(seen).To(Equal([]string{"preRollout", "preNode " + worker1, "postRollout"}))
+				Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
+				Expect(applies()).To(BeEmpty())
+				advance(time.Hour)
+				Expect(operation()).To(BeNil(), "an aborted rollout is not started again")
+
+				// Another change, whose very first hook fails: what was not set up is not taken down.
+				seen = nil
+				outcome = func(string, string) string { return "fail" }
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("two"))
+				runUntil("the rollout halts", failed)
+				Expect(operation().Failure.Hook).To(Equal(talosv1alpha1.HookPreRollout))
+				Expect(operation().Failure.Remediation).NotTo(ContainSubstring(talosv1alpha1.AnnotationSkipMachine))
+
+				annotate(talosv1alpha1.AnnotationAbort, operation().Failure.Token)
+				runUntil("the rollout ends", idle)
+				Expect(seen).To(Equal([]string{"preRollout"}))
+			})
+
+			It("halts on a hook that does not finish in its time", func() {
+				setHooks(talosv1alpha1.RolloutHooks{PreNode: []talosv1alpha1.Hook{hook("prepare", 2*time.Minute)}})
+				outcome = func(string, string) string { return "" }
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the hook is started", func() bool { return len(seen) == 1 })
+				Expect(*getJob("preNode " + worker1).Spec.ActiveDeadlineSeconds).To(Equal(int64(120)))
+
+				since := operation().Hook.Since.Time
+				at(since.Add(2*time.Minute - time.Second))
+				Expect(failed()).To(BeFalse())
+
+				at(since.Add(2 * time.Minute))
+				Expect(failed()).To(BeTrue())
+				Expect(operation().Failure.Message).To(ContainSubstring("did not succeed within 2m0s"))
+				Expect(applies()).To(BeEmpty())
+			})
+
+			It("halts on a hook whose Job the API server refuses", func() {
+				setHooks(talosv1alpha1.RolloutHooks{PreRollout: []talosv1alpha1.Hook{{
+					Name: "broken", Job: runtime.RawExtension{Raw: []byte(`{"template":{"spec":{"containers":[]}}}`)},
+				}}})
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the rollout halts", failed)
+				Expect(operation().Failure.Message).To(ContainSubstring("could not be created"))
+				Expect(seen).To(BeEmpty())
+				Expect(applies()).To(BeEmpty())
+			})
+
+			It("is carried on by another replica without running a hook twice", func() {
+				setHooks(everyStage())
+				outcome = func(stage, _ string) string {
+					if stage == talosv1alpha1.HookPreNode {
+						return ""
+					}
+
+					return "succeed"
+				}
+
+				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+				runUntil("the node's hook is started", func() bool { return len(seen) == 2 })
+
+				// A new process: nothing but status.operation tells it a hook is running.
+				reconciler = newReconciler()
+				machineReconciler.Resolver = reconciler.Resolver
+				advance(time.Minute)
+				Expect(seen).To(HaveLen(2), "the Job that runs is found, not started again")
+
+				outcome = func(string, string) string { return "succeed" }
+				runUntil("the rollout ends", idle)
+				Expect(seen).To(HaveLen(6))
+			})
+		})
+	})
+
+	Context("a Kubernetes upgrade", func() {
+		const (
+			patch     = "1.37.1"
+			apiServer = "registry.k8s.io/kube-apiserver:v"
+			kubelet   = "ghcr.io/siderolabs/kubelet:v"
+		)
+
+		var (
+			// stuck lists the turns whose component does not come up on the new image: it keeps
+			// running the old one.
+			stuck map[string]bool
+			// running is what each component really runs, by turn.
+			running map[string]string
+		)
+
+		imagesOf := func(machine string) map[string]string {
+			GinkgoHelper()
+
+			images, err := talos.KubernetesImages(scenario.Node(node(machine).addr).Config.Active)
+			Expect(err).NotTo(HaveOccurred())
+
+			return images
+		}
+
+		// pulled lists the images pulled for an upgrade, in order, as "<machine> <image>".
+		pulled := func() []string {
+			var out []string
+
+			for _, c := range scenario.CallsFor(fake.MethodKubernetesImagePull) {
+				for _, n := range rolloutNodes {
+					if n.addr == c.Node {
+						out = append(out, n.machine+" "+c.Image)
+					}
+				}
+			}
+
+			return out
+		}
+
+		upgradeKubernetes := func(version string) {
+			GinkgoHelper()
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) {
+				tc.Spec.Versions.Kubernetes = version
+				tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled
+			})
+		}
+
+		upToDate := func() *metav1.Condition {
+			GinkgoHelper()
+
+			c := condition(tc, talosv1alpha1.ConditionKubernetesUpToDate)
+			Expect(c).NotTo(BeNil())
+
+			return c
+		}
+
+		turnIs := func(component, machine, step string) func() bool {
+			return func() bool {
+				cur := operation()
+
+				return cur != nil && cur.Current != nil && cur.Current.Component == component && cur.Current.Machine == machine &&
+					cur.Current.Step == step
+			}
+		}
+
+		kubernetesOperations := func() []talosv1alpha1.OperationRecord {
+			var out []talosv1alpha1.OperationRecord
+
+			for _, record := range tc.Status.History {
+				if record.Type == talosv1alpha1.OperationKubernetesUpgrade {
+					out = append(out, record)
+				}
+			}
+
+			return out
+		}
+
+		settled := func() bool {
+			return idle() && upToDate().Status == metav1.ConditionTrue && inSync().Status == metav1.ConditionTrue
+		}
+
+		BeforeEach(func() {
+			stuck, running = map[string]bool{}, map[string]string{}
+
+			// The kubelets, as far as Kubernetes itself goes: each runs the components its node's
+			// active config names, mirrors the static pods into the API, and reports its own version.
+			kubelets = func() {
+				GinkgoHelper()
+
+				for _, n := range rolloutNodes {
+					for component, image := range imagesOf(n.machine) {
+						key := plan.TurnKey(component, n.machine)
+						if !stuck[key] || running[key] == "" {
+							running[key] = image
+						}
+
+						if component == plan.ComponentKubelet {
+							version, _ := plan.VersionOf(running[key])
+
+							kube := &corev1.Node{}
+							Expect(k8sClient.Get(ctx, client.ObjectKey{Name: n.node}, kube)).To(Succeed())
+
+							if kube.Status.NodeInfo.KubeletVersion != "v"+version {
+								kube.Status.NodeInfo.KubeletVersion = "v" + version
+								Expect(k8sClient.Status().Update(ctx, kube)).To(Succeed())
+							}
+
+							continue
+						}
+
+						pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: component + "-" + n.node, Namespace: kubeSystem}}
+
+						switch err := k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod); {
+						case apierrors.IsNotFound(err):
+							pod.Labels = map[string]string{"k8s-app": component}
+							pod.Spec = corev1.PodSpec{NodeName: n.node, Containers: []corev1.Container{{Name: component, Image: running[key]}}}
+							Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+
+							pod.Status.Phase = corev1.PodRunning
+							pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+							Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+						case err != nil:
+							Expect(err).NotTo(HaveOccurred())
+						case pod.Spec.Containers[0].Image != running[key]:
+							pod.Spec.Containers[0].Image = running[key]
+							Expect(k8sClient.Update(ctx, pod)).To(Succeed())
+						}
+					}
+				}
+			}
+
+			DeferCleanup(func() {
+				Expect(k8sClient.DeleteAllOf(ctx, &corev1.Pod{}, client.InNamespace(kubeSystem), client.GracePeriodSeconds(0))).To(Succeed())
+			})
+
+			settle(nil)
+		})
+
+		It("reports every node up to date while nothing is asked for", func() {
+			Expect(upToDate().Status).To(Equal(metav1.ConditionTrue), upToDate().Message)
+			Expect(pulled()).To(BeEmpty())
+			Expect(applies()).To(BeEmpty())
+		})
+
+		It("takes every component to the new version, the API server first, each seen running before it is confirmed", func() {
+			upgradeKubernetes(patch)
+			settle(started)
+
+			Expect(operation().Type).To(Equal(talosv1alpha1.OperationKubernetesUpgrade))
+			Expect(operation().Target).To(Equal(patch))
+			Expect(operation().Plan).To(Equal([]string{
+				"kube-apiserver/" + cp1Machine, "kube-controller-manager/" + cp1Machine, "kube-scheduler/" + cp1Machine,
+				"kubelet/" + cp1Machine, "kubelet/" + worker1, "kubelet/" + worker2,
+			}))
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonUpgrading))
+
+			runUntil("the API server is tried", turnIs(plan.ComponentAPIServer, cp1Machine, plan.StepVerifying))
+			Expect(pulled()).To(Equal([]string{cp1Machine + " " + apiServer + patch}), "the image is on the node before its config changes")
+			Expect(applies()).To(Equal([]string{tried(cp1Machine)}))
+			Expect(imagesOf(cp1Machine)[plan.ComponentAPIServer]).To(Equal(apiServer + patch))
+			Expect(imagesOf(cp1Machine)[plan.ComponentControllerManager]).To(HaveSuffix(":v"+kubernetesVersion), "one component at a time")
+			Expect(scenario.TryPending(cpAddr)).To(BeTrue(), "tried, not yet kept")
+
+			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+			Expect(kubernetesOperations()[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+
+			Expect(pulled()).To(Equal([]string{
+				cp1Machine + " " + apiServer + patch,
+				cp1Machine + " registry.k8s.io/kube-controller-manager:v" + patch,
+				cp1Machine + " registry.k8s.io/kube-scheduler:v" + patch,
+				cp1Machine + " " + kubelet + patch, worker1 + " " + kubelet + patch, worker2 + " " + kubelet + patch,
+			}))
+			Expect(applies()[:12]).To(Equal([]string{
+				tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine),
+				tried(cp1Machine), confirmed(cp1Machine), tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2),
+			}))
+
+			for _, n := range rolloutNodes {
+				for component, image := range imagesOf(n.machine) {
+					Expect(image).To(HaveSuffix(":v"+patch), "%s on %s", component, n.machine)
+				}
+
+				Expect(scenario.TryPending(n.addr)).To(BeFalse())
+			}
+
+			// What is left is what the upgrade does not own: the kube-proxy image of the control
+			// plane's config, which a config rollout brings in line.
+			runUntil("everything settles", settled)
+			Expect(upToDate().Message).To(ContainSubstring("all 3 nodes"))
+			Expect(applies()).To(HaveLen(14))
+			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationConfigRollout))
+			Expect(tc.Status.History[0].Completed).To(Equal([]string{cp1Machine}))
+			Expect(drain(recorder)).To(ContainElement(ContainSubstring("KubernetesUpgradeStarted")))
+		})
+
+		It("changes nothing while upgrades are not enabled, and says what is waiting", func() {
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Versions.Kubernetes = patch })
+			advance(time.Hour)
+
+			Expect(upToDate().Status).To(Equal(metav1.ConditionFalse))
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonUpgradesDisabled))
+			Expect(upToDate().Message).To(ContainSubstring(cp1Machine))
+			// And no config rollout applies the images behind the upgrade's back.
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonAwaitingKubernetesUpgrade))
+			Expect(operation()).To(BeNil())
+			Expect(applies()).To(BeEmpty())
+			Expect(pulled()).To(BeEmpty())
+			Expect(getMachine(worker1).Status.Config.ChangeClass).To(Equal("Kubernetes"))
+		})
+
+		It("refuses a version the nodes' Talos does not run, before any node is touched, and says which to upgrade first", func() {
+			upgradeKubernetes("1.38.0")
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(And(ContainSubstring("does not support Kubernetes 1.38.0"), ContainSubstring("upgrade Talos first"),
+				ContainSubstring(node(worker1).node+" ("+talosVersion+")")))
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(pulled()).To(BeEmpty())
+			Expect(applies()).To(BeEmpty())
+		})
+
+		It("refuses a downgrade", func() {
+			upgradeKubernetes("1.36.4")
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(ContainSubstring("not downgraded"))
+			Expect(pulled()).To(BeEmpty())
+		})
+
+		It("refuses an upgrade that would strand what the new version removes, before any node is touched", func() {
+			// A flag a component is started with.
+			scenario.SetRemovedInKubernetes(patch, "kubelet on 10.5.0.3 is started with --container-hints, which the new version removed")
+			upgradeKubernetes(patch)
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(ContainSubstring("--container-hints"))
+			Expect(pulled()).To(BeEmpty())
+
+			// Objects of an API it no longer serves.
+			scenario.SetRemovedInKubernetes(patch)
+			reconciler.KubernetesChecks = KubernetesCheckerFunc(func(context.Context, string, string) ([]string, error) {
+				return []string{"2 object(s) of workloads.v1alpha2.scheduling.k8s.io exist, an API the new version no longer serves"}, nil
+			})
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Message).To(ContainSubstring("workloads.v1alpha2.scheduling.k8s.io"))
+			Expect(pulled()).To(BeEmpty())
+			Expect(applies()).To(BeEmpty())
+
+			// What could not be asked is not fine either.
+			reconciler.KubernetesChecks = KubernetesCheckerFunc(func(context.Context, string, string) ([]string, error) {
+				return nil, errors.New("the server is currently unable to handle the request")
+			})
+			advance(time.Hour)
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonAwaitingStatus))
+			Expect(upToDate().Message).To(ContainSubstring("could not be checked"))
+
+			reconciler.KubernetesChecks = nil
+			advance(time.Hour)
+			Expect(operation()).To(BeNil(), "an operator that cannot ask does not assume")
+
+			reconciler.KubernetesChecks = KubernetesCheckerFunc(func(context.Context, string, string) ([]string, error) { return nil, nil })
+			scenario.FailNext(fake.MethodKubernetesUpgradeChecks, workerAddr, status.Error(codes.Unavailable, "connection refused"))
+			advance(time.Hour)
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonAwaitingStatus))
+
+			scenario.FailNext(fake.MethodKubernetesUpgradeChecks, workerAddr, nil)
+			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+			Expect(kubernetesOperations()[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+		})
+
+		It("asks the Kubernetes API itself for objects of removed APIs", func() {
+			checks := KubernetesCheckerFunc(func(ctx context.Context, from, to string) ([]string, error) {
+				return talos.RemovedAPIObjects(ctx, cfg, from, to)
+			})
+
+			// The API server of these specs serves none of the APIs that 1.37 removes.
+			Expect(checks.RemovedAPIObjects(ctx, "1.36.2", "1.37.1")).To(BeEmpty())
+		})
+
+		Context("with a component that does not come up", func() {
+			var deadline time.Time
+
+			BeforeEach(func() {
+				stuck[plan.TurnKey(plan.ComponentControllerManager, cp1Machine)] = true
+
+				upgradeKubernetes(patch)
+				runUntil("the controller manager is tried", turnIs(plan.ComponentControllerManager, cp1Machine, plan.StepVerifying))
+				advance(time.Minute)
+				Expect(operation().Current.HealthySince).To(BeNil())
+				Expect(upToDate().Message).To(ContainSubstring("kube-controller-manager on " + node(cp1Machine).node + " does not run"))
+
+				// Talos takes the image back when the try ends.
+				deadline = operation().Current.Deadline.Time
+				at(deadline)
+				expireTry(cp1Machine)
+				at(deadline.Add(plan.RollbackGrace))
+			})
+
+			It("halts, with the component back on its previous image and nothing after it touched", func() {
+				Expect(failed()).To(BeTrue())
+
+				f := operation().Failure
+				Expect(f.Reason).To(Equal(plan.FailRolledBack))
+				Expect(f.Machine).To(Equal(cp1Machine))
+				Expect(f.Remediation).To(And(ContainSubstring(talosv1alpha1.AnnotationRetry+"="+f.Token),
+					ContainSubstring(talosv1alpha1.AnnotationAbort+"="+f.Token)))
+				Expect(f.Remediation).NotTo(ContainSubstring(talosv1alpha1.AnnotationSkipMachine),
+					"a Kubernetes upgrade cannot leave a node out")
+
+				Expect(imagesOf(cp1Machine)[plan.ComponentControllerManager]).To(HaveSuffix(":v" + kubernetesVersion))
+				Expect(imagesOf(cp1Machine)[plan.ComponentAPIServer]).To(HaveSuffix(":v"+patch), "what was confirmed stays")
+				Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonOperationFailed))
+				Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseDegraded))
+
+				before := applies()
+				annotate(talosv1alpha1.AnnotationSkipMachine, f.Token)
+				advance(time.Hour)
+				Expect(failed()).To(BeTrue(), "and an annotation that asks for it is not followed")
+				Expect(applies()).To(Equal(before))
+				Expect(pulled()).To(HaveLen(2))
+			})
+
+			It("runs the turn again on retry", func() {
+				stuck = map[string]bool{}
+				annotate(talosv1alpha1.AnnotationRetry, operation().Failure.Token)
+				runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+
+				Expect(kubernetesOperations()[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+				Expect(imagesOf(worker2)[plan.ComponentKubelet]).To(HaveSuffix(":v" + patch))
+			})
+
+			It("ends on abort, and does not start again until the spec asks for another version", func() {
+				stuck = map[string]bool{}
+				annotate(talosv1alpha1.AnnotationAbort, operation().Failure.Token)
+				settle(idle)
+
+				Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
+				Expect(tc.Status.Upgrades.Kubernetes).To(Equal(patch))
+
+				sent := len(applies())
+				advance(time.Hour)
+				Expect(operation()).To(BeNil())
+				Expect(applies()).To(HaveLen(sent))
+				Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonAborted))
+
+				upgradeKubernetes("1.37.2")
+				runUntil("the upgrade to the other version ends", func() bool { return len(kubernetesOperations()) == 2 })
+				Expect(tc.Status.Upgrades).To(BeNil())
+				Expect(imagesOf(cp1Machine)[plan.ComponentControllerManager]).To(HaveSuffix(":v1.37.2"))
+			})
+		})
+
+		It("halts on an image that cannot be pulled, with nothing changed", func() {
+			scenario.FailNext(fake.MethodKubernetesImagePull, cpAddr, status.Error(codes.NotFound, "manifest unknown"))
+			upgradeKubernetes(patch)
+			runUntil("the upgrade halts", failed)
+
+			Expect(operation().Failure.Reason).To(Equal(plan.FailImagePull))
+			Expect(operation().Failure.Message).To(ContainSubstring(apiServer + patch))
+			Expect(applies()).To(BeEmpty())
+			Expect(imagesOf(cp1Machine)[plan.ComponentAPIServer]).To(HaveSuffix(":v" + kubernetesVersion))
+		})
+
+		It("takes a version that is more than a minor away one minor at a time", func() {
+			// The cluster is two minors behind what its spec asks for.
+			for _, n := range rolloutNodes {
+				scenario.UpdateNode(n.addr, func(fn *fake.Node) {
+					images, err := talos.KubernetesImages(fn.Config.Active)
+					Expect(err).NotTo(HaveOccurred())
+
+					for component, image := range images {
+						fn.Config.Active, err = talos.WithKubernetesImage(fn.Config.Active, component, strings.Replace(image, kubernetesVersion, "1.35.4", 1))
+						Expect(err).NotTo(HaveOccurred())
+					}
+				})
+			}
+
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled })
+			settle(started)
+			Expect(operation().Target).To(Equal("1.36.0"), "the first release of the minor in between")
+
+			runUntil("the first hop ends", func() bool { return len(kubernetesOperations()) == 1 })
+			for _, n := range rolloutNodes {
+				Expect(imagesOf(n.machine)[plan.ComponentKubelet]).To(Equal(kubelet + "1.36.0"))
+			}
+
+			runUntil("the second hop ends", func() bool { return len(kubernetesOperations()) == 2 })
+			for _, n := range rolloutNodes {
+				for _, image := range imagesOf(n.machine) {
+					Expect(image).To(HaveSuffix(":v" + kubernetesVersion))
+				}
+			}
+
+			runUntil("everything settles", settled)
+			Expect(pulled()).To(HaveLen(12))
+		})
+
+		It("is carried on by another replica from what is persisted, without a second try", func() {
+			upgradeKubernetes(patch)
+			runUntil("the API server is tried", turnIs(plan.ComponentAPIServer, cp1Machine, plan.StepVerifying))
+
+			reconciler = newReconciler()
+			reconciler.KubernetesChecks = KubernetesCheckerFunc(func(context.Context, string, string) ([]string, error) { return nil, nil })
+			machineReconciler.Resolver = reconciler.Resolver
+
+			runUntil("the scheduler's turn", turnIs(plan.ComponentScheduler, cp1Machine, plan.StepVerifying))
+			Expect(applies()).To(Equal([]string{
+				tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine),
+			}))
+		})
+
+		It("finishes the component it is at when paused, and begins no other", func() {
+			upgradeKubernetes(patch)
+			runUntil("the API server is tried", turnIs(plan.ComponentAPIServer, cp1Machine, plan.StepVerifying))
+
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Paused = true })
+			runUntil("the API server is confirmed", func() bool { return len(operation().Completed) == 1 })
+			advance(time.Hour)
+
+			Expect(applies()).To(Equal([]string{tried(cp1Machine), confirmed(cp1Machine)}))
+			Expect(pulled()).To(HaveLen(1), "not even the next image is pulled")
+			Expect(started()).To(BeTrue())
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonPaused))
+
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Paused = false })
+			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+		})
+
+		It("does not start on a cluster that is not healthy", func() {
+			sicken(worker2, "")
+			upgradeKubernetes(patch)
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonGateClosed))
+			Expect(pulled()).To(BeEmpty())
+		})
+
+		It("refuses to leave a control plane out, and leaves a worker on hold behind", func() {
+			hold := func(machine string, held bool) {
+				GinkgoHelper()
+
+				tm := getMachine(machine)
+				tm.Spec.Hold = held
+				Expect(k8sClient.Update(ctx, tm)).To(Succeed())
+			}
+
+			hold(cp1Machine, true)
+			upgradeKubernetes(patch)
+			advance(time.Hour)
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(ContainSubstring("cannot leave a control plane out"))
+
+			hold(cp1Machine, false)
+			hold(worker2, true)
+			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+
+			Expect(imagesOf(worker1)[plan.ComponentKubelet]).To(HaveSuffix(":v" + patch))
+			Expect(imagesOf(worker2)[plan.ComponentKubelet]).To(HaveSuffix(":v" + kubernetesVersion))
+			runUntil("the rest settles", func() bool { return idle() && upToDate().Reason == talosv1alpha1.ReasonHeld })
+			Expect(upToDate().Message).To(ContainSubstring(worker2))
+		})
+
+		It("runs the rollout's hooks around the upgrade, and none around its nodes", func() {
+			var hooks []string
+
+			inner := kubelets
+			kubelets = func() {
+				GinkgoHelper()
+				inner()
+
+				var list batchv1.JobList
+				Expect(k8sClient.List(ctx, &list, client.InNamespace(ns), client.HasLabels{LabelHook})).To(Succeed())
+
+				for i := range list.Items {
+					job := &list.Items[i]
+					if len(job.Status.Conditions) > 0 {
+						continue
+					}
+
+					hooks = append(hooks, job.Labels[LabelHook])
+
+					now := metav1.NewTime(clock)
+					job.Status.StartTime, job.Status.CompletionTime, job.Status.Succeeded = &now, &now, 1
+					job.Status.Conditions = []batchv1.JobCondition{
+						{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, LastTransitionTime: now},
+						{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: now},
+					}
+					Expect(k8sClient.Status().Update(ctx, job)).To(Succeed())
+				}
+			}
+
+			job := runtime.RawExtension{Raw: []byte(`{"template":{"spec":{"containers":[{"name":"hook","image":"registry.example.com/hook:1"}]}}}`)}
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) {
+				tc.Spec.Rollout.Hooks = &talosv1alpha1.RolloutHooks{
+					PreRollout: []talosv1alpha1.Hook{{Name: "announce", Job: job}}, PostRollout: []talosv1alpha1.Hook{{Name: "all-clear", Job: job}},
+					PreNode: []talosv1alpha1.Hook{{Name: "prepare", Job: job}}, PostNode: []talosv1alpha1.Hook{{Name: "release", Job: job}},
+				}
+			})
+
+			upgradeKubernetes(patch)
+			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
+			Expect(hooks).To(Equal([]string{talosv1alpha1.HookPreRollout, talosv1alpha1.HookPostRollout}))
 		})
 	})
 

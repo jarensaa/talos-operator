@@ -172,6 +172,17 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 		return false, nil, nil
 	}
 
+	// A version the nodes' Talos does not run may not even render. It is refused for what it is,
+	// before anything is asked of a rendered config.
+	if problem := unsupportedKubernetes(tc, obs); problem != "" {
+		setCondition(st, tc.Generation, talosv1alpha1.ConditionKubernetesUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonIncompatible, problem)
+
+		return false, &metav1.Condition{
+			Type: talosv1alpha1.ConditionRolloutBlocked, Status: metav1.ConditionTrue, Reason: talosv1alpha1.ReasonIncompatible,
+			Message: "the Kubernetes upgrade does not start: " + problem,
+		}, nil
+	}
+
 	holds := upgradeHolds(tc)
 	settings := plan.KubernetesSettings{Paused: tc.Spec.Paused, Aborted: holds.Kubernetes, Policy: obs.policy}
 
@@ -209,19 +220,42 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	return st.Operation != nil, r.reportKubernetes(ctx, tc, result, planned, true), nil
 }
 
+// talosVersions is the Talos version of every node that was read, by hostname, and the name of a
+// node whose version was not.
+func talosVersions(obs observation) (map[string]string, string) {
+	versions := map[string]string{}
+
+	for _, n := range obs.facts.nodes {
+		if n.version == "" {
+			return versions, n.hostname
+		}
+
+		versions[n.hostname] = n.version
+	}
+
+	return versions, ""
+}
+
+// unsupportedKubernetes says why the Kubernetes version the spec asks for cannot run on the
+// nodes' Talos, if it cannot.
+func unsupportedKubernetes(tc *talosv1alpha1.TalosCluster, obs observation) string {
+	if tc.Spec.Versions == nil || tc.Spec.Versions.Kubernetes == "" {
+		return ""
+	}
+
+	versions, _ := talosVersions(obs)
+
+	return talos.KubernetesSupportProblem(tc.Spec.Versions.Kubernetes, versions)
+}
+
 // checkKubernetes runs the checks of a hop before any node is touched: that every node's Talos
 // supports the version, that no component is started with something the version removed, and
 // that no object of an API it stops serving exists. It returns what they found, and why they
 // could not all be run, if they could not.
 func (r *TalosClusterReconciler) checkKubernetes(ctx context.Context, obs observation, hop plan.KubernetesHop) ([]string, string) {
-	versions := map[string]string{}
-
-	for _, n := range obs.facts.nodes {
-		if n.version == "" {
-			return nil, "the Talos version of " + n.hostname + " was not read"
-		}
-
-		versions[n.hostname] = n.version
+	versions, unread := talosVersions(obs)
+	if unread != "" {
+		return nil, "the Talos version of " + unread + " was not read"
 	}
 
 	if problem := talos.KubernetesUpgradeProblem(hop.From, hop.Version, versions); problem != "" {

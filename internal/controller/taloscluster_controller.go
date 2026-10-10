@@ -702,13 +702,21 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 		was = nil
 	}
 
-	// The same events tell the story of a config rollout and of an upgrade, under their own names.
+	// The same events tell the story of every kind of operation, under their own names.
 	kind, done, does := "Rollout", "MachineConfigured", "runs its rendered config"
-	upgrade := func(op *talosv1alpha1.Operation) bool {
-		return op != nil && op.Type == talosv1alpha1.OperationTalosUpgrade
+
+	of := is
+	if of == nil {
+		of = was
 	}
-	if upgrade(is) || (is == nil && upgrade(was)) {
-		kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
+
+	if of != nil {
+		switch of.Type { //nolint:exhaustive // every other kind tells the story of a rollout
+		case talosv1alpha1.OperationTalosUpgrade:
+			kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
+		case talosv1alpha1.OperationKubernetesUpgrade:
+			kind, done, does = "KubernetesUpgrade", "ComponentUpgraded", "runs the new version"
+		}
 	}
 
 	if is != nil {
@@ -728,6 +736,10 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 			if !slices.Contains(was.Skipped, name) {
 				warning("MachineSkipped", "%s was left out of %s %s", name, is.Type, is.ID)
 			}
+		}
+
+		if h := is.Hook; h != nil && (was.Hook == nil || was.Hook.Job != h.Job) {
+			normal("HookStarted", "the %s hook %s of %s %s runs as Job %s", h.Stage, h.Name, is.Type, is.ID, h.Job)
 		}
 
 		switch {
