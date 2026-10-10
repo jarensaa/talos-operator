@@ -65,6 +65,8 @@ A Kubernetes operator that manages Talos Linux clusters declaratively through CR
 
 Milestones M0–M9 are tracked as beads epics; run `bd ready` for unblocked work.
 
+**The beads database stays on the machine it lives on.** Its issue text is working notes, not vetted for publication: never commit `.beads/`, and never run a Dolt remote sync against this repository's remote.
+
 **Nothing about a real cluster belongs in this repository.** Docs, samples and test fixtures use invented names, addresses and hardware identifiers (`my-cluster`, `10.0.0.11`, `cluster.example.com`, `aaaaaaaa-bbbb-4ccc-8ddd-000000000001`). Never copy a value read from a live cluster or from someone's infrastructure repository into a file here, a commit message or a pull request.
 
 ## Guiding principles
