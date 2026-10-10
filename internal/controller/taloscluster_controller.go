@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -33,8 +34,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -80,6 +83,8 @@ type TalosClusterReconciler struct {
 	APIReader client.Reader
 	// Evictor evicts the pods of a node an upgrade is about to reboot.
 	Evictor PodEvictor
+	// KubernetesChecks asks the Kubernetes API what stands in the way of a Kubernetes upgrade.
+	KubernetesChecks KubernetesChecker
 	// NodeName is the Kubernetes node this replica runs on, if it knows. An upgrade takes that
 	// node last in its group, so the operator moves house as rarely as it can.
 	NodeName string
@@ -143,6 +148,7 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if adoptErr == nil && managing(tc) {
+		obs.policy, obs.policyChanges = r.policy(ctx, tc)
 		adoptErr = r.manage(ctx, tc, obs)
 	}
 
@@ -180,10 +186,20 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// A node step in flight is driven by time (the try window, the soak), so it is re-evaluated
 	// often rather than on the observe interval.
 	if op := tc.Status.Operation; op != nil && op.Failure == nil {
-		return ctrl.Result{RequeueAfter: min(r.interval(), rolloutInterval)}, nil
+		return ctrl.Result{RequeueAfter: r.untilWindow(obs, min(r.interval(), rolloutInterval))}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: r.interval()}, nil
+	return ctrl.Result{RequeueAfter: r.untilWindow(obs, r.interval())}, nil
+}
+
+// untilWindow shortens a wait so that it ends when the maintenance windows open or close.
+func (r *TalosClusterReconciler) untilWindow(obs observation, wait time.Duration) time.Duration {
+	if obs.policyChanges.IsZero() {
+		return wait
+	}
+
+	// A moment later, so that the pass it brings finds the window changed.
+	return max(min(wait, obs.policyChanges.Sub(r.now())+time.Second), time.Second)
 }
 
 // proving reports whether the adoption proof is evaluated: the cluster is observed only and was
@@ -233,6 +249,11 @@ type observation struct {
 	endpoints      talos.SelectOptions
 	health         *talos.HealthResult
 	healthErrorMsg string
+
+	// policy is what the user's rollout policy says in this pass, and policyChanges when its
+	// maintenance windows say something else next; zero if they never do (docs/scope.md §6.4).
+	policy        plan.Policy
+	policyChanges time.Time
 }
 
 func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions) observation {
@@ -683,13 +704,21 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 		was = nil
 	}
 
-	// The same events tell the story of a config rollout and of an upgrade, under their own names.
+	// The same events tell the story of every kind of operation, under their own names.
 	kind, done, does := "Rollout", "MachineConfigured", "runs its rendered config"
-	upgrade := func(op *talosv1alpha1.Operation) bool {
-		return op != nil && op.Type == talosv1alpha1.OperationTalosUpgrade
+
+	of := is
+	if of == nil {
+		of = was
 	}
-	if upgrade(is) || (is == nil && upgrade(was)) {
-		kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
+
+	if of != nil {
+		switch of.Type { //nolint:exhaustive // every other kind tells the story of a rollout
+		case talosv1alpha1.OperationTalosUpgrade:
+			kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
+		case talosv1alpha1.OperationKubernetesUpgrade:
+			kind, done, does = "KubernetesUpgrade", "ComponentUpgraded", "runs the new version"
+		}
 	}
 
 	if is != nil {
@@ -711,10 +740,13 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 			}
 		}
 
+		if h := is.Hook; h != nil && (was.Hook == nil || was.Hook.Job != h.Job) {
+			normal("HookStarted", "the %s hook %s of %s %s runs as Job %s", h.Stage, h.Name, is.Type, is.ID, h.Job)
+		}
+
 		switch {
 		case is.Failure != nil && (was.Failure == nil || was.Failure.Token != is.Failure.Token):
-			warning(kind+"Halted", "%s, step %s (%s): %s %s",
-				is.Failure.Machine, is.Failure.Step, is.Failure.Reason, is.Failure.Message, is.Failure.Remediation)
+			warning(kind+"Halted", "%s: %s %s", haltedAt(is.Failure), is.Failure.Message, is.Failure.Remediation)
 		case is.Failure == nil && was.Failure != nil:
 			normal(kind+"Resumed", "%s %s continues after %s", is.Type, is.ID, was.Failure.Reason)
 		}
@@ -838,6 +870,14 @@ func (r *TalosClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(target.ClustersForSecret(mgr.GetClient()))).
 		Watches(&talosv1alpha1.TalosMachine{}, handler.EnqueueRequestsFromMapFunc(clusterOfMachine(mgr.GetClient()))).
 		Watches(&talosv1alpha1.TalosMachinePool{}, handler.EnqueueRequestsFromMapFunc(clusterOfPool)).
+		// A hook's Job that finishes moves its operation on.
+		Owns(&batchv1.Job{}).
+		// A pass that fails is tried again soon, however often it failed before. The default backs
+		// off for up to a quarter of an hour, and a failing pass is usually the Kubernetes API being
+		// away for a while: when it is back, a config that is being tried has a deadline to keep.
+		WithOptions(controller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, 2*rolloutInterval),
+		}).
 		Named("taloscluster").
 		Complete(r)
 }

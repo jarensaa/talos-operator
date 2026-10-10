@@ -46,7 +46,7 @@ import (
 // Reviewed: every method below reads state through an allowlisted RPC (COSI Get/List, Version,
 // EtcdMemberList, EtcdStatus, ClusterService.HealthCheck).
 var readerMethods = []string{
-	"BootID", "DryRunApply", "EtcdMembers", "EtcdStatus", "HealthCheck", "ImageFactorySchematic", "MachineConfig",
+	"BootID", "DryRunApply", "EtcdMembers", "EtcdStatus", "HealthCheck", "ImageFactorySchematic", "KubernetesUpgradeChecks", "MachineConfig",
 	"MachineStatus", "MachineType", "Members", "Nodename", "Services", "SystemInformation",
 	"UnattendedInstallStatus", "Version",
 }

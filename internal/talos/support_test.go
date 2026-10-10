@@ -52,7 +52,7 @@ func TestMaxSupportedMinorMatchesMachinery(t *testing.T) {
 func TestSupportsTalos(t *testing.T) {
 	for tag, want := range map[string]bool{
 		apiVersion: true, "v1.14.0": true, "v1.13.5": true,
-		"v1.12.4": false, "v1.15.0": false, "v2.0.0": false, "garbage": false,
+		"v1.12.4": false, "v1.15.0": false, "v2.0.0": false, garbage: false,
 	} {
 		if got, why := SupportsTalos(tag); got != want {
 			t.Errorf("%s: got %v (%s), want %v", tag, got, why, want)

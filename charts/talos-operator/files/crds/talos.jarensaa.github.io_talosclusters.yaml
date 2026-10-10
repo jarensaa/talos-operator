@@ -264,6 +264,225 @@ spec:
                     - Report
                     - Enforce
                     type: string
+                  gates:
+                    description: |-
+                      Gates are conditions on objects in the cluster that must hold before a node is touched and
+                      while a changed node is verified, next to the cluster's own health (docs/scope.md §6.4).
+                    items:
+                      description: |-
+                        RolloutGate is a condition on one object in the cluster. The operator needs permission to get
+                        the object; the chart grants what its gates.rules value lists.
+                      properties:
+                        expression:
+                          description: |-
+                            Expression is a CEL expression over the object, as "object". The gate is open only while it
+                            evaluates to true, e.g. object.status.ceph.health == "HEALTH_OK". An object that does not
+                            exist, a field that is not there, or anything but a boolean closes the gate.
+                          maxLength: 1024
+                          minLength: 1
+                          type: string
+                        name:
+                          description: Name of the gate, used in conditions.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                        object:
+                          description: Object is what the gate asks about.
+                          properties:
+                            apiVersion:
+                              description: APIVersion of the object, e.g. ceph.rook.io/v1.
+                              minLength: 1
+                              type: string
+                            kind:
+                              description: Kind of the object, e.g. CephCluster.
+                              minLength: 1
+                              type: string
+                            name:
+                              description: Name of the object.
+                              minLength: 1
+                              type: string
+                            namespace:
+                              description: Namespace of the object; empty for a cluster-scoped
+                                one.
+                              type: string
+                          required:
+                          - apiVersion
+                          - kind
+                          - name
+                          type: object
+                      required:
+                      - expression
+                      - name
+                      - object
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  hooks:
+                    description: Hooks are Jobs run around an operation and around
+                      each node's turn (docs/scope.md §6.4).
+                    properties:
+                      postNode:
+                        description: PostNode runs after a node was verified. A node
+                          that failed gets none.
+                        items:
+                          description: Hook is a Job the operator runs and waits for.
+                          properties:
+                            job:
+                              description: |-
+                                Job is a batch/v1 JobSpec. The operator creates the Job in the TalosCluster's namespace and
+                                adds the environment variables TALOS_CLUSTER, TALOS_OPERATION, TALOS_OPERATION_ID,
+                                TALOS_HOOK and, for a node's hooks, TALOS_MACHINE and TALOS_NODE to every container. It sets
+                                restartPolicy Never and backoffLimit 0 where the spec leaves them open. The spec is not
+                                validated before the Job is created: one the API server refuses fails the hook.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                            name:
+                              description: Name of the hook, used in the Job's name
+                                and in conditions.
+                              pattern: ^[a-z0-9]([-a-z0-9]{0,22}[a-z0-9])?$
+                              type: string
+                            timeout:
+                              description: |-
+                                Timeout is how long the Job may take. A Job that has not succeeded by then fails the hook,
+                                which halts the operation. Defaults to spec.rollout.stepTimeout.
+                              type: string
+                          required:
+                          - job
+                          - name
+                          type: object
+                        maxItems: 8
+                        type: array
+                      postRollout:
+                        description: PostRollout runs when an operation that ran its
+                          preRollout hooks ends, however it ends.
+                        items:
+                          description: Hook is a Job the operator runs and waits for.
+                          properties:
+                            job:
+                              description: |-
+                                Job is a batch/v1 JobSpec. The operator creates the Job in the TalosCluster's namespace and
+                                adds the environment variables TALOS_CLUSTER, TALOS_OPERATION, TALOS_OPERATION_ID,
+                                TALOS_HOOK and, for a node's hooks, TALOS_MACHINE and TALOS_NODE to every container. It sets
+                                restartPolicy Never and backoffLimit 0 where the spec leaves them open. The spec is not
+                                validated before the Job is created: one the API server refuses fails the hook.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                            name:
+                              description: Name of the hook, used in the Job's name
+                                and in conditions.
+                              pattern: ^[a-z0-9]([-a-z0-9]{0,22}[a-z0-9])?$
+                              type: string
+                            timeout:
+                              description: |-
+                                Timeout is how long the Job may take. A Job that has not succeeded by then fails the hook,
+                                which halts the operation. Defaults to spec.rollout.stepTimeout.
+                              type: string
+                          required:
+                          - job
+                          - name
+                          type: object
+                        maxItems: 8
+                        type: array
+                      preNode:
+                        description: |-
+                          PreNode runs when a node's turn comes, before anything is sent to it. A Kubernetes upgrade
+                          takes no node out of the cluster and runs no node hooks.
+                        items:
+                          description: Hook is a Job the operator runs and waits for.
+                          properties:
+                            job:
+                              description: |-
+                                Job is a batch/v1 JobSpec. The operator creates the Job in the TalosCluster's namespace and
+                                adds the environment variables TALOS_CLUSTER, TALOS_OPERATION, TALOS_OPERATION_ID,
+                                TALOS_HOOK and, for a node's hooks, TALOS_MACHINE and TALOS_NODE to every container. It sets
+                                restartPolicy Never and backoffLimit 0 where the spec leaves them open. The spec is not
+                                validated before the Job is created: one the API server refuses fails the hook.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                            name:
+                              description: Name of the hook, used in the Job's name
+                                and in conditions.
+                              pattern: ^[a-z0-9]([-a-z0-9]{0,22}[a-z0-9])?$
+                              type: string
+                            timeout:
+                              description: |-
+                                Timeout is how long the Job may take. A Job that has not succeeded by then fails the hook,
+                                which halts the operation. Defaults to spec.rollout.stepTimeout.
+                              type: string
+                          required:
+                          - job
+                          - name
+                          type: object
+                        maxItems: 8
+                        type: array
+                      preRollout:
+                        description: PreRollout runs after an operation took the lock,
+                          before its first node.
+                        items:
+                          description: Hook is a Job the operator runs and waits for.
+                          properties:
+                            job:
+                              description: |-
+                                Job is a batch/v1 JobSpec. The operator creates the Job in the TalosCluster's namespace and
+                                adds the environment variables TALOS_CLUSTER, TALOS_OPERATION, TALOS_OPERATION_ID,
+                                TALOS_HOOK and, for a node's hooks, TALOS_MACHINE and TALOS_NODE to every container. It sets
+                                restartPolicy Never and backoffLimit 0 where the spec leaves them open. The spec is not
+                                validated before the Job is created: one the API server refuses fails the hook.
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                            name:
+                              description: Name of the hook, used in the Job's name
+                                and in conditions.
+                              pattern: ^[a-z0-9]([-a-z0-9]{0,22}[a-z0-9])?$
+                              type: string
+                            timeout:
+                              description: |-
+                                Timeout is how long the Job may take. A Job that has not succeeded by then fails the hook,
+                                which halts the operation. Defaults to spec.rollout.stepTimeout.
+                              type: string
+                          required:
+                          - job
+                          - name
+                          type: object
+                        maxItems: 8
+                        type: array
+                    type: object
+                  maintenanceWindows:
+                    description: |-
+                      MaintenanceWindows are the times at which an operation may start, and may begin another node
+                      (docs/scope.md §6.4). With none, any time is allowed. A node that is being changed when a
+                      window closes is finished.
+                    items:
+                      description: MaintenanceWindow is a recurring time at which
+                        nodes may be changed.
+                      properties:
+                        duration:
+                          description: Duration is how long the window stays open.
+                          type: string
+                        schedule:
+                          description: |-
+                            Schedule is when the window opens, as a cron expression of five fields: minute, hour, day of
+                            month, month, day of week. For example "0 2 * * 6" is Saturdays at 02:00.
+                          maxLength: 128
+                          pattern: ^\S+(\s+\S+){4}$
+                          type: string
+                        timeZone:
+                          description: TimeZone is the IANA time zone the schedule
+                            is read in, e.g. Europe/Oslo. UTC if empty.
+                          maxLength: 64
+                          type: string
+                      required:
+                      - duration
+                      - schedule
+                      type: object
+                      x-kubernetes-validations:
+                      - message: duration must be positive
+                        rule: duration(self.duration) > duration('0s')
+                    maxItems: 16
+                    type: array
                   soak:
                     description: |-
                       Soak is how long a node must stay healthy under a new config before it is confirmed and the
@@ -578,6 +797,10 @@ spec:
               operation:
                 description: Operation is the in-flight disruptive operation, if any.
                 properties:
+                  announced:
+                    description: 'Announced is set once the preRollout hooks ran,
+                      or there were none: nodes may begin.'
+                    type: boolean
                   bases:
                     additionalProperties:
                       type: string
@@ -599,6 +822,10 @@ spec:
                         description: Class is the change class that selected the node's
                           apply strategy (docs/scope.md §6.3).
                         type: string
+                      component:
+                        description: Component is the Kubernetes component a step
+                          of a Kubernetes upgrade changes.
+                        type: string
                       cordoned:
                         description: |-
                           Cordoned is set before the operator cordons the node, so that it later uncordons a node it
@@ -619,8 +846,9 @@ spec:
                         format: date-time
                         type: string
                       image:
-                        description: Image is the installer image an upgrade step
-                          installs.
+                        description: |-
+                          Image is the image an upgrade step installs: the installer of a Talos upgrade, or the
+                          component's image of a Kubernetes upgrade.
                         type: string
                       machine:
                         description: Machine is the TalosMachine being acted on.
@@ -645,12 +873,28 @@ spec:
                     - since
                     - step
                     type: object
+                  ending:
+                    description: Ending is set when the operation is over and only
+                      its postRollout hooks remain.
+                    properties:
+                      message:
+                        type: string
+                      outcome:
+                        description: Outcome is Succeeded, Aborted or Superseded.
+                        type: string
+                    required:
+                    - outcome
+                    type: object
                   failure:
                     description: Failure is set when the operation is halted.
                     properties:
                       at:
                         description: At is when the failure was recorded.
                         format: date-time
+                        type: string
+                      hook:
+                        description: Hook is the stage of the hook that failed, if
+                          a hook did.
                         type: string
                       machine:
                         description: Machine where the failure happened.
@@ -677,14 +921,62 @@ spec:
                     - message
                     - step
                     type: object
+                  finishing:
+                    type: string
+                  hook:
+                    description: Hook is the hook that is running, if one is (docs/scope.md
+                      §6.4).
+                    properties:
+                      attempt:
+                        description: Attempt counts runs of this hook, starting at
+                          1; retry increments it and so names a new Job.
+                        format: int32
+                        type: integer
+                      index:
+                        description: Index is the hook's position in its list, and
+                          Name its name.
+                        format: int32
+                        type: integer
+                      job:
+                        description: Job is the name of the hook's Job.
+                        type: string
+                      machine:
+                        description: Machine is the machine whose turn a node hook
+                          belongs to.
+                        type: string
+                      name:
+                        type: string
+                      since:
+                        description: Since is when the hook was started.
+                        format: date-time
+                        type: string
+                      stage:
+                        description: Stage is preRollout, postRollout, preNode or
+                          postNode.
+                        type: string
+                    required:
+                    - attempt
+                    - index
+                    - job
+                    - name
+                    - since
+                    - stage
+                    type: object
                   id:
                     description: ID uniquely identifies the operation.
                     type: string
                   plan:
-                    description: Plan lists machines in execution order.
+                    description: |-
+                      Plan lists the operation's turns in execution order: machines, or for a Kubernetes upgrade
+                      one component on one machine each, as "<component>/<machine>".
                     items:
                       type: string
                     type: array
+                  prepared:
+                    description: |-
+                      Prepared is the turn whose preNode hooks ran, and Finishing the turn whose postNode hooks
+                      are due: it is verified, and counts as completed once they ran.
+                    type: string
                   skipped:
                     description: Skipped lists machines a human skipped after a failure.
                     items:
@@ -739,6 +1031,11 @@ spec:
                     description: 'Aborted: the upgrade was aborted before it reached
                       the machine, or while it was at it.'
                     type: object
+                  kubernetes:
+                    description: |-
+                      Kubernetes is the Kubernetes version whose upgrade a human aborted. It is not started again;
+                      an upgrade to any other version is (docs/scope.md §7.4).
+                    type: string
                   skipped:
                     additionalProperties:
                       type: string

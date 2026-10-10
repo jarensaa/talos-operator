@@ -183,10 +183,10 @@ func TestPlanRolloutBlocks(t *testing.T) {
 		reason   string
 		message  string
 	}{
-		{"paused", change, Settings{Paused: true}, openPass, BlockPaused, "spec.paused"},
+		{wordPaused, change, Settings{Paused: true}, openPass, BlockPaused, "spec.paused"},
 		{"a closed gate", change, Settings{}, closedPass, BlockGateClosed, closedPass.HealthMessage},
 		{"an aborted change is not started again", change, Settings{AbortedTargets: map[string]string{w1: "b", "w-9": "b"}}, openPass,
-			BlockAborted, "aborted"},
+			BlockAborted, wordAborted},
 		{"stale status", append(slices.Clone(change), stale), Settings{}, openPass, BlockNotCurrent, w2},
 		{"a protected field", []Machine{changed(cp1, true, classify.Protected)}, Settings{}, openPass, BlockProtected, "cp-1 (v1alpha1/Example)"},
 		{"a boot-time change", []Machine{changed(w1, false, classify.BootTime)}, Settings{}, openPass, BlockRequiresReinstall, w1},

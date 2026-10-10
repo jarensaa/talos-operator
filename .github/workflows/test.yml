@@ -41,10 +41,7 @@ jobs:
           key: bin-${{ runner.os }}-${{ hashFiles('Makefile', 'go.mod') }}
 
       - name: Modules, generated code and formatting are committed
-        run: |
-          go mod tidy
-          make manifests generate fmt
-          git diff --exit-code
+        run: make committed
 
       # test-unit skips the regenerate/fmt/vet prerequisites of `make test`: the step above checks
       # them and golangci-lint runs vet.

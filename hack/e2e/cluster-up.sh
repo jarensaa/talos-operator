@@ -16,7 +16,9 @@ CLUSTER_NAME=${CLUSTER_NAME:-talos-operator-e2e}
 # that the suite has a Talos upgrade to perform (test/e2e/adoption_test.go).
 TALOS_VERSION=${TALOS_VERSION:-v1.14.1}
 UPGRADE_TO=${UPGRADE_TO:-v1.14.2}
-KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.37.0}
+# Likewise for Kubernetes: one minor below KUBERNETES_UPGRADE_TO, for the suite to upgrade.
+KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.36.0}
+KUBERNETES_UPGRADE_TO=${KUBERNETES_UPGRADE_TO:-1.37.0}
 CONTROLPLANES=${CONTROLPLANES:-3}
 WORKERS=${WORKERS:-1}
 # Extra workers left in maintenance mode, for expansion tests (M7).
@@ -232,6 +234,8 @@ export E2E_WORKERS="${worker_ips[*]}"
 export E2E_MAINTENANCE_NODES="${maintenance_ips[*]}"
 export E2E_TALOS_VERSION="$TALOS_VERSION"
 export E2E_UPGRADE_TO="$UPGRADE_TO"
+export E2E_KUBERNETES_VERSION="$KUBERNETES_VERSION"
+export E2E_KUBERNETES_UPGRADE_TO="$KUBERNETES_UPGRADE_TO"
 ENV
 
 log "cluster $CLUSTER_NAME is ready; source $E2E_DIR/env"

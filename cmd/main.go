@@ -17,12 +17,16 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	// The time zones of maintenance windows, whatever the image the operator runs in has.
+	_ "time/tzdata"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -168,6 +172,10 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) e
 		// The chart passes the node's name down; without it the operator simply does not know
 		// which node an upgrade should leave for last.
 		NodeName: os.Getenv("NODE_NAME"),
+		// The cluster the operator runs in is the cluster it manages (docs/scope.md §4.2).
+		KubernetesChecks: controller.KubernetesCheckerFunc(func(ctx context.Context, from, to string) ([]string, error) {
+			return talos.RemovedAPIObjects(ctx, mgr.GetConfig(), from, to)
+		}),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("TalosCluster controller: %w", err)
 	}

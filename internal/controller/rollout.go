@@ -78,7 +78,7 @@ func (r *TalosClusterReconciler) rollout(ctx context.Context, tc *talosv1alpha1.
 		}
 
 		note, err := r.continueRollout(ctx, tc, obs, pools, machines, timing)
-		reportOperation(tc, note)
+		reportOperation(tc, obs, note)
 
 		return err
 	}
@@ -127,9 +127,12 @@ type machineView struct {
 	node *nodeFacts
 	// live is the node's normalized active config; nil if it could not be read.
 	live *render.Config
-	// desired is what the spec renders now; nil if it does not render, and problem says why.
-	desired *render.Config
-	problem string
+	// rendered is what the spec renders now, and desired what a config rollout is to bring the
+	// node to: the same, but for the images of the Kubernetes components, which stay as the
+	// node has them (withLiveKubernetes). Both are nil if the spec does not render, and problem
+	// says why.
+	rendered, desired *render.Config
+	problem           string
 	// withhold is set when a config source is a Secret: what Talos says about the config may
 	// quote it, so it is not repeated.
 	withhold bool
@@ -164,8 +167,16 @@ func (r *TalosClusterReconciler) view(ctx context.Context, tc *talosv1alpha1.Tal
 		return v, nil
 	}
 
-	v.desired = desired
+	v.rendered, v.desired = desired, desired
 	v.withhold = len(resolved.fromSecrets) > 0
+
+	if v.live != nil {
+		if v.desired, _, err = withLiveKubernetes(desired, v.node.activeConfig); err != nil {
+			v.rendered, v.desired, v.problem = nil, nil, "keep the node's Kubernetes images: "+err.Error()
+
+			return v, nil //nolint:nilerr // a problem of this machine's config, which the planner is told as such
+		}
+	}
 
 	if v.live != nil {
 		// A node that runs what its config's installer installs takes that config like any other.
@@ -175,7 +186,7 @@ func (r *TalosClusterReconciler) view(ctx context.Context, tc *talosv1alpha1.Tal
 		}
 
 		if v.change, err = classify.Classify(v.live, v.desired, opts...); err != nil {
-			v.desired, v.problem = nil, "classify the change: "+err.Error()
+			v.rendered, v.desired, v.problem = nil, nil, "classify the change: "+err.Error()
 		}
 	}
 
@@ -275,6 +286,7 @@ func (r *TalosClusterReconciler) planRollout(ctx context.Context, tc *talosv1alp
 		Paused:         tc.Spec.Paused,
 		ApprovedChange: tc.Annotations[talosv1alpha1.AnnotationApproveDiff],
 		AbortedTargets: st.AbortedTargets,
+		Policy:         obs.policy,
 	}, passOf(obs))
 
 	if !result.AbortStands {
@@ -374,9 +386,31 @@ func reportPlan(tc *talosv1alpha1.TalosCluster, obs observation, result plan.Rol
 	}
 }
 
+// reportHeld sets RolloutBlocked for an operation in flight that begins no new node, because it
+// is paused or no maintenance window is open, and clears it otherwise. finishes says what is
+// still done.
+func reportHeld(tc *talosv1alpha1.TalosCluster, policy plan.Policy, finishes string) {
+	st, gen := &tc.Status, tc.Generation
+
+	switch {
+	case tc.Spec.Paused:
+		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonPaused,
+			"spec.paused is set: "+finishes)
+	case policy.OutsideWindow != "":
+		reason := talosv1alpha1.ReasonOutsideWindow
+		if policy.WindowsInvalid {
+			reason = talosv1alpha1.ReasonInvalidRollout
+		}
+
+		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, reason, policy.OutsideWindow+": "+finishes)
+	default:
+		meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionRolloutBlocked)
+	}
+}
+
 // reportOperation sets ConfigInSync and RolloutBlocked for the operation in flight. note is what
 // the step in flight waits for, if anything.
-func reportOperation(tc *talosv1alpha1.TalosCluster, note string) {
+func reportOperation(tc *talosv1alpha1.TalosCluster, obs observation, note string) {
 	st := &tc.Status
 	gen := tc.Generation
 
@@ -387,7 +421,7 @@ func reportOperation(tc *talosv1alpha1.TalosCluster, note string) {
 	}
 
 	if f := op.Failure; f != nil {
-		msg := fmt.Sprintf("the rollout halted at %s, step %s (%s): %s", f.Machine, f.Step, f.Reason, f.Message)
+		msg := fmt.Sprintf("the rollout halted %s: %s", haltedAt(f), f.Message)
 
 		setCondition(st, gen, talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonOperationFailed, msg)
 		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed,
@@ -399,26 +433,8 @@ func reportOperation(tc *talosv1alpha1.TalosCluster, note string) {
 
 	st.Phase = talosv1alpha1.ClusterPhaseManaged
 
-	progress := fmt.Sprintf("%d of %d machines done", len(op.Completed)+len(op.Skipped), len(op.Plan))
-
-	if cur := op.Current; cur != nil {
-		progress += fmt.Sprintf("; %s is %s", cur.Machine, cur.Step)
-
-		if note != "" {
-			progress += ": " + note
-		}
-	}
-
-	setCondition(st, gen, talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonRollingOut, progress)
-
-	if tc.Spec.Paused {
-		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonPaused,
-			"spec.paused is set: a node whose config is being tried is still verified and confirmed, no other node is touched")
-
-		return
-	}
-
-	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionRolloutBlocked)
+	setCondition(st, gen, talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonRollingOut, progressOf(op, note))
+	reportHeld(tc, obs.policy, "a node whose config is being tried is still verified and confirmed, no other node is touched")
 }
 
 // continueRollout carries the operation in flight one step further. It returns what the step
@@ -440,47 +456,58 @@ func (r *TalosClusterReconciler) continueRollout(ctx context.Context, tc *talosv
 		return machineView{}, nil
 	}
 
-	switch {
-	case op.Failure != nil:
-		return "", r.actOnFailure(ctx, tc, view, timing)
-	case op.Current == nil:
-		return r.nextMachine(tc, view, timing)
-	default:
-		v, err := view(op.Current.Machine)
-		if err != nil {
-			return "", err
-		}
+	return r.drive(ctx, tc, obs, timing, turns{
+		begin: func(key string, attempt int32) error {
+			v, err := view(key)
+			if err != nil {
+				return err
+			}
 
-		return r.step(ctx, tc, obs, v, timing)
-	}
+			r.begin(tc, key, v, attempt, timing)
+
+			return nil
+		},
+		step: func() (string, error) {
+			v, err := view(op.Current.Machine)
+			if err != nil {
+				return "", err
+			}
+
+			return r.step(ctx, tc, obs, v, timing)
+		},
+		failed:    func() error { return r.actOnFailure(ctx, tc, view, timing) },
+		skip:      func(machine string) error { return r.skipConfig(ctx, tc, view, machine) },
+		abort:     func() { abortConfig(tc) },
+		nodeHooks: true,
+	})
 }
 
-// nextMachine moves on to the next planned machine, or ends an operation that has none left.
-func (r *TalosClusterReconciler) nextMachine(tc *talosv1alpha1.TalosCluster, view func(string) (machineView, error), timing plan.Timing,
-) (string, error) {
+// abortConfig records what an aborted rollout was applying. What was left is not rolled out again
+// as it is: only a spec that renders something else gets a rollout going.
+func abortConfig(tc *talosv1alpha1.TalosCluster) {
 	op := tc.Status.Operation
 
-	i := slices.IndexFunc(op.Plan, func(name string) bool {
-		return !slices.Contains(op.Completed, name) && !slices.Contains(op.Skipped, name)
-	})
-	if i < 0 {
-		r.finish(tc, talosv1alpha1.OperationSucceeded, "")
-
-		return "", nil
+	aborted := maps.Clone(op.Targets)
+	for _, done := range op.Completed {
+		delete(aborted, done)
 	}
 
-	if tc.Spec.Paused {
-		return "", nil
+	tc.Status.AbortedTargets = aborted
+}
+
+// skipConfig records on a machine that a human left its rendered config out, so that it is not
+// rolled out to it again.
+func (r *TalosClusterReconciler) skipConfig(ctx context.Context, tc *talosv1alpha1.TalosCluster, view func(string) (machineView, error),
+	machine string,
+) error {
+	v, err := view(machine)
+	if err != nil || v.tm == nil {
+		return err
 	}
 
-	v, err := view(op.Plan[i])
-	if err != nil {
-		return "", err
-	}
+	hash := tc.Status.Operation.Targets[machine]
 
-	r.begin(tc, op.Plan[i], v, 1, timing)
-
-	return "", nil
+	return r.patchMachineConfig(ctx, v.tm, func(cfg *talosv1alpha1.ConfigState) { cfg.SkippedHash = hash })
 }
 
 // begin persists the first step of a machine's turn. Nothing is sent to Talos in the same
@@ -507,17 +534,17 @@ func (r *TalosClusterReconciler) begin(tc *talosv1alpha1.TalosCluster, name stri
 	switch {
 	case v.tm == nil:
 		// The TalosMachine is gone, so there is nothing left to configure.
-		op.Skipped = append(op.Skipped, name)
+		skipped(op, name)
 	case v.tm.Spec.Hold, v.tm.Spec.DesiredState == talosv1alpha1.DesiredStateRemoved:
-		op.Skipped = append(op.Skipped, name)
+		skipped(op, name)
 	case v.desired != nil && v.desired.Hash != desired:
-		r.finish(tc, talosv1alpha1.OperationSuperseded, name+" renders a different config than this rollout planned")
+		r.end(tc, talosv1alpha1.OperationSuperseded, name+" renders a different config than this rollout planned")
 	case v.live != nil && v.live.Hash == desired:
 		// Nothing to apply, but the rollout only moves past a node it has seen healthy.
 		step.Step, step.PreviousHash, step.Class = plan.FirstStep(false), desired, ""
 		op.Current = step
 	case v.live != nil && v.live.Hash != base:
-		r.finish(tc, talosv1alpha1.OperationSuperseded, "the config of "+name+" changed after this rollout was planned")
+		r.end(tc, talosv1alpha1.OperationSuperseded, "the config of "+name+" changed after this rollout was planned")
 	default:
 		// The deadline is persisted before the try is sent, and the try is sent with a timeout
 		// that ends at the deadline or later. Talos's own timer therefore never ends first.
@@ -546,22 +573,26 @@ func (r *TalosClusterReconciler) step(ctx context.Context, tc *talosv1alpha1.Tal
 	}
 	node := stepNode(v)
 
-	// A node nothing was sent to is left alone when the rollout is paused, or when its spec
-	// renders something else by now. The step is dropped; the machine's turn begins again.
-	if plan.Untouched(s, node, now) && (tc.Spec.Paused || (v.desired != nil && v.desired.Hash != cur.DesiredHash)) {
+	// A node nothing was sent to is left alone while the rollout is paused or outside its
+	// maintenance windows, or when its spec renders something else by now. The step is dropped;
+	// the machine's turn begins again.
+	hold := obs.policy.Hold(tc.Spec.Paused)
+	if plan.Untouched(s, node, now) && (!hold.Open || (v.desired != nil && v.desired.Hash != cur.DesiredHash)) {
 		op.Current = nil
 
-		return "", nil
+		return hold.Reason, nil
 	}
 
 	pre := r.preGate(tc, obs, v)
-	checks := plan.Gate{Reason: "not verified yet"}
+	checks := plan.Gate{Reason: notVerifiedYet}
 
 	if cur.Step == plan.StepVerifying && node.Reachable {
 		var err error
 		if checks, err = r.verifyNode(ctx, obs, v, cur.Since.Time, now); err != nil {
 			return "", err
 		}
+
+		checks = checks.And(obs.policy.Gates())
 	}
 
 	action := plan.NextStep(s, node, pre, checks, timing, now)
@@ -599,8 +630,7 @@ func (r *TalosClusterReconciler) step(ctx context.Context, tc *talosv1alpha1.Tal
 			return "", err
 		}
 
-		op.Completed = append(op.Completed, cur.Machine)
-		op.Current = nil
+		verified(tc, true)
 	case plan.Fail:
 		failOperation(op, action.Reason, action.Message, now)
 	}
@@ -653,20 +683,23 @@ func configHash(raw []byte) (string, error) {
 	return normalized.Hash, nil
 }
 
-// preGate is what must hold before a config is sent to the node: nothing pauses the rollout,
-// the config still renders, and every other node is healthy (plan.TouchGate). The node's own
-// health is not asked about, so that a node a config broke can be given another.
+// preGate is what must hold before a config is sent to the node: nothing holds the rollout back,
+// the config still renders, every other node is healthy (plan.TouchGate) and the user's gates
+// are open. The node's own health is not asked about, so that a node a config broke can be given
+// another.
 func (r *TalosClusterReconciler) preGate(tc *talosv1alpha1.TalosCluster, obs observation, v machineView) plan.Gate {
+	hold := obs.policy.Hold(tc.Spec.Paused)
+
 	switch {
-	case tc.Spec.Paused:
-		return plan.Gate{Reason: "spec.paused is set"}
+	case !hold.Open:
+		return hold
 	case v.tm == nil:
 		return plan.Gate{Reason: "the TalosMachine no longer exists"}
 	case v.desired == nil:
 		return plan.Gate{Reason: "the machine's config does not render: " + v.problem}
 	}
 
-	return plan.TouchGate(passOf(obs), v.hostname())
+	return plan.TouchGate(passOf(obs), v.hostname()).And(obs.policy.Gates())
 }
 
 // latest reports whether tc is the TalosCluster as the API server has it now. A side effect
@@ -685,7 +718,11 @@ func (r *TalosClusterReconciler) latest(ctx context.Context, tc *talosv1alpha1.T
 	return current.ResourceVersion == tc.ResourceVersion
 }
 
-const noteCatchingUp = "waiting for the operator's view of the TalosCluster to catch up"
+const (
+	noteCatchingUp = "waiting for the operator's view of the TalosCluster to catch up"
+	// notVerifiedYet is what a node's checks say before they were run.
+	notVerifiedYet = "not verified yet"
+)
 
 // try validates the node's rendered config with a dry run and applies it in try mode. The
 // planner only asks for this while the node still runs its previous config: Talos takes
@@ -702,6 +739,17 @@ func (r *TalosClusterReconciler) try(ctx context.Context, tc *talosv1alpha1.Talo
 		return "the machine renders a different config than the one being rolled out", nil
 	}
 
+	return r.tryConfig(ctx, tc, obs, v, v.desired.BytesOrderedLike(v.live), now)
+}
+
+// tryConfig validates raw with a dry run on the node of the step in flight and applies it in try
+// mode, with a timeout that ends at the step's persisted deadline or later.
+func (r *TalosClusterReconciler) tryConfig(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, v machineView, raw []byte,
+	now time.Time,
+) (string, error) {
+	op := tc.Status.Operation
+	cur := op.Current
+
 	if !r.latest(ctx, tc) {
 		return noteCatchingUp, nil
 	}
@@ -711,8 +759,6 @@ func (r *TalosClusterReconciler) try(ctx context.Context, tc *talosv1alpha1.Talo
 		//nolint:nilerr // what the step waits for; the planner's timeouts end it if this lasts
 		return "no Talos client to apply config with: " + err.Error(), nil
 	}
-
-	raw := v.desired.BytesOrderedLike(v.live)
 
 	if _, err := writer.DryRunApply(ctx, v.node.address, raw); err != nil {
 		return r.applyFailed(ctx, op, v, "Talos refused the config in a dry run, so nothing was applied", err, now), nil
@@ -800,13 +846,15 @@ func failOperation(op *talosv1alpha1.Operation, reason, message string, now time
 		Step:        cur.Step,
 		Reason:      reason,
 		Message:     message,
-		Remediation: remediation(reason, token),
+		Remediation: remediation(reason, token, op.Type != talosv1alpha1.OperationKubernetesUpgrade),
 		Token:       token,
 		At:          &at,
 	}
 }
 
-func remediation(reason, token string) string {
+// remediation says what a human can do about a failed step. A Kubernetes upgrade cannot leave a
+// node out, so it offers no skip (docs/scope.md §7.4).
+func remediation(reason, token string, skippable bool) string {
 	var first string
 
 	switch reason {
@@ -819,7 +867,7 @@ func remediation(reason, token string) string {
 	case plan.FailRejected:
 		first = "Fix the config in the spec."
 	case plan.FailImagePull:
-		first = "Nothing on the node changed. Check that the installer image exists and that the node can pull it."
+		first = "Nothing on the node changed. Check that the image exists and that the node can pull it."
 	case plan.FailInstall:
 		first = "The node still runs what it ran. Find out why the installer failed."
 	case plan.FailDrainTimeout:
@@ -831,9 +879,13 @@ func remediation(reason, token string) string {
 		first = "Find out what kept the step from finishing."
 	}
 
-	return fmt.Sprintf("%s Then annotate the TalosCluster with %s=%s to run the step again, "+
-		"%s=%s to leave this machine out, or %s=%s to end the rollout.",
-		first, talosv1alpha1.AnnotationRetry, token, talosv1alpha1.AnnotationSkipMachine, token, talosv1alpha1.AnnotationAbort, token)
+	skip := ""
+	if skippable {
+		skip = fmt.Sprintf(" %s=%s to leave this machine out,", talosv1alpha1.AnnotationSkipMachine, token)
+	}
+
+	return fmt.Sprintf("%s Then annotate the TalosCluster with %s=%s to run the step again,%s or %s=%s to end the operation.",
+		first, talosv1alpha1.AnnotationRetry, token, skip, talosv1alpha1.AnnotationAbort, token)
 }
 
 // actOnFailure carries out what a human asked for after a failure. The annotations only count
@@ -848,30 +900,14 @@ func (r *TalosClusterReconciler) actOnFailure(ctx context.Context, tc *talosv1al
 
 	switch {
 	case asked(talosv1alpha1.AnnotationAbort):
-		// What was left is not rolled out again as it is: only a spec that renders something else
-		// gets the rollout going.
-		aborted := maps.Clone(op.Targets)
-		for _, done := range op.Completed {
-			delete(aborted, done)
-		}
-
-		st.AbortedTargets = aborted
-
-		r.finish(tc, talosv1alpha1.OperationAborted, fmt.Sprintf("aborted after failing at %s (%s): %s", f.Machine, f.Reason, f.Message))
+		abortConfig(tc)
+		r.end(tc, talosv1alpha1.OperationAborted, fmt.Sprintf("aborted after failing at %s (%s): %s", f.Machine, f.Reason, f.Message))
 	case asked(talosv1alpha1.AnnotationSkipMachine):
-		v, err := view(f.Machine)
-		if err != nil {
+		if err := r.skipConfig(ctx, tc, view, f.Machine); err != nil {
 			return err
 		}
 
-		if v.tm != nil {
-			if err := r.patchMachineConfig(ctx, v.tm, func(cfg *talosv1alpha1.ConfigState) { cfg.SkippedHash = op.Targets[f.Machine] }); err != nil {
-				return err
-			}
-		}
-
-		op.Skipped = append(op.Skipped, f.Machine)
-		op.Failure, op.Current = nil, nil
+		skipped(op, f.Machine)
 	case asked(talosv1alpha1.AnnotationRetry):
 		v, err := view(f.Machine)
 		if err != nil {
@@ -962,6 +998,7 @@ func (r *TalosClusterReconciler) abandonOperation(tc *talosv1alpha1.TalosCluster
 
 	st.Approval, st.AbortedTargets, st.Upgrades = nil, nil, nil
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionTalosUpToDate)
+	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionKubernetesUpToDate)
 }
 
 // operationEndpoints selects the Talos API endpoints of a cluster: never the node an operation is

@@ -223,6 +223,19 @@ func (r *TalosMachineReconciler) observeConfig(ctx context.Context, tc *talosv1a
 		return err
 	}
 
+	// Once config is managed, the images of the Kubernetes components are a Kubernetes upgrade's
+	// to change and no part of what the machine's config is compared by (withLiveKubernetes).
+	// Before that, the comparison is what proves adoption, and leaves nothing out.
+	behind := false
+
+	if managing(tc) {
+		if desired, behind, err = withLiveKubernetes(desired, raw); err != nil {
+			report(metav1.ConditionFalse, talosv1alpha1.ReasonFailed, "keep the node's Kubernetes images: "+err.Error())
+
+			return nil //nolint:nilerr // reported in ConfigMatchesLive
+		}
+	}
+
 	cfg.DesiredHash = desired.Hash
 
 	diffs, err := render.Diff(live, desired)
@@ -259,7 +272,12 @@ func (r *TalosMachineReconciler) observeConfig(ctx context.Context, tc *talosv1a
 	}
 
 	if len(diffs) == 0 {
-		report(metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded, "the rendered config equals the live config")
+		message := "the rendered config equals the live config"
+		if behind {
+			message += ", apart from the Kubernetes version it names, which a Kubernetes upgrade brings about"
+		}
+
+		report(metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded, message)
 
 		return nil
 	}

@@ -65,11 +65,21 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test
-test: manifests generate fmt vet test-unit ## Regenerate, format, vet, then run unit and envtest tests.
+.PHONY: tidy
+tidy: ## Run go mod tidy.
+	go mod tidy
 
-# CI runs test-unit directly: it checks generated code and formatting in a separate step, and
-# golangci-lint already runs vet.
+.PHONY: test
+test: tidy manifests generate fmt vet test-unit ## Tidy, regenerate, format, vet, then run unit and envtest tests.
+
+# What CI refuses: a go.mod that is not tidy, generated files that are stale, code that is not
+# formatted. Run it before pushing; `make test` does the same work and leaves the diff to you.
+.PHONY: committed
+committed: tidy manifests generate fmt ## Check that modules, generated code and formatting are committed.
+	git diff --exit-code
+
+# CI runs test-unit directly: it checks modules, generated code and formatting with `make committed`,
+# and golangci-lint already runs vet.
 .PHONY: test-unit
 test-unit: setup-envtest ## Run unit and envtest tests only.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
@@ -105,7 +115,7 @@ test-e2e: ## Run e2e tests against the cluster from e2e-cluster-up, with the ope
 	@test -s $(E2E_DIR)/env || { echo "No e2e cluster; run 'make e2e-cluster-up e2e-deploy' first."; exit 1; }
 	@# Only tests named TestE2E* run: unit tests in the same packages already run in test-unit.
 	@# -p 1: the packages share one cluster, and test/e2e takes a node offline for a while.
-	. $(E2E_DIR)/env && go test -tags e2e -run '^TestE2E' $(E2E_PACKAGES) -v -count=1 -p 1 -timeout 100m
+	. $(E2E_DIR)/env && go test -tags e2e -run '^TestE2E' $(E2E_PACKAGES) -v -count=1 -p 1 -timeout 160m
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

@@ -397,10 +397,10 @@ func TestPlanUpgradeBlocks(t *testing.T) {
 		{"a jump Talos does not allow", []UpgradeMachine{upgradable(w1, false), jump}, UpgradeSettings{}, openPass,
 			BlockIncompatible, "cp-1: v1.12.4"},
 		{"incompatible outranks paused", []UpgradeMachine{jump}, UpgradeSettings{Paused: true}, openPass, BlockIncompatible, cp1},
-		{"paused", change, UpgradeSettings{Paused: true}, openPass, BlockPaused, "spec.paused"},
+		{wordPaused, change, UpgradeSettings{Paused: true}, openPass, BlockPaused, "spec.paused"},
 		{"stale status", append(slices.Clone(change), stale), UpgradeSettings{}, openPass, BlockNotCurrent, w2},
 		{"an aborted upgrade is not started again", change,
-			UpgradeSettings{Aborted: map[string]string{w1: upgradable(w1, false).Image}}, openPass, BlockAborted, "aborted"},
+			UpgradeSettings{Aborted: map[string]string{w1: upgradable(w1, false).Image}}, openPass, BlockAborted, wordAborted},
 		{"a closed gate", change, UpgradeSettings{}, closedPass, BlockGateClosed, closedPass.HealthMessage},
 	}
 

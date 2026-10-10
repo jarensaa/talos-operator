@@ -542,3 +542,95 @@ func TestSamplesAreValid(t *testing.T) {
 		}
 	}
 }
+
+// The rollout policy (docs/scope.md §6.4): what the API server can refuse, it refuses, so that a
+// typo is found when it is made and not when a window was supposed to open.
+func TestRolloutPolicyIsValidated(t *testing.T) {
+	ctx := context.Background()
+	hours := func(h int) metav1.Duration { return metav1.Duration{Duration: time.Duration(h) * time.Hour} }
+	job := runtime.RawExtension{Raw: []byte(`{"template":{"spec":{"containers":[{"name":"hook","image":"registry.example.com/hook:1"}]}}}`)}
+	object := talosv1alpha1.GateObject{APIVersion: "ceph.rook.io/v1", Kind: "CephCluster", Namespace: "storage", Name: "storage"}
+
+	const gate, alwaysOpen = "storage-healthy", "true"
+
+	accepted := minimalCluster("policy-ok")
+	accepted.Spec.Rollout = talosv1alpha1.Rollout{
+		MaintenanceWindows: []talosv1alpha1.MaintenanceWindow{
+			{Schedule: "0 2 * * 6", Duration: hours(3), TimeZone: "Europe/Oslo"},
+			{Schedule: "30  22 1-7 */2 mon", Duration: hours(1)},
+		},
+		Gates: []talosv1alpha1.RolloutGate{
+			{Name: gate, Object: object, Expression: `object.status.ceph.health == "HEALTH_OK"`},
+			// A cluster-scoped object has no namespace.
+			{Name: "nodes", Object: talosv1alpha1.GateObject{APIVersion: "v1", Kind: "Node", Name: "node-a"}, Expression: alwaysOpen},
+		},
+		Hooks: &talosv1alpha1.RolloutHooks{
+			PreRollout: []talosv1alpha1.Hook{{Name: "announce", Job: job}},
+			PreNode:    []talosv1alpha1.Hook{{Name: "noout", Job: job, Timeout: &metav1.Duration{Duration: time.Minute}}},
+		},
+	}
+
+	if err := k8sClient.Create(ctx, accepted); err != nil {
+		t.Fatal(err)
+	}
+
+	// The Job spec is stored as written: the API server does not know it, and does not prune it.
+	stored := &talosv1alpha1.TalosCluster{}
+	if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(accepted), stored); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := string(stored.Spec.Rollout.Hooks.PreNode[0].Job.Raw); !strings.Contains(got, "registry.example.com/hook:1") {
+		t.Fatalf("the hook's Job spec was not kept: %s", got)
+	}
+
+	rejected := []struct {
+		name    string
+		rollout talosv1alpha1.Rollout
+		message string
+	}{
+		{"a schedule of four fields", talosv1alpha1.Rollout{
+			MaintenanceWindows: []talosv1alpha1.MaintenanceWindow{{Schedule: "0 2 * *", Duration: hours(1)}},
+		}, "schedule"},
+		{"a schedule with seconds", talosv1alpha1.Rollout{
+			MaintenanceWindows: []talosv1alpha1.MaintenanceWindow{{Schedule: "0 0 2 * * 6", Duration: hours(1)}},
+		}, "schedule"},
+		{"a window that never opens", talosv1alpha1.Rollout{
+			MaintenanceWindows: []talosv1alpha1.MaintenanceWindow{{Schedule: "0 2 * * 6"}},
+		}, "duration must be positive"},
+		{"a gate without an expression", talosv1alpha1.Rollout{
+			Gates: []talosv1alpha1.RolloutGate{{Name: gate, Object: object}},
+		}, "expression"},
+		{"a gate without an object", talosv1alpha1.Rollout{
+			Gates: []talosv1alpha1.RolloutGate{{Name: gate, Expression: alwaysOpen}},
+		}, "object"},
+		{"two gates of one name", talosv1alpha1.Rollout{
+			Gates: []talosv1alpha1.RolloutGate{{Name: "a", Object: object, Expression: alwaysOpen}, {Name: "a", Object: object, Expression: "false"}},
+		}, "Duplicate value"},
+		{"a hook whose name cannot be part of a Job's", talosv1alpha1.Rollout{
+			Hooks: &talosv1alpha1.RolloutHooks{PreNode: []talosv1alpha1.Hook{{Name: "No Out", Job: job}}},
+		}, "name"},
+		{"a hook whose name is too long for a Job's", talosv1alpha1.Rollout{
+			Hooks: &talosv1alpha1.RolloutHooks{PostNode: []talosv1alpha1.Hook{{Name: "a-name-that-leaves-no-room-for-more", Job: job}}},
+		}, "name"},
+		{"a hook whose Job is not an object", talosv1alpha1.Rollout{
+			Hooks: &talosv1alpha1.RolloutHooks{PreRollout: []talosv1alpha1.Hook{{Name: "announce", Job: runtime.RawExtension{Raw: []byte(`"true"`)}}}},
+		}, "job"},
+	}
+
+	for i, tt := range rejected {
+		tc := minimalCluster(fmt.Sprintf("policy-bad-%d", i))
+		tc.Spec.Rollout = tt.rollout
+
+		err := k8sClient.Create(ctx, tc)
+		if err == nil {
+			t.Errorf("%s must be refused", tt.name)
+
+			continue
+		}
+
+		if !strings.Contains(err.Error(), tt.message) {
+			t.Errorf("%s: the refusal must mention %q: %v", tt.name, tt.message, err)
+		}
+	}
+}

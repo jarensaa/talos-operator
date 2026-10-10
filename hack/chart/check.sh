@@ -36,4 +36,32 @@ for file in "$generated"/*.yaml; do
     >/dev/null || fail "the rendered CRD $name differs from $file"
 done
 
-echo "chart check: $want CRDs rendered, kept on uninstall, identical to $generated"
+# Permissions that come from files and values: both must reach the ServiceAccount, and a gate's
+# kind is granted only when someone asks for it.
+gate='gates.rules[0].apiGroups[0]=ceph.rook.io,gates.rules[0].resources[0]=cephclusters,gates.rules[0].verbs[0]=get'
+
+bound() {
+  helm template talos-operator "$chart" --namespace talos-operator "$@" |
+    yq -N "select(.kind == \"ClusterRoleBinding\") | .metadata.name"
+}
+
+rules() { # the rules of a ClusterRole, as JSON
+  local name=$1; shift
+  helm template talos-operator "$chart" --namespace talos-operator "$@" |
+    yq -o json -I0 "select(.kind == \"ClusterRole\" and .metadata.name == \"$name\") | .rules"
+}
+
+# Captured first: grep -q ends a pipe early, which pipefail takes for a failure of what feeds it.
+default=$(bound)
+gated=$(bound --set "$gate")
+
+grep -qx talos-operator-upgrade-checks <<<"$default" || fail "the upgrade checks' ClusterRole is not bound"
+diff <(rules talos-operator-upgrade-checks) <(yq -o json -I0 '.rules' "$chart/files/upgrade-check-rules.yaml") >/dev/null ||
+  fail "the upgrade checks' ClusterRole does not carry files/upgrade-check-rules.yaml"
+
+! grep -q gates <<<"$default" || fail "no gate is granted anything by default"
+grep -qx talos-operator-gates <<<"$gated" || fail "gates.rules must be bound to the operator"
+[ "$(rules talos-operator-gates --set "$gate")" = '[{"apiGroups":["ceph.rook.io"],"resources":["cephclusters"],"verbs":["get"]}]' ] ||
+  fail "gates.rules must become the rules of the gates ClusterRole"
+
+echo "chart check: $want CRDs rendered, kept on uninstall, identical to $generated; permissions bound"

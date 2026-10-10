@@ -38,6 +38,12 @@ func TestPathClass(t *testing.T) {
 		"machine.features.kubePrism.port":        Connectivity,
 		"machine.features.diskQuotaSupport":      Unknown,
 		"machine.kubelet.extraArgs.max-pods":     LiveSafe,
+		"machine.kubelet.image":                  Kubernetes, // the longer rule wins over machine.kubelet
+		"cluster.apiServer.image":                Kubernetes,
+		"cluster.controllerManager.image":        Kubernetes,
+		"cluster.scheduler.image":                Kubernetes,
+		"cluster.proxy.image":                    Kubernetes,
+		"cluster.proxy.disabled":                 LiveSafe,
 		"machine.nodeLabels":                     LiveSafe,
 		"machine.certSANs":                       LiveSafe,
 		"machine.kubeletExtra":                   Unknown, // a prefix must match a whole path segment

@@ -56,6 +56,8 @@ const (
 	MethodInstall                 = "Install"
 	MethodEtcdForfeitLeadership   = "EtcdForfeitLeadership"
 	MethodReboot                  = "Reboot"
+	MethodKubernetesImagePull     = "KubernetesImagePull"
+	MethodKubernetesUpgradeChecks = "KubernetesUpgradeChecks"
 )
 
 // Machine types as Talos reports them.
@@ -68,6 +70,7 @@ const (
 // under ApplyConfiguration with DryRun set, which AssertNoMutations allows.
 var mutatingMethods = map[string]bool{
 	MethodApplyConfiguration: true, MethodImagePull: true, MethodInstall: true, MethodEtcdForfeitLeadership: true, MethodReboot: true,
+	MethodKubernetesImagePull: true,
 }
 
 func (n *Node) unhealthy() bool { return n.UnhealthyWhen != nil && n.UnhealthyWhen(n.Config.Active) }
@@ -140,6 +143,8 @@ type Scenario struct {
 	etcdMembers []talos.EtcdMember
 	etcdLeader  uint64
 	health      talos.HealthResult
+	// removed is what the Kubernetes upgrade checks find, by the version checked.
+	removed map[string][]string
 }
 
 type errorKey struct {
@@ -211,6 +216,19 @@ func (s *Scenario) SetHealth(result talos.HealthResult) {
 	defer s.mu.Unlock()
 
 	s.health = result
+}
+
+// SetRemovedInKubernetes makes the upgrade checks for Kubernetes version find the given problems
+// on the nodes; none clears them.
+func (s *Scenario) SetRemovedInKubernetes(version string, problems ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.removed == nil {
+		s.removed = map[string][]string{}
+	}
+
+	s.removed[version] = problems
 }
 
 // FailNext makes every subsequent call of method on node return err until cleared with a nil err.
@@ -611,6 +629,21 @@ func (r *reader) HealthCheck(ctx context.Context, node netip.Addr, _ talos.Clust
 	return talos.HealthResult{Healthy: r.s.health.Healthy, Messages: slices.Clone(r.s.health.Messages)}, nil
 }
 
+// KubernetesUpgradeChecks implements talos.Reader: every node is asked, and one that does not
+// answer fails the checks.
+func (r *reader) KubernetesUpgradeChecks(ctx context.Context, _, to string, nodes talos.ClusterInfo) ([]string, error) {
+	for _, node := range slices.Concat(nodes.ControlPlanes, nodes.Workers) {
+		if _, err := r.s.record(ctx, MethodKubernetesUpgradeChecks, node); err != nil {
+			return nil, err
+		}
+	}
+
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+
+	return slices.Clone(r.s.removed[to]), nil
+}
+
 // Factory is a fake target.ClientFactory that serves the scenario's Reader and ConfigWriter and
 // records every target it was asked for, so tests can assert credentials and endpoint selection.
 type Factory struct {
@@ -800,6 +833,19 @@ func (u *upgrader) PullImage(ctx context.Context, node netip.Addr, image string)
 	n.pulled[image] = true
 
 	return nil
+}
+
+// PullKubernetesImage implements talos.Upgrader.
+func (u *upgrader) PullKubernetesImage(ctx context.Context, node netip.Addr, component, image string) error {
+	// Talos runs these from a node's config. kube-proxy is not among them: nothing pulls it here.
+	runs := []string{talos.ComponentAPIServer, talos.ComponentControllerManager, talos.ComponentScheduler, talos.ComponentKubelet}
+	if !slices.Contains(runs, component) {
+		return fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
+	}
+
+	_, err := u.image(ctx, MethodKubernetesImagePull, node, image)
+
+	return err
 }
 
 // Install implements talos.Upgrader.

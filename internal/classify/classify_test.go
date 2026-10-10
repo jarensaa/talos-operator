@@ -17,6 +17,8 @@ limitations under the License.
 package classify_test
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -32,6 +34,13 @@ import (
 func rendered(t *testing.T, bundle *secrets.Bundle, patches ...string) *render.Config {
 	t.Helper()
 
+	return renderedAt(t, bundle, machine.TypeControlPlane, "1.37.0", patches...)
+}
+
+// renderedAt renders a machine of the given role at a Kubernetes version.
+func renderedAt(t *testing.T, bundle *secrets.Bundle, role machine.Type, kubernetes string, patches ...string) *render.Config {
+	t.Helper()
+
 	raw := make([][]byte, 0, len(patches))
 	for _, p := range patches {
 		raw = append(raw, []byte(p))
@@ -40,10 +49,10 @@ func rendered(t *testing.T, bundle *secrets.Bundle, patches ...string) *render.C
 	cfg, err := render.Render(render.Input{
 		ClusterName:       "c",
 		Endpoint:          "https://10.5.0.2:6443",
-		KubernetesVersion: "1.37.0",
+		KubernetesVersion: kubernetes,
 		Contract:          config.TalosVersion1_14,
 		Bundle:            bundle,
-		Role:              machine.TypeControlPlane,
+		Role:              role,
 		InstallImage:      "factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.2",
 		Patches:           raw,
 	})
@@ -70,6 +79,7 @@ func TestClassify(t *testing.T) {
 		volume   = "apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: data\nprovisioning:\n" +
 			"  diskSelector:\n    match: disk.transport == \"nvme\"\n  minSize: 10GiB\n"
 		proxy    = "apiVersion: v1alpha1\nkind: KubeProxyConfig\nenabled: false\n"
+		coreDNS  = "apiVersion: v1alpha1\nkind: KubeCoreDNSConfig\nenabled: false\n"
 		kubelet  = "apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  max-pods: \"200\"\n"
 		apiSrv   = "apiVersion: v1alpha1\nkind: KubeAPIServerConfig\nextraArgs:\n  audit-log-maxage: \"7\"\n"
 		resolver = "apiVersion: v1alpha1\nkind: ResolverConfig\nnameservers:\n  - address: 1.1.1.1\n"
@@ -91,7 +101,9 @@ func TestClassify(t *testing.T) {
 		{"host firewall", rendered(t, bundle, firewall), classify.Connectivity, "v1alpha1/NetworkDefaultActionConfig"},
 		{"resolvers", rendered(t, bundle, resolver), classify.Connectivity, "v1alpha1/ResolverConfig"},
 		{"user volume", rendered(t, bundle, volume), classify.Storage, "v1alpha1/UserVolumeConfig/data"},
-		{"a kind without a rule", rendered(t, bundle, proxy), classify.Unknown, "v1alpha1/KubeProxyConfig"},
+		{"a kind without a rule", rendered(t, bundle, coreDNS), classify.Unknown, "v1alpha1/KubeCoreDNSConfig"},
+		// Talos applies the kube-proxy manifest once; what the config says later changes nothing.
+		{"kube-proxy", rendered(t, bundle, proxy), classify.LiveSafe, "v1alpha1/KubeProxyConfig"},
 		{"a field without a rule", rendered(t, bundle, "machine:\n  features:\n    diskQuotaSupport: false\n"),
 			classify.Unknown, "v1alpha1: machine.features.diskQuotaSupport"},
 		{"install disk", rendered(t, bundle, install), classify.BootTime, "v1alpha1/UnattendedInstallConfig"},
@@ -150,6 +162,8 @@ func TestClassStrategies(t *testing.T) {
 		{classify.Connectivity, false, false},
 		{classify.Storage, false, true},
 		{classify.Unknown, false, true},
+		{classify.Kubernetes, true, false},
+		{classify.Installer, true, false},
 		{classify.BootTime, true, false},
 		{classify.Protected, true, false},
 	}
@@ -161,7 +175,7 @@ func TestClassStrategies(t *testing.T) {
 	}
 
 	order := []classify.Class{classify.None, classify.LiveSafe, classify.ControlPlaneRestart, classify.Connectivity,
-		classify.Storage, classify.Unknown, classify.BootTime, classify.Protected}
+		classify.Storage, classify.Unknown, classify.Kubernetes, classify.Installer, classify.BootTime, classify.Protected}
 	for i := 1; i < len(order); i++ {
 		if !order[i].Worse(order[i-1]) || order[i-1].Worse(order[i]) {
 			t.Errorf("%s must be worse than %s", order[i], order[i-1])
@@ -230,5 +244,72 @@ func TestClassifyInstallerImage(t *testing.T) {
 
 	if !classify.BootTime.Worse(classify.Installer) || !classify.Installer.Worse(classify.Unknown) {
 		t.Fatal("the installer sits between what needs approval and what only an install can change")
+	}
+}
+
+// The images of the Kubernetes components are a Kubernetes upgrade's to change, in its own order.
+// A config rollout must never be the one to apply them, whatever rides along.
+func TestClassifyKubernetesVersion(t *testing.T) {
+	bundle := talostest.Bundle(t)
+
+	const (
+		argument = "apiVersion: v1alpha1\nkind: KubeAPIServerConfig\nextraArgs:\n  audit-log-maxage: \"7\"\n"
+		volume   = "apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: data\nprovisioning:\n" +
+			"  diskSelector:\n    match: disk.transport == \"nvme\"\n  minSize: 10GiB\n"
+		installer = "apiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n" +
+			"  image: factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:%s\n" +
+			"provisioning:\n  diskSelector:\n    match: disk.transport == \"sata\"\n"
+	)
+
+	install := func(version string) string { return fmt.Sprintf(installer, version) }
+
+	const kubeletImage = "v1alpha1/KubeletConfig: image"
+
+	controlPlane, worker := machine.TypeControlPlane, machine.TypeWorker
+
+	tests := []struct {
+		name          string
+		live, desired *render.Config
+		want          classify.Class
+		reasons       []string
+	}{
+		{"a control plane", renderedAt(t, bundle, controlPlane, "1.36.2"), renderedAt(t, bundle, controlPlane, "1.37.0"), classify.Kubernetes,
+			[]string{"v1alpha1/KubeAPIServerConfig: image", "v1alpha1/KubeControllerManagerConfig: image",
+				"v1alpha1/KubeProxyConfig: image", "v1alpha1/KubeSchedulerConfig: image", kubeletImage}},
+		{"a worker", renderedAt(t, bundle, worker, "1.36.2"), renderedAt(t, bundle, worker, "1.37.0"), classify.Kubernetes,
+			[]string{kubeletImage}},
+		{"a patch release", renderedAt(t, bundle, worker, "1.37.0"), renderedAt(t, bundle, worker, "1.37.1"), classify.Kubernetes,
+			[]string{kubeletImage}},
+		// An argument of the same document does not take the image with it into a config rollout.
+		{"with an argument", renderedAt(t, bundle, controlPlane, "1.36.2"), renderedAt(t, bundle, controlPlane, "1.37.0", argument),
+			classify.Kubernetes, nil},
+		{"the argument alone", renderedAt(t, bundle, controlPlane, "1.37.0"), renderedAt(t, bundle, controlPlane, "1.37.0", argument),
+			classify.ControlPlaneRestart, []string{"v1alpha1/KubeAPIServerConfig: extraArgs.audit-log-maxage"}},
+		{"with a volume", renderedAt(t, bundle, controlPlane, "1.36.2"), renderedAt(t, bundle, controlPlane, "1.37.0", volume),
+			classify.Kubernetes, nil},
+		// What is more fundamental still comes first.
+		{"with another installer", renderedAt(t, bundle, worker, "1.36.2", install("v1.14.1")),
+			renderedAt(t, bundle, worker, "1.37.0", install("v1.14.2")), classify.Installer, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := classify.Classify(tt.live, tt.desired)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got.Class != tt.want {
+				t.Fatalf("got %s (%v), want %s", got.Class, got.Reasons, tt.want)
+			}
+
+			if tt.reasons != nil && !slices.Equal(got.Reasons, tt.reasons) {
+				t.Fatalf("reasons: got %v, want %v", got.Reasons, tt.reasons)
+			}
+		})
+	}
+
+	if classify.Kubernetes.NeedsApproval() {
+		t.Fatal("no approval makes a config rollout apply a Kubernetes version")
 	}
 }

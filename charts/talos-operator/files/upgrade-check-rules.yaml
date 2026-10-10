@@ -1,0 +1,11 @@
+# The lists a Kubernetes upgrade is checked with before any node is touched (docs/scope.md §7.4):
+# objects of APIs that a Kubernetes version stops serving. The list of those APIs is
+# go-kubernetes's, for every upgrade between the Kubernetes versions this operator's Talos range
+# runs. TestChartGrantsTheUpgradeChecks (internal/talos) fails when the two differ.
+rules:
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["podschedulingcontexts"]
+    verbs: ["list"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["podgroups", "workloads"]
+    verbs: ["list"]

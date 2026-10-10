@@ -48,6 +48,9 @@ const (
 	// ConditionTalosUpToDate reports whether every node runs the Talos version and installer its
 	// spec asks for (docs/scope.md §7.3).
 	ConditionTalosUpToDate = "TalosUpToDate"
+	// ConditionKubernetesUpToDate reports whether every node's config names, and every node runs,
+	// the Kubernetes version its spec asks for (docs/scope.md §7.4).
+	ConditionKubernetesUpToDate = "KubernetesUpToDate"
 	// ConditionRolloutBlocked reports that a disruptive operation is halted and needs attention.
 	ConditionRolloutBlocked = "RolloutBlocked"
 )
@@ -130,7 +133,12 @@ const (
 	// ReasonAwaitingUpgrade: the config names another installer image than a node runs, which a
 	// Talos upgrade brings about, not a config rollout.
 	ReasonAwaitingUpgrade = "AwaitingUpgrade"
-	// Reasons of TalosUpToDate.
+	// ReasonAwaitingKubernetesUpgrade: the config names another version of a Kubernetes component
+	// than a node runs, which a Kubernetes upgrade brings about, in its own order.
+	ReasonAwaitingKubernetesUpgrade = "AwaitingKubernetesUpgrade"
+	// ReasonOutsideWindow: no maintenance window is open (docs/scope.md §6.4).
+	ReasonOutsideWindow = "OutsideWindow"
+	// Reasons of TalosUpToDate and KubernetesUpToDate.
 	ReasonUpgrading        = "Upgrading"
 	ReasonUpgradesDisabled = "UpgradesDisabled"
 	ReasonIncompatible     = "Incompatible"
@@ -157,4 +165,6 @@ const (
 	AnnotationOrphan = "talos.jarensaa.github.io/orphan"
 	// LabelCluster names the TalosCluster an operator-created object belongs to.
 	LabelCluster = "talos.jarensaa.github.io/cluster"
+	// LabelHook marks the Job of a hook with the stage it ran at (docs/scope.md §6.4).
+	LabelHook = "talos.jarensaa.github.io/hook"
 )

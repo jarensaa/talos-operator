@@ -26,7 +26,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -180,7 +179,7 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 		}
 
 		note, err := r.continueUpgrade(ctx, tc, obs, pools, machines, timing)
-		reportUpgradeOperation(tc, note)
+		reportUpgradeOperation(tc, obs, note)
 
 		return true, nil, err
 	}
@@ -209,8 +208,9 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 		holds = &talosv1alpha1.UpgradeHolds{}
 	}
 
-	result := plan.PlanUpgrade(planned, plan.UpgradeSettings{Paused: tc.Spec.Paused, Skipped: holds.Skipped, Aborted: holds.Aborted},
-		passOf(obs))
+	result := plan.PlanUpgrade(planned, plan.UpgradeSettings{
+		Paused: tc.Spec.Paused, Skipped: holds.Skipped, Aborted: holds.Aborted, Policy: obs.policy,
+	}, passOf(obs))
 
 	// A hold covers one installer. Once the spec asks for another, it is spent.
 	if !result.AbortStands {
@@ -219,10 +219,7 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 
 	maps.DeleteFunc(holds.Skipped, func(name, image string) bool { return images[name] != image })
 
-	st.Upgrades = nil
-	if len(holds.Skipped)+len(holds.Aborted) > 0 {
-		st.Upgrades = holds
-	}
+	st.Upgrades = keptHolds(holds)
 
 	if result.MayStart() {
 		if err := timing.Validate(); err != nil {
@@ -243,6 +240,15 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 	}
 
 	return st.Operation != nil, reportUpgradePlan(tc, result, planned), nil
+}
+
+// keptHolds is holds, or nil when it holds nothing.
+func keptHolds(holds *talosv1alpha1.UpgradeHolds) *talosv1alpha1.UpgradeHolds {
+	if holds == nil || len(holds.Skipped)+len(holds.Aborted) == 0 && holds.Kubernetes == "" {
+		return nil
+	}
+
+	return holds
 }
 
 func leftCordoned(op *talosv1alpha1.Operation) string {
@@ -324,7 +330,7 @@ func reportUpgradePlan(tc *talosv1alpha1.TalosCluster, result plan.Upgrade, plan
 
 // reportUpgradeOperation sets TalosUpToDate and RolloutBlocked for the upgrade in flight. note is
 // what the step in flight waits for, if anything.
-func reportUpgradeOperation(tc *talosv1alpha1.TalosCluster, note string) {
+func reportUpgradeOperation(tc *talosv1alpha1.TalosCluster, obs observation, note string) {
 	st, gen := &tc.Status, tc.Generation
 
 	op := st.Operation
@@ -334,7 +340,7 @@ func reportUpgradeOperation(tc *talosv1alpha1.TalosCluster, note string) {
 	}
 
 	if f := op.Failure; f != nil {
-		msg := fmt.Sprintf("the upgrade halted at %s, step %s (%s): %s", f.Machine, f.Step, f.Reason, f.Message)
+		msg := fmt.Sprintf("the upgrade halted %s: %s", haltedAt(f), f.Message)
 
 		setCondition(st, gen, talosv1alpha1.ConditionTalosUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonOperationFailed, msg)
 		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed,
@@ -346,26 +352,8 @@ func reportUpgradeOperation(tc *talosv1alpha1.TalosCluster, note string) {
 
 	st.Phase = talosv1alpha1.ClusterPhaseManaged
 
-	progress := fmt.Sprintf("%d of %d machines done", len(op.Completed)+len(op.Skipped), len(op.Plan))
-
-	if cur := op.Current; cur != nil {
-		progress += fmt.Sprintf("; %s is %s", cur.Machine, cur.Step)
-
-		if note != "" {
-			progress += ": " + note
-		}
-	}
-
-	setCondition(st, gen, talosv1alpha1.ConditionTalosUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonUpgrading, progress)
-
-	if tc.Spec.Paused {
-		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonPaused,
-			"spec.paused is set: a node that is already cordoned is still upgraded and uncordoned, no other node is touched")
-
-		return
-	}
-
-	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionRolloutBlocked)
+	setCondition(st, gen, talosv1alpha1.ConditionTalosUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonUpgrading, progressOf(op, note))
+	reportHeld(tc, obs.policy, "a node that is already cordoned is still upgraded and uncordoned, no other node is touched")
 }
 
 // continueUpgrade carries the upgrade in flight one step further. It returns what the step waits for.
@@ -385,29 +373,57 @@ func (r *TalosClusterReconciler) continueUpgrade(ctx context.Context, tc *talosv
 		return upgradeView{}
 	}
 
-	switch {
-	case op.Failure != nil:
-		r.actOnUpgradeFailure(tc, view)
+	return r.drive(ctx, tc, obs, timing, turns{
+		begin: func(key string, attempt int32) error {
+			r.beginUpgrade(tc, key, view(key), attempt, false)
 
-		return "", nil
-	case op.Current == nil:
-		i := slices.IndexFunc(op.Plan, func(name string) bool {
-			return !slices.Contains(op.Completed, name) && !slices.Contains(op.Skipped, name)
-		})
-		if i < 0 {
-			r.finish(tc, talosv1alpha1.OperationSucceeded, "")
+			return nil
+		},
+		step: func() (string, error) { return r.upgradeStep(ctx, tc, obs, view(op.Current.Machine), timing) },
+		failed: func() error {
+			r.actOnUpgradeFailure(tc, view)
 
-			return "", nil
-		}
+			return nil
+		},
+		skip: func(machine string) error {
+			skipUpgrade(tc, machine)
 
-		if !tc.Spec.Paused {
-			r.beginUpgrade(tc, op.Plan[i], view(op.Plan[i]), 1, false)
-		}
+			return nil
+		},
+		abort:     func() { abortUpgrade(tc) },
+		nodeHooks: true,
+	})
+}
 
-		return "", nil
-	default:
-		return r.upgradeStep(ctx, tc, obs, view(op.Current.Machine), timing)
+// upgradeHolds is status.upgrades, made if there is none.
+func upgradeHolds(tc *talosv1alpha1.TalosCluster) *talosv1alpha1.UpgradeHolds {
+	if tc.Status.Upgrades == nil {
+		tc.Status.Upgrades = &talosv1alpha1.UpgradeHolds{}
 	}
+
+	return tc.Status.Upgrades
+}
+
+// abortUpgrade records what an aborted upgrade was installing. What was left is not upgraded
+// again as it is: only a spec that asks for another installer gets an upgrade going.
+func abortUpgrade(tc *talosv1alpha1.TalosCluster) {
+	op := tc.Status.Operation
+	holds := upgradeHolds(tc)
+
+	holds.Aborted = maps.Clone(op.Targets)
+	for _, done := range op.Completed {
+		delete(holds.Aborted, done)
+	}
+}
+
+// skipUpgrade records that a human left a machine out of the upgrade to its installer.
+func skipUpgrade(tc *talosv1alpha1.TalosCluster, machine string) {
+	holds := upgradeHolds(tc)
+	if holds.Skipped == nil {
+		holds.Skipped = map[string]string{}
+	}
+
+	holds.Skipped[machine] = tc.Status.Operation.Targets[machine]
 }
 
 // beginUpgrade persists the first step of a machine's turn. Nothing is sent anywhere in the same
@@ -418,9 +434,9 @@ func (r *TalosClusterReconciler) beginUpgrade(tc *talosv1alpha1.TalosCluster, na
 
 	switch {
 	case v.tm == nil, v.tm.Spec.Hold, v.tm.Spec.DesiredState == talosv1alpha1.DesiredStateRemoved:
-		op.Skipped = append(op.Skipped, name)
+		skipped(op, name)
 	case v.install.Image != op.Targets[name]:
-		r.finish(tc, talosv1alpha1.OperationSuperseded, name+" is to be installed from another image than this upgrade planned")
+		r.end(tc, talosv1alpha1.OperationSuperseded, name+" is to be installed from another image than this upgrade planned")
 	default:
 		op.Current = &talosv1alpha1.OperationStep{
 			Machine:  name,
@@ -487,12 +503,13 @@ func (r *TalosClusterReconciler) upgradeStep(ctx context.Context, tc *talosv1alp
 	cur := op.Current
 	now := r.now()
 
-	// A node nothing was taken from yet is left alone while the upgrade is paused: the step is
-	// dropped, and the machine's turn begins again when the pause is lifted.
-	if tc.Spec.Paused && !cur.Cordoned && slices.Contains([]string{plan.StepPulling, plan.StepInstalling, plan.StepDraining}, cur.Step) {
+	// A node nothing was taken from yet is left alone while the upgrade is paused or outside its
+	// maintenance windows: the step is dropped, and the machine's turn begins again later.
+	hold := obs.policy.Hold(tc.Spec.Paused)
+	if !hold.Open && !cur.Cordoned && slices.Contains([]string{plan.StepPulling, plan.StepInstalling, plan.StepDraining}, cur.Step) {
 		op.Current = nil
 
-		return "", nil
+		return hold.Reason, nil
 	}
 
 	node, kube, pods, err := r.upgradeNode(ctx, v, cur)
@@ -508,13 +525,15 @@ func (r *TalosClusterReconciler) upgradeStep(ctx context.Context, tc *talosv1alp
 		HealthySince: timeOf(cur.HealthySince),
 	}
 
-	pre := plan.RebootGate(passOf(obs), v.hostname())
-	checks := plan.Gate{Reason: "not verified yet"}
+	pre := plan.RebootGate(passOf(obs), v.hostname()).And(obs.policy.Gates())
+	checks := plan.Gate{Reason: notVerifiedYet}
 
 	if cur.Step == plan.StepVerifying && node.Reachable {
 		if checks, err = r.verifyNode(ctx, obs, machineView{tm: v.tm, pool: v.pool, node: v.node}, cur.Since.Time, now); err != nil {
 			return "", err
 		}
+
+		checks = checks.And(obs.policy.Gates())
 	}
 
 	action := plan.NextUpgradeStep(step, node, pre, checks, timing, now)
@@ -581,8 +600,7 @@ func (r *TalosClusterReconciler) upgradeStep(ctx context.Context, tc *talosv1alp
 
 		return "", r.setUnschedulable(ctx, kube, false)
 	case plan.Complete:
-		op.Completed = append(op.Completed, cur.Machine)
-		op.Current = nil
+		verified(tc, true)
 	case plan.Fail:
 		failOperation(op, action.Reason, action.Message, now)
 	}
@@ -687,34 +705,14 @@ func (r *TalosClusterReconciler) actOnUpgradeFailure(tc *talosv1alpha1.TalosClus
 	f := op.Failure
 	asked := func(annotation string) bool { return f.Token != "" && tc.Annotations[annotation] == f.Token }
 
-	holds := st.Upgrades
-	if holds == nil {
-		holds = &talosv1alpha1.UpgradeHolds{}
-	}
-
 	switch {
 	case asked(talosv1alpha1.AnnotationAbort):
-		// What was left is not upgraded again as it is: only a spec that asks for another
-		// installer gets an upgrade going.
-		holds.Aborted = maps.Clone(op.Targets)
-		for _, done := range op.Completed {
-			delete(holds.Aborted, done)
-		}
-
-		st.Upgrades = holds
-
-		r.finish(tc, talosv1alpha1.OperationAborted,
+		abortUpgrade(tc)
+		r.end(tc, talosv1alpha1.OperationAborted,
 			fmt.Sprintf("aborted after failing at %s (%s): %s%s", f.Machine, f.Reason, f.Message, leftCordoned(op)))
 	case asked(talosv1alpha1.AnnotationSkipMachine):
-		if holds.Skipped == nil {
-			holds.Skipped = map[string]string{}
-		}
-
-		holds.Skipped[f.Machine] = op.Targets[f.Machine]
-		st.Upgrades = holds
-
-		op.Skipped = append(op.Skipped, f.Machine)
-		op.Failure, op.Current = nil, nil
+		skipUpgrade(tc, f.Machine)
+		skipped(op, f.Machine)
 	case asked(talosv1alpha1.AnnotationRetry):
 		attempt, cordoned := int32(1), false
 		if op.Current != nil {

@@ -514,3 +514,63 @@ func TestForfeitingEtcdLeadershipMovesItToAnotherMember(t *testing.T) {
 		t.Fatalf("the leader hands over to another member: %v", err)
 	}
 }
+
+// What a Kubernetes upgrade asks of Talos besides applying config: the checks before it, which
+// ask every node, and the pull of a component's image, which changes a node and so is never
+// something an observer does.
+func TestKubernetesUpgradeCalls(t *testing.T) {
+	cp, worker := netip.MustParseAddr("10.5.0.2"), netip.MustParseAddr("10.5.0.3")
+	s := fake.NewScenario(fake.Node{Addr: cp, MachineType: fake.TypeControlPlane}, fake.Node{Addr: worker, MachineType: fake.TypeWorker})
+	ctx := context.Background()
+	nodes := talos.ClusterInfo{ControlPlanes: []netip.Addr{cp}, Workers: []netip.Addr{worker}}
+
+	if found, err := s.Reader().KubernetesUpgradeChecks(ctx, "1.36.2", "1.37.1", nodes); err != nil || len(found) != 0 {
+		t.Fatalf("got %q, %v", found, err)
+	}
+
+	s.SetRemovedInKubernetes("1.37.1", "kubelet on 10.5.0.3 is started with --container-hints")
+
+	if found, err := s.Reader().KubernetesUpgradeChecks(ctx, "1.36.2", "1.37.1", nodes); err != nil || len(found) != 1 {
+		t.Fatalf("got %q, %v", found, err)
+	}
+
+	if found, err := s.Reader().KubernetesUpgradeChecks(ctx, "1.36.2", "1.36.3", nodes); err != nil || len(found) != 0 {
+		t.Fatalf("another version removes something else: got %q, %v", found, err)
+	}
+
+	// A node that does not answer leaves the question open.
+	s.FailNext(fake.MethodKubernetesUpgradeChecks, worker, errors.New("unreachable"))
+
+	if _, err := s.Reader().KubernetesUpgradeChecks(ctx, "1.36.2", "1.37.1", nodes); err == nil {
+		t.Fatal("a node that was not read must fail the checks")
+	}
+
+	s.AssertNoMutations(t)
+
+	if err := s.Upgrader().PullKubernetesImage(ctx, cp, talos.ComponentAPIServer, "registry.k8s.io/kube-apiserver:v1.37.1"); err != nil {
+		t.Fatal(err)
+	}
+
+	pulls := s.CallsFor(fake.MethodKubernetesImagePull)
+	if len(pulls) != 1 || pulls[0].Node != cp || pulls[0].Image != "registry.k8s.io/kube-apiserver:v1.37.1" {
+		t.Fatalf("pulls: %+v", pulls)
+	}
+
+	if err := s.Upgrader().PullKubernetesImage(ctx, cp, "kube-proxy", "registry.k8s.io/kube-proxy:v1.37.1"); err == nil {
+		t.Fatal("kube-proxy is not a component Talos runs from a node's config")
+	}
+
+	mutated := &recorder{}
+	s.AssertNoMutations(mutated)
+
+	if !mutated.failed {
+		t.Fatal("pulling an image to a node is a mutation")
+	}
+}
+
+// recorder is a fake.TestingT that notes a failure instead of ending the test.
+type recorder struct{ failed bool }
+
+func (r *recorder) Helper() {}
+
+func (r *recorder) Fatalf(string, ...any) { r.failed = true }

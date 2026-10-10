@@ -41,10 +41,34 @@ func systemContainerd() *common.ContainerdInstance {
 	return &common.ContainerdInstance{Driver: common.ContainerDriver_CONTAINERD, Namespace: common.ContainerdNamespace_NS_SYSTEM}
 }
 
-// PullImage implements Upgrader. The stream reports progress and ends with the image's name.
+// criContainerd is where the kubelet runs pods from, static pods included: the "cri" namespace
+// talosctl upgrade-k8s pulls the control-plane images to (pkg/cluster/kubernetes/talos_managed.go:
+// 170 in Talos v1.14). The kubelet itself is a Talos service and runs from systemContainerd.
+func criContainerd() *common.ContainerdInstance {
+	return &common.ContainerdInstance{Driver: common.ContainerDriver_CRI, Namespace: common.ContainerdNamespace_NS_CRI}
+}
+
+// PullImage implements Upgrader.
 func (u *machineryUpgrader) PullImage(ctx context.Context, node netip.Addr, image string) error {
+	return u.pull(ctx, node, systemContainerd(), image)
+}
+
+// PullKubernetesImage implements Upgrader.
+func (u *machineryUpgrader) PullKubernetesImage(ctx context.Context, node netip.Addr, component, image string) error {
+	switch component {
+	case ComponentKubelet:
+		return u.pull(ctx, node, systemContainerd(), image)
+	case ComponentAPIServer, ComponentControllerManager, ComponentScheduler:
+		return u.pull(ctx, node, criContainerd(), image)
+	}
+
+	return fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
+}
+
+// pull fetches an image. The stream reports progress and ends with the image's name.
+func (u *machineryUpgrader) pull(ctx context.Context, node netip.Addr, containerd *common.ContainerdInstance, image string) error {
 	stream, err := u.client.ImageClient.Pull(client.WithNode(ctx, node.String()), &machineapi.ImageServicePullRequest{
-		Containerd: systemContainerd(),
+		Containerd: containerd,
 		ImageRef:   image,
 	})
 	if err != nil {

@@ -183,8 +183,159 @@ After a skip or an abort the operator doesn't come back with the same installer 
 - **One control plane means downtime.** While that node reboots there is no Kubernetes API. The upgrade carries on when it is back.
 - **Two control planes can't be upgraded.** With two etcd members, taking either down loses quorum, so the operator refuses to reboot one. Run one or three.
 - **Workers go one at a time.**
+- **There is no rollback on request.** A system that does not boot falls back by itself. One that boots and is wrong is not taken back by the operator: asking for the previous version is a downgrade, which it refuses.
 - **Only the installer image is upgraded.** A change that only a fresh install can make (kernel arguments, the install disk, disk encryption) stays refused, with reason `RequiresReinstall`.
 - **Pausing** (`spec.paused`) leaves alone a node nothing was taken from. A node that is already cordoned is finished.
+
+## Upgrading Kubernetes
+
+Set `versions.kubernetes`, with `management.upgrades` set to `Enabled`. What is upgraded is what Talos runs from a node's machine config: `kube-apiserver`, `kube-controller-manager` and `kube-scheduler` on control planes, and the kubelet on every node.
+
+Without `upgrades: Enabled` the operator only says what is behind: `KubernetesUpToDate` is false with reason `UpgradesDisabled`, and nothing changes.
+
+A config rollout never changes the images of these components: no other component may be newer than the API servers, and a rollout has no such order. It applies everything else of a change and leaves the images as the node has them, also while an upgrade is due, running or refused. A machine whose config differs from its node's only in these images says so in `ConfigMatchesLive`.
+
+### What happens
+
+One component on one node at a time, in this order: the API server on every control plane, then the controller manager on each, then the scheduler, then the kube-proxy image that each control plane's config names (see below), then the kubelet on control planes and on workers. `status.operation.plan` lists the turns, as `kube-apiserver/<machine>`.
+
+| Step | What happens |
+|---|---|
+| `Pulling` | The new image is pulled to the node, so the component is only down for its restart. |
+| `Trying` | The node's config is applied with that one image changed, in try mode, like every config change. |
+| `Verifying` | The component must run the new version and be ready, and the whole cluster must stay healthy for the soak. For a control-plane component that is its pod in `kube-system`; for the kubelet, the version its Node reports. |
+| `Confirming` | The config is made persistent. |
+
+A version more than one minor ahead of what the cluster runs is reached one minor at a time, each as an operation of its own. The steps in between go to the first release of each minor (`1.36.0` on the way from 1.35 to 1.37).
+
+With one control plane, the Kubernetes API is down while its API server restarts, for a minute or two, and the rest of the control plane needs a few more to find its feet again. The operator loses its leader lease then and restarts; whichever replica comes back carries on from what is in status. Because of this the API server's turn is given `stepTimeout` (10m) to be healthy again before its soak, not the shorter `tryTimeout`. If an API server really does not come up, that is also how long it takes until Talos puts the previous one back.
+
+### What is refused before any node is touched
+
+`KubernetesUpToDate` is false with reason `Incompatible`, and says which of these it is:
+
+- a downgrade;
+- a version the Talos release on some node does not run. The message names the nodes and says to upgrade Talos first;
+- a flag, feature gate or admission plugin that a component is started with and the new version removed;
+- objects of an API the new version no longer serves. Migrate or delete them first;
+- a control plane on hold (`spec.hold`). A worker on hold is left out, and its kubelet stays behind.
+
+If one of those checks cannot be run, the upgrade waits (`AwaitingStatus`) and says which.
+
+A removed flag is usually in your own config. Take it out of the pool's or machine's config: that change rolls out although the upgrade is refused, and the upgrade starts once the last node is rid of the flag.
+
+### When a component doesn't come up
+
+Talos puts the previous image back when the try ends, the upgrade halts, and nothing after it is touched. `retry` runs that turn again and `abort` ends the upgrade; there is no `skip-machine`, because what comes after would be newer than the component that was skipped. After an abort the operator does not start again for the same version.
+
+| Reason | What it means | State of the node |
+|---|---|---|
+| `ImagePullFailed` | The image could not be pulled. | Unchanged. |
+| `RolledBack` | The component did not run the new version, or the cluster did not stay healthy, within `tryTimeout`. | Back on the previous image. |
+| `Timeout` | The cluster did not get healthy before the turn began. | Unchanged. |
+
+### What the operator leaves alone
+
+- **kube-proxy, CoreDNS and the other manifests Talos applies when a cluster is bootstrapped.** Talos applies them once and never again, and the operator does not either. The upgrade does update the kube-proxy image that each control plane's config names, so that the config is right; nothing runs from it. If your cluster still runs the kube-proxy Talos deployed, update its DaemonSet yourself; `KubernetesUpToDate` says when it is behind. kube-proxy may be older than the API server, so there is no hurry, but it does not follow by itself.
+- **Everything Talos does not run:** the CNI, CSI drivers, workloads.
+
+## Windows, gates and hooks
+
+`spec.rollout` holds three things that apply to every operation: a config rollout, a Talos upgrade and a Kubernetes upgrade.
+
+### Maintenance windows
+
+```yaml
+spec:
+  rollout:
+    maintenanceWindows:
+      - schedule: "0 2 * * 6"
+        duration: 3h
+        timeZone: Europe/Oslo
+```
+
+`schedule` is a cron expression of five fields (minute, hour, day of month, month, day of week) for when the window opens; `timeZone` is an IANA name and defaults to UTC. With no windows, any time is allowed.
+
+Outside every window nothing starts (`RolloutBlocked` with reason `OutsideWindow`, and the time the next window opens), and an operation in flight begins no new node. A node that is being changed is finished: a config that is being tried is verified and confirmed, a node that is cordoned is upgraded and uncordoned. So a window should be long enough for one node, not for the whole cluster; the rest waits for the next one.
+
+A schedule or time zone that cannot be understood closes the window until it is fixed (`InvalidRollout`).
+
+### Gates
+
+```yaml
+spec:
+  rollout:
+    gates:
+      - name: storage-healthy
+        object: { apiVersion: ceph.rook.io/v1, kind: CephCluster, namespace: storage, name: storage }
+        expression: object.status.ceph.health == "HEALTH_OK"
+```
+
+A gate is a [CEL](https://kubernetes.io/docs/reference/using-api/cel/) expression over one object, available as `object`. It is asked before a node is touched and while a changed node is verified: a node is not done, and the next not begun, until every gate has been true for the soak.
+
+Only a plain `true` opens a gate. An object that does not exist, a field that is not there, a result that is not a boolean: all closed, with the reason in `RolloutBlocked` or in the progress of the operation. Use `has(object.status.x)` where a field may be missing.
+
+The operator may only read what it is granted. Give it `get` on each kind a gate names, in the chart's values:
+
+```yaml
+gates:
+  rules:
+    - apiGroups: ["ceph.rook.io"]
+      resources: ["cephclusters"]
+      verbs: ["get"]
+```
+
+A gate that stays closed is bounded like every other wait. Before a node it ends in `Timeout` after `stepTimeout`; after a config change, Talos takes the change back when `tryTimeout` ends. If what a gate watches needs longer than that to settle after a node, such as storage that rebalances after a reboot, raise `stepTimeout`.
+
+### Hooks
+
+```yaml
+spec:
+  rollout:
+    hooks:
+      preNode:
+        - name: noout
+          timeout: 5m
+          job:
+            template:
+              spec:
+                serviceAccountName: storage-tools
+                containers:
+                  - name: ceph
+                    image: registry.example.com/ceph-tools:1
+                    command: ["ceph", "osd", "set-group", "noout", "$(TALOS_NODE)"]
+```
+
+A hook is a `batch/v1` Job spec. The operator creates the Job in the TalosCluster's namespace and waits for it.
+
+| Stage | Runs |
+|---|---|
+| `preRollout` | Once, after the operation started and before its first node. |
+| `preNode` | Before anything is sent to a node. |
+| `postNode` | After a node was verified. |
+| `postRollout` | When an operation that ran its `preRollout` hooks ends: finished, aborted, or replaced by a newer change. |
+
+A Kubernetes upgrade takes no node out of the cluster and runs only `preRollout` and `postRollout`.
+
+Every container gets these environment variables:
+
+| Variable | Value |
+|---|---|
+| `TALOS_CLUSTER` | The TalosCluster's name. |
+| `TALOS_OPERATION` | `ConfigRollout`, `TalosUpgrade` or `KubernetesUpgrade`. |
+| `TALOS_OPERATION_ID` | The operation's ID, as in `status.operation.id`. |
+| `TALOS_HOOK` | The stage. |
+| `TALOS_MACHINE`, `TALOS_NODE` | For a node's hooks: the TalosMachine, and its Kubernetes Node. |
+
+Where the spec leaves them open, the operator sets `restartPolicy: Never`, `backoffLimit: 0`, `activeDeadlineSeconds` to the hook's timeout (`stepTimeout` if the hook has none), and keeps a finished Job for a day.
+
+**When a hook fails** (its Job fails, or does not finish in time), the operation halts with reason `HookFailed`, and the remediation names the Job to read the log of. `retry` runs the hook again as a new Job. `skip-machine` leaves out the node whose `preNode` hook failed, or goes on without the rest of a node's `postNode` hooks. `abort` ends the operation.
+
+Three things to know when writing hooks:
+
+- **A hook may run more than once for the same node**, after a retry. Write hooks that are safe to repeat.
+- **A node that failed gets no `postNode` hook.** What `preNode` set up for it is still set up while the operation is halted, and after a skip. Clean up in `postRollout`, which runs however the operation ends.
+- **A hook runs in the operator's namespace**, with the pod spec you wrote. Whoever may edit a TalosCluster can therefore run pods there, next to the cluster's secrets. They could already put any config on every node, so this grants nothing new, but it is one more reason to keep that permission narrow.
 
 ## Backing out
 
