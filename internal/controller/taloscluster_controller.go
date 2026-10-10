@@ -76,8 +76,13 @@ type TalosClusterReconciler struct {
 	// Now is the clock for status timestamps; nil means time.Now.
 	Now func() time.Time
 	// APIReader reads objects outside the namespaces the manager caches: the node leases a
-	// rollout verifies heartbeats with. Nil means Client.
+	// rollout verifies heartbeats with, and the pods an upgrade drains. Nil means Client.
 	APIReader client.Reader
+	// Evictor evicts the pods of a node an upgrade is about to reboot.
+	Evictor PodEvictor
+	// NodeName is the Kubernetes node this replica runs on, if it knows. An upgrade takes that
+	// node last in its group, so the operator moves house as rarely as it can.
+	NodeName string
 }
 
 // +kubebuilder:rbac:groups=talos.jarensaa.github.io,resources=talosclusters,verbs=get;list;watch;update;patch
@@ -395,6 +400,13 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 		return err
 	})
 
+	reads.read("boot ID", func(ctx context.Context) error {
+		id, err := r.BootID(ctx, addr)
+		facts.bootID = id
+
+		return err
+	})
+
 	reads.read("schematic", func(ctx context.Context) error {
 		sc, err := r.ImageFactorySchematic(ctx, addr)
 
@@ -426,6 +438,7 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 			if err == nil {
 				facts.etcdErrors = es.Errors
 				facts.etcdStatusRead = true
+				facts.etcdLeader = es.MemberID != 0 && es.MemberID == es.Leader
 			}
 
 			return err
@@ -670,16 +683,25 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 		was = nil
 	}
 
+	// The same events tell the story of a config rollout and of an upgrade, under their own names.
+	kind, done, does := "Rollout", "MachineConfigured", "runs its rendered config"
+	upgrade := func(op *talosv1alpha1.Operation) bool {
+		return op != nil && op.Type == talosv1alpha1.OperationTalosUpgrade
+	}
+	if upgrade(is) || (is == nil && upgrade(was)) {
+		kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
+	}
+
 	if is != nil {
 		if was == nil {
 			was = &talosv1alpha1.Operation{}
 
-			normal("RolloutStarted", "%s %s started for %s", is.Type, is.ID, strings.Join(is.Plan, ", "))
+			normal(kind+"Started", "%s %s started for %s", is.Type, is.ID, strings.Join(is.Plan, ", "))
 		}
 
 		for _, name := range is.Completed {
 			if !slices.Contains(was.Completed, name) {
-				normal("MachineConfigured", "%s runs its rendered config, confirmed after staying healthy", name)
+				normal(done, "%s %s, confirmed after staying healthy", name, does)
 			}
 		}
 
@@ -691,10 +713,10 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 
 		switch {
 		case is.Failure != nil && (was.Failure == nil || was.Failure.Token != is.Failure.Token):
-			warning("RolloutHalted", "%s, step %s (%s): %s %s",
+			warning(kind+"Halted", "%s, step %s (%s): %s %s",
 				is.Failure.Machine, is.Failure.Step, is.Failure.Reason, is.Failure.Message, is.Failure.Remediation)
 		case is.Failure == nil && was.Failure != nil:
-			normal("RolloutResumed", "%s %s continues after %s", is.Type, is.ID, was.Failure.Reason)
+			normal(kind+"Resumed", "%s %s continues after %s", is.Type, is.ID, was.Failure.Reason)
 		}
 
 		return
@@ -707,13 +729,13 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 
 	record := after.Status.History[0]
 	if record.Outcome == talosv1alpha1.OperationSucceeded {
-		normal("Rollout"+record.Outcome, "%s %s: %d machine(s) configured, %d skipped",
+		normal(kind+record.Outcome, "%s %s: %d machine(s) done, %d skipped",
 			record.Type, record.ID, len(record.Completed), len(record.Skipped))
 
 		return
 	}
 
-	warning("Rollout"+record.Outcome, "%s %s: %s", record.Type, record.ID, record.Message)
+	warning(kind+record.Outcome, "%s %s: %s", record.Type, record.ID, record.Message)
 }
 
 func setCondition(st *talosv1alpha1.TalosClusterStatus, gen int64, condType string, status metav1.ConditionStatus, reason, message string) {

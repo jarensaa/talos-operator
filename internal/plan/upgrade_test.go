@@ -97,11 +97,11 @@ func TestUpgradeHappyPath(t *testing.T) {
 		{"back, still booting", cordonedStep(StepBooting), with(cordoned(nodeAfter(), 0), func(n *UpgradeNode) { n.Running = false }),
 			open, closed, time.Minute, Wait, ""},
 		{"back on the new system", cordonedStep(StepBooting), cordoned(nodeAfter(), 0), open, closed, time.Minute, Advance, StepUncordoning},
-		{"not Ready to Kubernetes yet", cordonedStep(StepUncordoning), with(cordoned(nodeAfter(), 0), func(n *UpgradeNode) { n.NodeReady = false }),
-			open, closed, 0, Wait, ""},
+		{"not Ready to Kubernetes yet", cordonedStep(StepUncordoning),
+			with(cordoned(nodeAfter(), 0), func(n *UpgradeNode) { n.NodeReady = false }), open, closed, 0, Wait, ""},
 		{"uncordon", cordonedStep(StepUncordoning), cordoned(nodeAfter(), 0), open, closed, 0, Uncordon, ""},
 		{"uncordoned", cordonedStep(StepUncordoning), nodeAfter(), open, closed, 0, Advance, StepVerifying},
-		{"healthy", cordonedStep(StepVerifying), nodeAfter(), open, open, 0, MarkHealthy, ""},
+		{"verified", cordonedStep(StepVerifying), nodeAfter(), open, open, 0, MarkHealthy, ""},
 		{"soaking", soaked, nodeAfter(), open, open, timing.Soak - time.Second, Wait, ""},
 		{"done", soaked, nodeAfter(), open, open, timing.Soak, Complete, ""},
 	}
@@ -165,7 +165,8 @@ func TestUpgradeFailures(t *testing.T) {
 // through. It must come out right from what the node says.
 func TestUpgradeResumesFromWhatTheNodeSays(t *testing.T) {
 	for _, name := range []string{StepPulling, StepInstalling} {
-		if got := NextUpgradeStep(upgradeStep(name), nodeAfter(), closed, closed, timing, t0); got.Kind != Advance || got.Step != StepUncordoning {
+		got := NextUpgradeStep(upgradeStep(name), nodeAfter(), closed, closed, timing, t0)
+		if got.Kind != Advance || got.Step != StepUncordoning {
 			t.Fatalf("%s on a node that already runs the target must go straight to uncordoning, got %s %s", name, got.Kind, got.Step)
 		}
 	}
@@ -192,12 +193,15 @@ func TestOnlyAnOperatorsOwnCordonIsUndone(t *testing.T) {
 	}
 
 	after := with(nodeAfter(), func(n *UpgradeNode) { n.Unschedulable = true })
-	if got := NextUpgradeStep(upgradeStep(StepUncordoning), after, open, closed, timing, t0); got.Kind != Advance || got.Step != StepVerifying {
+	got := NextUpgradeStep(upgradeStep(StepUncordoning), after, open, closed, timing, t0)
+	if got.Kind != Advance || got.Step != StepVerifying {
 		t.Fatalf("a cordon the operator did not set must not be undone, got %s", got.Kind)
 	}
 }
 
 // upgradeRule names the rule an action breaks in the given situation, or returns "".
+//
+//nolint:gocyclo // one rule per action, spelled out
 func upgradeRule(step UpgradeStep, node UpgradeNode, pre, checks Gate, now time.Time, action Action) string {
 	cordoned := node.KubernetesKnown && node.Unschedulable
 	rebooted := node.Reachable && node.BootID != "" && node.BootID != step.BootID
@@ -234,6 +238,10 @@ func upgradeRule(step UpgradeStep, node UpgradeNode, pre, checks Gate, now time.
 			if !cordoned || node.PodsLeft != 0 {
 				return "a node is rebooted only once it is cordoned and drained"
 			}
+
+			if !node.Reachable || node.BootID == "" {
+				return "the boot ID to tell a reboot by must be known before the reboot is asked for"
+			}
 		case StepUncordoning:
 			if !node.Installed || !node.InstallKnown || !node.Running {
 				return "a node moves on from its reboot only on the installed system"
@@ -250,7 +258,7 @@ func upgradeRule(step UpgradeStep, node UpgradeNode, pre, checks Gate, now time.
 
 // The rules of an upgrade, checked over every combination of step, observation, gate and time.
 func TestUpgradeInvariants(t *testing.T) {
-	var nodes []UpgradeNode
+	nodes := make([]UpgradeNode, 0, 432)
 
 	for _, reachable := range []bool{true, false} {
 		for _, boot := range []string{"", bootBefore, bootAfter} {
@@ -271,7 +279,9 @@ func TestUpgradeInvariants(t *testing.T) {
 		}
 	}
 
-	offsets := []time.Duration{0, time.Second, timing.Soak, timing.StepTimeout - time.Second, timing.StepTimeout, timing.StepTimeout + time.Hour}
+	offsets := []time.Duration{
+		0, time.Second, timing.Soak, timing.StepTimeout - time.Second, timing.StepTimeout, timing.StepTimeout + time.Hour,
+	}
 	steps := []string{StepPulling, StepInstalling, StepDraining, StepRebooting, StepBooting, StepUncordoning, StepVerifying}
 	checked := 0
 
@@ -384,7 +394,8 @@ func TestPlanUpgradeBlocks(t *testing.T) {
 		reason   string
 		message  string
 	}{
-		{"a jump Talos does not allow", []UpgradeMachine{upgradable(w1, false), jump}, UpgradeSettings{}, openPass, BlockIncompatible, "cp-1: v1.12.4"},
+		{"a jump Talos does not allow", []UpgradeMachine{upgradable(w1, false), jump}, UpgradeSettings{}, openPass,
+			BlockIncompatible, "cp-1: v1.12.4"},
 		{"incompatible outranks paused", []UpgradeMachine{jump}, UpgradeSettings{Paused: true}, openPass, BlockIncompatible, cp1},
 		{"paused", change, UpgradeSettings{Paused: true}, openPass, BlockPaused, "spec.paused"},
 		{"stale status", append(slices.Clone(change), stale), UpgradeSettings{}, openPass, BlockNotCurrent, w2},

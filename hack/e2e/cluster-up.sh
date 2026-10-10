@@ -12,7 +12,10 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
 E2E_DIR=${E2E_DIR:-"$REPO_ROOT/.e2e"}
 CLUSTER_NAME=${CLUSTER_NAME:-talos-operator-e2e}
-TALOS_VERSION=${TALOS_VERSION:-v1.14.2}
+# The cluster boots one patch release below UPGRADE_TO, the version the operator is built for, so
+# that the suite has a Talos upgrade to perform (test/e2e/adoption_test.go).
+TALOS_VERSION=${TALOS_VERSION:-v1.14.1}
+UPGRADE_TO=${UPGRADE_TO:-v1.14.2}
 KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.37.0}
 CONTROLPLANES=${CONTROLPLANES:-3}
 WORKERS=${WORKERS:-1}
@@ -227,6 +230,8 @@ export E2E_KUBECONFIG="$KUBECONFIG_PATH"
 export E2E_CONTROLPLANES="${controlplane_ips[*]}"
 export E2E_WORKERS="${worker_ips[*]}"
 export E2E_MAINTENANCE_NODES="${maintenance_ips[*]}"
+export E2E_TALOS_VERSION="$TALOS_VERSION"
+export E2E_UPGRADE_TO="$UPGRADE_TO"
 ENV
 
 log "cluster $CLUSTER_NAME is ready; source $E2E_DIR/env"

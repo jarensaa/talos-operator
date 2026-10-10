@@ -54,7 +54,7 @@ func (r *TalosClusterReconciler) manage(ctx context.Context, tc *talosv1alpha1.T
 		// The cluster was not reached, so nothing can be compared or planned. A node step in flight
 		// still has deadlines to keep: it goes on, with its node counted as unreachable.
 		if st.Operation != nil {
-			return r.rollout(ctx, tc, obs, pools, machines)
+			return r.operate(ctx, tc, obs, pools, machines)
 		}
 
 		return nil
@@ -86,7 +86,31 @@ func (r *TalosClusterReconciler) manage(ctx context.Context, tc *talosv1alpha1.T
 		meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionRolloutBlocked)
 	}
 
-	return r.rollout(ctx, tc, obs, pools, machines)
+	return r.operate(ctx, tc, obs, pools, machines)
+}
+
+// operate carries the one disruptive operation of the cluster a step further, or plans the next
+// (docs/scope.md §8.1, invariant 1). A Talos upgrade comes before a config rollout: it brings a
+// node to the system its config names, and the rollout then applies that config.
+func (r *TalosClusterReconciler) operate(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation,
+	pools map[string]*talosv1alpha1.TalosMachinePool, machines []talosv1alpha1.TalosMachine,
+) error {
+	upgrading, held, err := r.upgrade(ctx, tc, obs, pools, machines)
+	if err != nil || upgrading {
+		return err
+	}
+
+	if err := r.rollout(ctx, tc, obs, pools, machines); err != nil {
+		return err
+	}
+
+	// An upgrade that is due and may not start is what really holds things up: the config that
+	// names its installer waits for it.
+	if held != nil && tc.Status.Operation == nil {
+		setCondition(&tc.Status, tc.Generation, held.Type, held.Status, held.Reason, held.Message)
+	}
+
+	return nil
 }
 
 // forgetHandover drops the handover state when config returns to Observe, so entering Manage

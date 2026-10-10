@@ -49,6 +49,12 @@ spec:
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          env:
+            # Which node this replica runs on: an upgrade takes that node last (docs/scope.md §7.3).
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           ports:
             - name: probes
               containerPort: 8081

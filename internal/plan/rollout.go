@@ -83,6 +83,7 @@ const (
 	BlockNotCurrent        = "AwaitingStatus"
 	BlockProtected         = "ProtectedChange"
 	BlockRequiresReinstall = "RequiresReinstall"
+	BlockAwaitingUpgrade   = "AwaitingUpgrade"
 	BlockAborted           = "Aborted"
 	BlockAwaitingApproval  = "AwaitingApproval"
 	BlockGateClosed        = "GateClosed"
@@ -240,6 +241,11 @@ func rolloutBlock(pending []Machine, stale []string, s Settings, gate Gate, r Ro
 
 	if blocked := withClass(pending, classify.BootTime); len(blocked) > 0 {
 		return BlockRequiresReinstall, "the change only takes effect through a reinstall, which is not supported yet: " + describe(blocked)
+	}
+
+	if blocked := withClass(pending, classify.Installer); len(blocked) > 0 {
+		return BlockAwaitingUpgrade, "the config names an installer image the node does not run yet, which a Talos upgrade " +
+			"brings about (spec.management.upgrades); it is applied once the node runs it: " + describe(blocked)
 	}
 
 	if s.Paused {

@@ -169,6 +169,12 @@ type Rollout struct {
 	// Defaults to 10m. A timeout is a failure, never a skip.
 	// +optional
 	StepTimeout *metav1.Duration `json:"stepTimeout,omitempty"`
+
+	// DrainTimeout bounds the eviction of a node's pods before an upgrade reboots it. Evictions
+	// respect PodDisruptionBudgets, so a budget that never lets a pod go ends here. Defaults to
+	// 10m. A node that is not drained in time halts the upgrade and stays cordoned.
+	// +optional
+	DrainTimeout *metav1.Duration `json:"drainTimeout,omitempty"`
 }
 
 // CredentialsSource is where the operator's Talos API client certificate comes from.
@@ -345,12 +351,28 @@ type AdoptionStatus struct {
 	ProvenAt *metav1.Time `json:"provenAt,omitempty"`
 }
 
+// UpgradeHolds maps machines to installer images a human took out of an upgrade. An upgrade to
+// such an image is not started again for that machine; one to any other image is.
+type UpgradeHolds struct {
+	// Skipped: the machine was skipped after its upgrade failed.
+	// +optional
+	Skipped map[string]string `json:"skipped,omitempty"`
+	// Aborted: the upgrade was aborted before it reached the machine, or while it was at it.
+	// +optional
+	Aborted map[string]string `json:"aborted,omitempty"`
+}
+
 // OperationType is the kind of disruptive operation holding the cluster lock.
 // +kubebuilder:validation:Enum=ConfigRollout;TalosUpgrade;KubernetesUpgrade;AddControlPlane;RemoveMachine;Bootstrap
 type OperationType string
 
-// OperationConfigRollout applies rendered machine config, one node at a time (docs/scope.md §6.3).
-const OperationConfigRollout OperationType = "ConfigRollout"
+const (
+	// OperationConfigRollout applies rendered machine config, one node at a time (docs/scope.md §6.3).
+	OperationConfigRollout OperationType = "ConfigRollout"
+	// OperationTalosUpgrade installs another Talos version or installer, one node at a time, with a
+	// drain and a reboot each (docs/scope.md §7.3).
+	OperationTalosUpgrade OperationType = "TalosUpgrade"
+)
 
 // Outcomes of a finished operation.
 const (
@@ -389,6 +411,13 @@ type OperationStep struct {
 	// PreRebootBootID is recorded before a reboot so a resumed step can tell whether it happened.
 	// +optional
 	PreRebootBootID string `json:"preRebootBootID,omitempty"`
+	// Image is the installer image an upgrade step installs.
+	// +optional
+	Image string `json:"image,omitempty"`
+	// Cordoned is set before the operator cordons the node, so that it later uncordons a node it
+	// cordoned itself and leaves alone one that someone else did.
+	// +optional
+	Cordoned bool `json:"cordoned,omitempty"`
 	// Deadline is the step's timeout, e.g. the end of a TRY window.
 	// +optional
 	Deadline *metav1.Time `json:"deadline,omitempty"`
@@ -521,6 +550,10 @@ type TalosClusterStatus struct {
 	// renders anything else, a revert included, rolls out and clears this.
 	// +optional
 	AbortedTargets map[string]string `json:"abortedTargets,omitempty"`
+
+	// Upgrades records what a human decided about Talos upgrades that were due.
+	// +optional
+	Upgrades *UpgradeHolds `json:"upgrades,omitempty"`
 
 	// History holds the most recent finished operations, newest first.
 	// +kubebuilder:validation:MaxItems=10

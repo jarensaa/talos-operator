@@ -150,6 +150,11 @@ func metricsOptions(o *options) (metricsserver.Options, *certwatcher.CertWatcher
 
 // setupControllers registers every controller with the manager.
 func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) error {
+	evictor, err := controller.NewPodEvictor(mgr.GetConfig())
+	if err != nil {
+		return err
+	}
+
 	if err := (&controller.TalosClusterReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -159,6 +164,10 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) e
 		// TalosCluster itself right before a write to Talos.
 		APIReader:       mgr.GetAPIReader(),
 		ObserveInterval: o.observeInterval,
+		Evictor:         evictor,
+		// The chart passes the node's name down; without it the operator simply does not know
+		// which node an upgrade should leave for last.
+		NodeName: os.Getenv("NODE_NAME"),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("TalosCluster controller: %w", err)
 	}

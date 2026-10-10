@@ -33,6 +33,8 @@ concurrency:
 
 env:
   TALOSCTL_VERSION: v1.14.2
+  # What the nodes boot, one patch release below what the suite upgrades them to (cluster-up.sh).
+  TALOS_VERSION: v1.14.1
   # One control plane and one worker for pull requests: quick, and enough for what every change
   # must show. The weekly run has three control planes.
   CONTROLPLANES: ${{ inputs.controlplanes || (github.event_name == 'schedule' && '3') || '1' }}
@@ -73,7 +75,8 @@ jobs:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # An upgrade reboots every node, and the larger shapes have four of them.
+    timeout-minutes: 120
     # Cluster creation needs only QEMU and talosctl, so it starts first in the background; Go setup
     # and test compilation run while the VMs boot, install and bootstrap (~3 minutes).
     steps:
@@ -109,7 +112,7 @@ jobs:
           path: |
             ~/.talos/cache
             ~/.talos/cni/bin
-          key: talos-assets-${{ env.TALOSCTL_VERSION }}
+          key: talos-assets-${{ env.TALOSCTL_VERSION }}-boot-${{ env.TALOS_VERSION }}
 
       # The harness is called directly rather than through make: the Makefile needs Go, which is
       # set up in parallel below. Background processes survive between steps of a job.

@@ -162,9 +162,9 @@ func nextPulling(step UpgradeStep, node UpgradeNode, pre Gate, t Timing, now tim
 	case node.installed():
 		return advance(StepUncordoning)
 	case timedOut(Step{Since: step.Since}, t, now):
-		return fail(FailTimeout, "not started within %s: %s", t.StepTimeout, cmp.Or(pre.Reason, "the node is not reachable"))
+		return fail(FailTimeout, "not started within %s: %s", t.StepTimeout, cmp.Or(pre.Reason, notReachable))
 	case !node.Reachable:
-		return wait("the node is not reachable")
+		return wait(notReachable)
 	case !pre.Open:
 		// Pulling takes nothing from the cluster, but an upgrade that cannot go on is not begun.
 		return wait("%s", pre.Reason)
@@ -178,9 +178,9 @@ func nextInstalling(step UpgradeStep, node UpgradeNode, t Timing, now time.Time)
 	case node.installed():
 		return advance(StepUncordoning)
 	case timedOut(Step{Since: step.Since}, t, now):
-		return fail(FailTimeout, "not installed within %s: the node is not reachable", t.StepTimeout)
+		return fail(FailTimeout, "not installed within %s: %s", t.StepTimeout, notReachable)
 	case !node.Reachable:
-		return wait("the node is not reachable")
+		return wait(notReachable)
 	default:
 		return Action{Kind: Install}
 	}
@@ -207,6 +207,10 @@ func nextDraining(step UpgradeStep, node UpgradeNode, pre Gate, t Timing, now ti
 		return wait("the node's pods could not be listed")
 	case node.PodsLeft > 0:
 		return Action{Kind: Evict, Message: drainWait(node, pre, cordoned)}
+	case !node.Reachable || node.BootID == "":
+		// The boot ID is recorded with the next step. Without it nothing could tell later whether
+		// the node rebooted.
+		return wait(notReachable)
 	default:
 		return advance(StepRebooting)
 	}
@@ -239,9 +243,9 @@ func nextRebooting(step UpgradeStep, node UpgradeNode, pre Gate, t Timing, now t
 		// It rebooted: the request went out and its answer, or the step after it, was lost.
 		return advance(StepBooting)
 	case timedOut(Step{Since: step.Since}, t, now):
-		return fail(FailTimeout, "not rebooted within %s: %s", t.StepTimeout, cmp.Or(pre.Reason, "the node is not reachable"))
+		return fail(FailTimeout, "not rebooted within %s: %s", t.StepTimeout, cmp.Or(pre.Reason, notReachable))
 	case !node.Reachable || node.BootID == "":
-		return wait("the node is not reachable")
+		return wait(notReachable)
 	case !pre.Open:
 		return wait("%s", pre.Reason)
 	default:
@@ -293,7 +297,7 @@ func nextSettling(step UpgradeStep, node UpgradeNode, checks Gate, t Timing, now
 
 	reason := checks.Reason
 	if !node.Reachable {
-		reason = "the node is not reachable"
+		reason = notReachable
 	}
 
 	switch {

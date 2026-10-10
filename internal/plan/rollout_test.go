@@ -190,6 +190,9 @@ func TestPlanRolloutBlocks(t *testing.T) {
 		{"stale status", append(slices.Clone(change), stale), Settings{}, openPass, BlockNotCurrent, w2},
 		{"a protected field", []Machine{changed(cp1, true, classify.Protected)}, Settings{}, openPass, BlockProtected, "cp-1 (v1alpha1/Example)"},
 		{"a boot-time change", []Machine{changed(w1, false, classify.BootTime)}, Settings{}, openPass, BlockRequiresReinstall, w1},
+		// An installer the node does not run yet is an upgrade's to bring about, whatever else is set.
+		{"an installer not installed yet", []Machine{changed(w1, false, classify.Installer)}, Settings{Paused: true}, openPass,
+			BlockAwaitingUpgrade, w1},
 		// One blocked machine blocks the rollout for all of them.
 		{"protected on one machine", []Machine{changed(w1, false, classify.LiveSafe), changed(cp1, true, classify.Protected)},
 			Settings{}, openPass, BlockProtected, cp1},

@@ -105,7 +105,7 @@ test-e2e: ## Run e2e tests against the cluster from e2e-cluster-up, with the ope
 	@test -s $(E2E_DIR)/env || { echo "No e2e cluster; run 'make e2e-cluster-up e2e-deploy' first."; exit 1; }
 	@# Only tests named TestE2E* run: unit tests in the same packages already run in test-unit.
 	@# -p 1: the packages share one cluster, and test/e2e takes a node offline for a while.
-	. $(E2E_DIR)/env && go test -tags e2e -run '^TestE2E' $(E2E_PACKAGES) -v -count=1 -p 1 -timeout 45m
+	. $(E2E_DIR)/env && go test -tags e2e -run '^TestE2E' $(E2E_PACKAGES) -v -count=1 -p 1 -timeout 100m
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

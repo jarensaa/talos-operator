@@ -55,7 +55,13 @@ const (
 	// Unknown is everything this package has no rule for. It needs approval, so a document kind
 	// Talos adds later is never treated as safe by default.
 	Unknown Class = "Unknown"
-	// BootTime changes only take effect through a reinstall (§7.3).
+	// Installer changes name another installer image: another Talos version, or another schematic.
+	// They take effect through an upgrade, which the operator performs when upgrades are enabled
+	// (§7.3). As a config change it is applied once the node runs what the image installs, and
+	// then it changes nothing on the node: see Installed.
+	Installer Class = "Installer"
+	// BootTime changes only take effect when a node is installed: kernel arguments, the install
+	// disk, disk encryption. The operator does not reinstall a node for them.
 	BootTime Class = "BootTime"
 	// Protected fields never change: cluster identity, CAs, tokens, the machine type.
 	Protected Class = "Protected"
@@ -63,7 +69,7 @@ const (
 
 // severity orders the classes.
 var severity = map[Class]int{
-	None: 0, LiveSafe: 1, ControlPlaneRestart: 2, Connectivity: 3, Storage: 4, Unknown: 5, BootTime: 6, Protected: 7,
+	None: 0, LiveSafe: 1, ControlPlaneRestart: 2, Connectivity: 3, Storage: 4, Unknown: 5, Installer: 6, BootTime: 7, Protected: 8,
 }
 
 // Worse reports whether c is more severe than other.
@@ -72,8 +78,9 @@ func (c Class) Worse(other Class) bool { return severity[c] > severity[other] }
 // NeedsApproval reports whether a human must approve the change before it is applied.
 func (c Class) NeedsApproval() bool { return c == Storage || c == Unknown }
 
-// Blocked reports whether the operator refuses the change outright.
-func (c Class) Blocked() bool { return c == Protected || c == BootTime }
+// Blocked reports whether a config rollout does not apply the change: because the operator never
+// makes it, or because an upgrade has to bring the node there first.
+func (c Class) Blocked() bool { return c == Protected || c == BootTime || c == Installer }
 
 // Change is the classification of the difference between two configs.
 type Change struct {
@@ -140,6 +147,7 @@ var pathRules = sortRules([]pathRule{
 	{"cluster.network.podSubnets", Protected}, {"cluster.network.serviceSubnets", Protected},
 	{"cluster.network.dnsDomain", Protected},
 
+	{v1alpha1InstallImage, Installer},
 	{"machine.install", BootTime}, {"machine.kernel", BootTime}, {"machine.systemDiskEncryption", BootTime},
 
 	{"machine.disks", Storage},
@@ -166,11 +174,44 @@ func sortRules(rules []pathRule) []pathRule {
 // v1alpha1Key is the key of the legacy root document in a normalized config.
 const v1alpha1Key render.DocKey = "v1alpha1"
 
+// Option changes how a difference is classified.
+type Option func(*options)
+
+type options struct {
+	installed bool
+}
+
+// Installed says that the node already runs what the desired config's installer image installs.
+// Naming that image in the node's config is then bookkeeping, and as safe as a label.
+func Installed() Option { return func(o *options) { o.installed = true } }
+
+// installerImagePaths are where a machine config names the installer image: in the
+// UnattendedInstallConfig document, and in the v1alpha1 document of older configs.
+const (
+	unattendedInstallKind  = "UnattendedInstallConfig"
+	unattendedInstallImage = "installer.image"
+	v1alpha1InstallImage   = "machine.install.image"
+)
+
 // Classify compares live with desired. An empty Change means they are equal.
-func Classify(live, desired *render.Config) (Change, error) {
+func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	installer := Installer
+	if o.installed {
+		installer = LiveSafe
+	}
+
 	byClass := map[Class][]string{}
 
 	note := func(class Class, reason string) {
+		if class == Installer {
+			class = installer
+		}
+
 		byClass[class] = append(byClass[class], reason)
 	}
 
@@ -209,6 +250,21 @@ func Classify(live, desired *render.Config) (Change, error) {
 			continue
 		}
 
+		// The document that names the installer: a change of the image alone is the installer's
+		// class, anything else in it only an install can bring about.
+		if isKind(k, unattendedInstallKind) && inLive && inDesired {
+			paths, err := changedPaths(a, b)
+			if err != nil {
+				return Change{}, fmt.Errorf("compare %s: %w", k, err)
+			}
+
+			if len(paths) == 1 && paths[0] == unattendedInstallImage {
+				note(Installer, string(k)+": "+paths[0])
+
+				continue
+			}
+		}
+
 		note(kindClass(k), string(k))
 	}
 
@@ -223,6 +279,12 @@ func Classify(live, desired *render.Config) (Change, error) {
 	slices.Sort(out.Reasons)
 
 	return out, nil
+}
+
+func isKind(key render.DocKey, kind string) bool {
+	parts := strings.Split(string(key), "/")
+
+	return len(parts) >= 2 && parts[1] == kind
 }
 
 // kindClass classifies a document key such as v1alpha1/BondConfig/bond0.

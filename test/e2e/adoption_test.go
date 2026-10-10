@@ -30,9 +30,12 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
@@ -411,6 +414,150 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(snapshot(ctx, harness, nodes)).To(Equal(untouched))
 		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(15*time.Minute))
+
+	// A Talos upgrade (docs/scope.md §7.3): every node gets the new system installed, is drained
+	// and rebooted, and comes back on it, one at a time. The operator runs on these very nodes, one
+	// replica on each, so it upgrades the ground it stands on: whichever replica leads loses its
+	// node at some point, and the other finishes what it began.
+	It("upgrades Talos on every node, the ones the operator itself runs on included, with a workload kept up", func(ctx context.Context) {
+		target := os.Getenv("E2E_UPGRADE_TO")
+		if target == "" || target == os.Getenv("E2E_TALOS_VERSION") {
+			Skip("the harness cluster already runs the version to upgrade to")
+		}
+
+		before := snapshot(ctx, harness, nodes)
+
+		schematics := map[netip.Addr]string{}
+		for _, n := range nodes {
+			schematic, err := harness.ImageFactorySchematic(ctx, n)
+			Expect(err).NotTo(HaveOccurred())
+
+			schematics[n] = schematic.ID
+		}
+
+		By("running a workload that has to stay up: one replica per node, and a budget that lets one go at a time")
+		const name = "stays-up"
+
+		labels := map[string]string{"app": name}
+		workload := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: new(int32(len(nodes))),
+				Selector: &metav1.LabelSelector{MatchLabels: labels},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: labels},
+					Spec: corev1.PodSpec{
+						// The image every Talos node has: the kubelet's own pause container.
+						Containers:  []corev1.Container{{Name: "pause", Image: "registry.k8s.io/pause:3.10"}},
+						Tolerations: []corev1.Toleration{{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists}},
+						Affinity: &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+								TopologyKey:   "kubernetes.io/hostname",
+								LabelSelector: &metav1.LabelSelector{MatchLabels: labels},
+							}},
+						}},
+					},
+				},
+			},
+		}
+		budget := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				MaxUnavailable: new(intstr.FromInt32(1)),
+				Selector:       &metav1.LabelSelector{MatchLabels: labels},
+			},
+		}
+
+		Expect(k8sClient.Create(ctx, workload)).To(Succeed())
+		Expect(k8sClient.Create(ctx, budget)).To(Succeed())
+		DeferCleanup(func(ctx context.Context) {
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, budget))).To(Succeed())
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, workload))).To(Succeed())
+		})
+
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(workload), workload)).To(Succeed())
+			g.Expect(workload.Status.AvailableReplicas).To(BeEquivalentTo(len(nodes)))
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
+
+		By("asking for the next Talos release")
+		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
+			tc.Spec.Versions.Talos = target
+			tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled
+		})
+
+		// upgraded finds the record of the upgrade once it has ended.
+		upgraded := func() *talosv1alpha1.OperationRecord {
+			for i := range tc.Status.History {
+				if tc.Status.History[i].Type == talosv1alpha1.OperationTalosUpgrade {
+					return &tc.Status.History[i]
+				}
+			}
+
+			return nil
+		}
+
+		By("waiting for the upgrade to go through every node")
+		// With a single control plane the Kubernetes API is down while that node reboots, and the
+		// test cannot see anything then. Whenever it can, the workload must be up.
+		lowest := int32(len(nodes))
+
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(workload), workload); err == nil {
+				lowest = min(lowest, workload.Status.AvailableReplicas)
+			}
+
+			if op := tc.Status.Operation; op != nil {
+				g.Expect(op.Failure).To(BeNil(), "the upgrade halted: %+v", op.Failure)
+			}
+
+			g.Expect(upgraded()).NotTo(BeNil(), "still upgrading: %+v", tc.Status.Operation)
+		}).WithContext(ctx).WithTimeout(time.Duration(len(nodes)) * 15 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+		record := upgraded()
+		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		Expect(record.Completed).To(HaveLen(len(nodes)))
+		Expect(lowest).To(BeNumerically(">=", int32(len(nodes))-1), "the budget lets one replica go at a time, never more")
+
+		By("checking every node: rebooted once into the new release, from the installer it had, and schedulable again")
+		for _, n := range nodes {
+			version, err := harness.Version(ctx, n)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(version.Tag).To(Equal(target), "%s", n)
+
+			schematic, err := harness.ImageFactorySchematic(ctx, n)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(schematic.ID).To(Equal(schematics[n]), "%s keeps its schematic", n)
+
+			boot, err := harness.BootID(ctx, n)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(boot).NotTo(Equal(before[n].BootID), "%s must have rebooted", n)
+		}
+
+		var kubeNodes corev1.NodeList
+		Expect(k8sClient.List(ctx, &kubeNodes)).To(Succeed())
+
+		for _, n := range kubeNodes.Items {
+			Expect(n.Spec.Unschedulable).To(BeFalse(), "%s was uncordoned", n.Name)
+		}
+
+		By("waiting for the config to follow: it names the installer each node now runs")
+		inSync(ctx, time.Duration(len(nodes))*6*time.Minute)
+		Expect(tc.Spec.Versions.Talos).To(Equal(target))
+		Eventually(conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionTalosUpToDate)).
+			WithContext(ctx).WithTimeout(time.Minute).Should(Succeed())
+
+		By("checking that the operator is whole again: both replicas, and nothing it was not allowed to do")
+		Eventually(func(g Gomega) {
+			deployment := &appsv1.Deployment{}
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNamespace, Name: operatorName}, deployment)).To(Succeed())
+			g.Expect(deployment.Status.ReadyReplicas).To(Equal(*deployment.Spec.Replicas))
+		}).WithContext(ctx).WithTimeout(5 * time.Minute).Should(Succeed())
+
+		Expect(rejectedRPCs(ctx)).To(BeZero())
+	}, NodeTimeout(100*time.Minute))
 
 	// A change of the spec reaches the nodes: applied in try mode, verified from outside, and
 	// confirmed only after the node stayed healthy (docs/scope.md §8.5.1).

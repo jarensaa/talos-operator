@@ -198,6 +198,9 @@ type Action struct {
 	Message string
 }
 
+// notReachable is what a step waits for while its node does not answer.
+const notReachable = "the node is not reachable"
+
 func wait(format string, args ...any) Action {
 	return Action{Kind: Wait, Message: fmt.Sprintf(format, args...)}
 }
@@ -247,7 +250,7 @@ func nextTrying(step Step, node Node, pre Gate, t Timing, now time.Time) Action 
 	case !now.Before(step.Deadline):
 		return advance(StepRollingBack)
 	case !node.Reachable:
-		return wait("the node is not reachable")
+		return wait(notReachable)
 	case node.ActiveHash == step.DesiredHash:
 		return advance(StepVerifying)
 	case node.ActiveHash != step.PreviousHash:
@@ -299,7 +302,7 @@ func nextVerifying(step Step, node Node, checks Gate, t Timing, now time.Time) A
 func unverified(node Node, settled bool, checks Gate) string {
 	switch {
 	case !node.Reachable:
-		return "the node is not reachable"
+		return notReachable
 	case !settled:
 		return "the node has a staged config waiting for a reboot"
 	default:
@@ -337,7 +340,7 @@ func nextVerifyingTry(step Step, node Node, checks Gate, t Timing, now time.Time
 
 func unverifiedTry(node Node, checks Gate) string {
 	if !node.Reachable {
-		return "the node is not reachable"
+		return notReachable
 	}
 
 	return checks.Reason
@@ -354,7 +357,7 @@ func nextConfirming(step Step, node Node, now time.Time) Action {
 		// that did land without an answer is recognised while rolling back.
 		return advance(StepRollingBack)
 	case !node.Reachable:
-		return wait("the node is not reachable")
+		return wait(notReachable)
 	case node.ActiveHash != step.DesiredHash:
 		return advance(StepRollingBack)
 	default:

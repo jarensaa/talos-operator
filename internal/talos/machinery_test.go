@@ -115,7 +115,9 @@ type lifecycleAPI struct {
 	*testAPI
 }
 
-func (i imageAPI) Pull(req *machineapi.ImageServicePullRequest, stream grpc.ServerStreamingServer[machineapi.ImageServicePullResponse]) error {
+func (i imageAPI) Pull(req *machineapi.ImageServicePullRequest,
+	stream grpc.ServerStreamingServer[machineapi.ImageServicePullResponse],
+) error {
 	a := i.testAPI
 
 	a.mu.Lock()

@@ -32,7 +32,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-const installerImage = "factory.example.com/metal-installer/aaa:v1.14.2"
+const installerImage = "factory.example.com/metal-installer/aaa:" + apiVersion
 
 func upgradeDial() []grpc.DialOption {
 	return []grpc.DialOption{
@@ -155,18 +155,19 @@ func TestCheckUpgrade(t *testing.T) {
 		{"pull", machineapi.ImageService_Pull_FullMethodName, &machineapi.ImageServicePullRequest{}, true},
 		{"install", machineapi.LifecycleService_Upgrade_FullMethodName, &machineapi.LifecycleServiceUpgradeRequest{}, true},
 		{"forfeit leadership", machineapi.MachineService_EtcdForfeitLeadership_FullMethodName, &machineapi.EtcdForfeitLeadershipRequest{}, true},
-		{"reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, true},
-		{"version", machineapi.MachineService_Version_FullMethodName, &emptypb.Empty{}, true},
+		{"a reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, true},
+		{"reading the version", machineapi.MachineService_Version_FullMethodName, &emptypb.Empty{}, true},
 		{"dry run in try mode", machineapi.MachineService_ApplyConfiguration_FullMethodName,
 			apply(machineapi.ApplyConfigurationRequest_TRY, true), true},
 		// An upgrade connection does not apply config: that is the config connection's.
-		{"apply", machineapi.MachineService_ApplyConfiguration_FullMethodName, apply(machineapi.ApplyConfigurationRequest_NO_REBOOT, false), false},
+		{"apply", machineapi.MachineService_ApplyConfiguration_FullMethodName,
+			apply(machineapi.ApplyConfigurationRequest_NO_REBOOT, false), false},
 		{"try", machineapi.MachineService_ApplyConfiguration_FullMethodName, apply(machineapi.ApplyConfigurationRequest_TRY, false), false},
 		// A fresh install wipes the disk it is given.
 		{"install from scratch", machineapi.LifecycleService_Install_FullMethodName, &machineapi.LifecycleServiceInstallRequest{}, false},
 		//nolint:staticcheck // the legacy upgrade RPC takes force and stage, and must stay refused
 		{"legacy upgrade", machineapi.MachineService_Upgrade_FullMethodName, &machineapi.UpgradeRequest{}, false},
-		{"reset", machineapi.MachineService_Reset_FullMethodName, &machineapi.ResetRequest{}, false},
+		{"a reset", machineapi.MachineService_Reset_FullMethodName, &machineapi.ResetRequest{}, false},
 		{"rollback", machineapi.MachineService_Rollback_FullMethodName, &machineapi.RollbackRequest{}, false},
 		{"shutdown", machineapi.MachineService_Shutdown_FullMethodName, &machineapi.ShutdownRequest{}, false},
 		{"etcd leave", machineapi.MachineService_EtcdLeaveCluster_FullMethodName, &machineapi.EtcdLeaveClusterRequest{}, false},
@@ -231,20 +232,25 @@ func TestUpgraderLeavesTheCallersDeadlineOnLongCalls(t *testing.T) {
 }
 
 func TestUpgradeProblem(t *testing.T) {
+	const (
+		current = "1.37.0"
+		older   = "v1.14.1"
+	)
+
 	tests := []struct {
 		name               string
 		from, to, k8s, why string
 	}{
-		{"a patch release", "v1.14.1", "v1.14.2", "1.37.0", ""},
-		{"the same version, another installer", "v1.14.2", "v1.14.2", "1.37.0", ""},
-		{"a minor release", "v1.13.9", "v1.14.2", "1.36.0", ""},
-		{"without a known Kubernetes version", "v1.14.1", "v1.14.2", "", ""},
-		{"a downgrade", "v1.14.2", "v1.14.1", "1.37.0", "downgrades are not supported"},
-		{"newer than this operator", "v1.14.2", "v1.15.0", "1.37.0", "newer than this operator"},
+		{"a patch release", older, apiVersion, current, ""},
+		{"the same version, another installer", apiVersion, apiVersion, current, ""},
+		{"a minor release", "v1.13.9", apiVersion, "1.36.0", ""},
+		{"without a known Kubernetes version", older, apiVersion, "", ""},
+		{"a downgrade", apiVersion, older, current, "downgrades are not supported"},
+		{"newer than this operator", apiVersion, "v1.15.0", current, "newer than this operator"},
 		{"older than supported", "v1.12.4", "v1.12.6", "1.34.0", "older than the minimum"},
-		{"a jump Talos does not allow", "v1.10.5", "v1.14.2", "1.34.0", "does not upgrade"},
-		{"a Kubernetes the target does not run", "v1.14.1", "v1.14.2", "1.20.0", "does not support Kubernetes"},
-		{"garbage", "v1.14.1", "latest", "1.37.0", "unparsable"},
+		{"a jump Talos does not allow", "v1.10.5", apiVersion, "1.34.0", "does not upgrade"},
+		{"a Kubernetes the target does not run", older, apiVersion, "1.20.0", "does not support Kubernetes"},
+		{"garbage", older, "latest", current, "unparsable"},
 	}
 
 	for _, tt := range tests {

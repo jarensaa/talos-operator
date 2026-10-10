@@ -251,6 +251,12 @@ spec:
                 description: Rollout tunes how config changes are applied once config
                   is Manage.
                 properties:
+                  drainTimeout:
+                    description: |-
+                      DrainTimeout bounds the eviction of a node's pods before an upgrade reboots it. Evictions
+                      respect PodDisruptionBudgets, so a budget that never lets a pod go ends here. Defaults to
+                      10m. A node that is not drained in time halts the upgrade and stays cordoned.
+                    type: string
                   driftPolicy:
                     default: Report
                     description: DriftPolicy is Report (default) or Enforce.
@@ -593,6 +599,11 @@ spec:
                         description: Class is the change class that selected the node's
                           apply strategy (docs/scope.md §6.3).
                         type: string
+                      cordoned:
+                        description: |-
+                          Cordoned is set before the operator cordons the node, so that it later uncordons a node it
+                          cordoned itself and leaves alone one that someone else did.
+                        type: boolean
                       deadline:
                         description: Deadline is the step's timeout, e.g. the end
                           of a TRY window.
@@ -606,6 +617,10 @@ spec:
                           HealthySince is when every verification check first passed without interruption; the
                           soak is measured from it.
                         format: date-time
+                        type: string
+                      image:
+                        description: Image is the installer image an upgrade step
+                          installs.
                         type: string
                       machine:
                         description: Machine is the TalosMachine being acted on.
@@ -714,6 +729,23 @@ spec:
                 - Managed
                 - Degraded
                 type: string
+              upgrades:
+                description: Upgrades records what a human decided about Talos upgrades
+                  that were due.
+                properties:
+                  aborted:
+                    additionalProperties:
+                      type: string
+                    description: 'Aborted: the upgrade was aborted before it reached
+                      the machine, or while it was at it.'
+                    type: object
+                  skipped:
+                    additionalProperties:
+                      type: string
+                    description: 'Skipped: the machine was skipped after its upgrade
+                      failed.'
+                    type: object
+                type: object
             type: object
         required:
         - spec
