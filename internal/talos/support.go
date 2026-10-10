@@ -19,6 +19,8 @@ package talos
 import (
 	"fmt"
 
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/compatibility"
 	"k8s.io/apimachinery/pkg/util/version"
 )
 
@@ -46,4 +48,55 @@ func SupportsTalos(tag string) (bool, string) {
 	}
 
 	return true, ""
+}
+
+// UpgradeProblem says why a node running Talos from cannot be upgraded to target while the
+// cluster runs Kubernetes kubernetesVersion, or returns "". It refuses up front what cannot work
+// (docs/scope.md §7.3): a target outside this operator's range, a downgrade, a jump Talos itself
+// does not allow, and a Kubernetes version the target does not support.
+//
+// Downgrades are refused outright. Talos allows some, but a downgraded node may not understand
+// the config it has, and nothing here can prove that it does.
+func UpgradeProblem(from, target, kubernetesVersion string) string {
+	if ok, why := SupportsTalos(target); !ok {
+		return why
+	}
+
+	current, err := version.ParseGeneric(from)
+	if err != nil {
+		return fmt.Sprintf("unparsable version %q", from)
+	}
+
+	if version.MustParseGeneric(target).LessThan(current) {
+		return fmt.Sprintf("%s is older than %s, and downgrades are not supported", target, from)
+	}
+
+	to, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: target})
+	if err != nil {
+		return fmt.Sprintf("unparsable version %q", target)
+	}
+
+	host, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: from})
+	if err != nil {
+		return fmt.Sprintf("unparsable version %q", from)
+	}
+
+	if err := to.UpgradeableFrom(host); err != nil {
+		return fmt.Sprintf("Talos does not upgrade from %s to %s: %v", from, target, err)
+	}
+
+	if kubernetesVersion == "" {
+		return ""
+	}
+
+	k8s, err := compatibility.ParseKubernetesVersion(kubernetesVersion)
+	if err != nil {
+		return fmt.Sprintf("unparsable Kubernetes version %q", kubernetesVersion)
+	}
+
+	if err := k8s.SupportedWith(to); err != nil {
+		return fmt.Sprintf("Talos %s does not support Kubernetes %s, which the cluster runs: %v", target, kubernetesVersion, err)
+	}
+
+	return ""
 }

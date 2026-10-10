@@ -24,6 +24,7 @@ package talos
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"time"
 )
@@ -72,6 +73,44 @@ type Reader interface {
 	// mode, even in a dry run. Only the verdict is returned, because the server's diff is an
 	// unredacted, order-sensitive text diff of the whole config.
 	DryRunApply(ctx context.Context, node netip.Addr, machineConfig []byte) (DryRunResult, error)
+}
+
+// Upgrader is the Talos access of upgrades: Enabled: everything a Reader can do, plus the calls an
+// upgrade of a node is made of (docs/scope.md §7.3). It cannot apply machine config, reset a node
+// or change etcd membership.
+//
+// The sequence is the one talosctl follows since Talos 1.13 (cmd/talosctl/cmd/talos/upgrade.go:
+// 93-174): pull, install to the inactive boot slot, and only then reboot. Draining is Kubernetes'
+// business and happens in between, by the caller.
+type Upgrader interface {
+	Reader
+
+	// PullImage fetches the installer image to node. It takes as long as the download does, so the
+	// caller's context bounds it.
+	PullImage(ctx context.Context, node netip.Addr, image string) error
+	// Install writes the system from a pulled installer image to node's inactive boot slot. The node
+	// keeps running what it runs until it reboots. A failed install is reported as an
+	// *InstallError; the caller's context bounds the call.
+	Install(ctx context.Context, node netip.Addr, image string) error
+	// ForfeitEtcdLeadership makes node hand etcd leadership to another member, if it is the leader.
+	ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error
+	// Reboot asks node to reboot. It returns once the node accepted the request.
+	Reboot(ctx context.Context, node netip.Addr) error
+}
+
+// InstallError is an installer that ran and failed. The node is unchanged.
+type InstallError struct {
+	ExitCode int32
+	// Detail is the installer's last message, if it said anything.
+	Detail string
+}
+
+func (e *InstallError) Error() string {
+	if e.Detail == "" {
+		return fmt.Sprintf("the installer exited with code %d", e.ExitCode)
+	}
+
+	return fmt.Sprintf("the installer exited with code %d: %s", e.ExitCode, e.Detail)
 }
 
 // DryRunResult is Talos's verdict on a dry-run apply.

@@ -105,6 +105,18 @@ func (f *Factory) ConfigWriter(ctx context.Context, t Target) (ConfigWriter, err
 	return &machineryWriter{machineryReader{client: c, timeout: f.callTimeout()}}, nil
 }
 
+// Upgrader returns a client that can also upgrade and reboot nodes. Callers hand it out only
+// while spec.management.upgrades is Enabled (docs/scope.md §8.1, invariant 6). Its connection is
+// separate from the others and cannot apply config.
+func (f *Factory) Upgrader(ctx context.Context, t Target) (Upgrader, error) {
+	c, err := f.client(ctx, t, accessUpgrade)
+	if err != nil {
+		return nil, err
+	}
+
+	return &machineryUpgrader{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+}
+
 func (f *Factory) callTimeout() time.Duration {
 	if f.CallTimeout != 0 {
 		return f.CallTimeout

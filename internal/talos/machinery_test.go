@@ -91,6 +91,79 @@ type testAPI struct {
 	etcdStatus  *machineapi.EtcdStatusResponse
 	etcdErr     error
 	health      func(stream grpc.ServerStreamingServer[clusterapi.HealthCheckProgress]) error
+
+	// What an upgrade sends, and the scripted streams it gets back.
+	pulls    []*machineapi.ImageServicePullRequest
+	installs []*machineapi.LifecycleServiceUpgradeRequest
+	reboots  []*machineapi.RebootRequest
+	forfeits int
+	pull     []*machineapi.ImageServicePullResponse
+	install  []*machineapi.LifecycleServiceUpgradeResponse
+}
+
+// imageAPI and lifecycleAPI serve the two services whose method names the machine service also
+// has, from the same script.
+type imageAPI struct {
+	machineapi.UnimplementedImageServiceServer
+
+	*testAPI
+}
+
+type lifecycleAPI struct {
+	machineapi.UnimplementedLifecycleServiceServer
+
+	*testAPI
+}
+
+func (i imageAPI) Pull(req *machineapi.ImageServicePullRequest, stream grpc.ServerStreamingServer[machineapi.ImageServicePullResponse]) error {
+	a := i.testAPI
+
+	a.mu.Lock()
+	a.pulls = append(a.pulls, req)
+	a.mu.Unlock()
+
+	for _, msg := range a.pull {
+		if err := stream.Send(msg); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (l lifecycleAPI) Upgrade(req *machineapi.LifecycleServiceUpgradeRequest,
+	stream grpc.ServerStreamingServer[machineapi.LifecycleServiceUpgradeResponse],
+) error {
+	a := l.testAPI
+
+	a.mu.Lock()
+	a.installs = append(a.installs, req)
+	a.mu.Unlock()
+
+	for _, msg := range a.install {
+		if err := stream.Send(msg); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (a *testAPI) Reboot(_ context.Context, req *machineapi.RebootRequest) (*machineapi.RebootResponse, error) {
+	a.mu.Lock()
+	a.reboots = append(a.reboots, req)
+	a.mu.Unlock()
+
+	return &machineapi.RebootResponse{}, nil
+}
+
+func (a *testAPI) EtcdForfeitLeadership(context.Context, *machineapi.EtcdForfeitLeadershipRequest,
+) (*machineapi.EtcdForfeitLeadershipResponse, error) {
+	a.mu.Lock()
+	a.forfeits++
+	a.mu.Unlock()
+
+	return &machineapi.EtcdForfeitLeadershipResponse{}, nil
 }
 
 func (a *testAPI) record(ctx context.Context, method string) {
@@ -170,6 +243,8 @@ func serve(t *testing.T, opts ...grpc.DialOption) (*testAPI, *client.Client) {
 	)
 
 	machineapi.RegisterMachineServiceServer(srv, api)
+	machineapi.RegisterImageServiceServer(srv, imageAPI{testAPI: api})
+	machineapi.RegisterLifecycleServiceServer(srv, lifecycleAPI{testAPI: api})
 	clusterapi.RegisterClusterServiceServer(srv, api)
 	cosiv1alpha1.RegisterStateServer(srv, server.NewState(api.state))
 
