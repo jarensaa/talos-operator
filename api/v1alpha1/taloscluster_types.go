@@ -17,7 +17,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -253,16 +252,18 @@ type TalosClusterSpec struct {
 	Paused bool `json:"paused,omitempty"`
 }
 
-// ClusterPhase summarises where the cluster is in its lifecycle.
-// +kubebuilder:validation:Enum=Observing;Adopting;Adopted;Managed;Degraded
+// ClusterPhase summarises where the cluster is in its lifecycle. It only moves forward
+// (docs/scope.md §12.14): while Adopting, the cluster describes the resources and the operator
+// writes them; from Adopted on the resources are the user's; once Managed they describe the
+// cluster. Degraded is Managed with something in the way.
+// +kubebuilder:validation:Enum=Adopting;Adopted;Managed;Degraded
 type ClusterPhase string
 
 const (
-	ClusterPhaseObserving ClusterPhase = "Observing"
-	ClusterPhaseAdopting  ClusterPhase = "Adopting"
-	ClusterPhaseAdopted   ClusterPhase = "Adopted"
-	ClusterPhaseManaged   ClusterPhase = "Managed"
-	ClusterPhaseDegraded  ClusterPhase = "Degraded"
+	ClusterPhaseAdopting ClusterPhase = "Adopting"
+	ClusterPhaseAdopted  ClusterPhase = "Adopted"
+	ClusterPhaseManaged  ClusterPhase = "Managed"
+	ClusterPhaseDegraded ClusterPhase = "Degraded"
 )
 
 // EtcdMember is one observed etcd member.
@@ -316,9 +317,20 @@ type AdoptionStatus struct {
 	// +optional
 	Preconditions []Precondition `json:"preconditions,omitempty"`
 
-	// ProposalRef names the ConfigMap holding the proposed TalosCluster and TalosMachine specs.
+	// AdoptedAt is when the cluster was first proven. From then on the operator never writes the
+	// TalosCluster's spec, a TalosMachinePool or a TalosMachine again; nothing unsets it.
 	// +optional
-	ProposalRef *corev1.LocalObjectReference `json:"proposalRef,omitempty"`
+	AdoptedAt *metav1.Time `json:"adoptedAt,omitempty"`
+
+	// Source fingerprints the live state the resources were last derived from, so they are
+	// derived again only when the cluster changes.
+	// +optional
+	Source string `json:"source,omitempty"`
+
+	// Notes are facts about the live cluster worth knowing when taking the resources over, such
+	// as a node whose Talos version differs from the one its config installs.
+	// +optional
+	Notes []string `json:"notes,omitempty"`
 
 	// UnmatchedMembers lists live members (by hostname) that no TalosMachine claims.
 	// +optional
@@ -522,7 +534,7 @@ type TalosClusterStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Talos",type=string,JSONPath=`.spec.versions.talos`
 // +kubebuilder:printcolumn:name="Kubernetes",type=string,JSONPath=`.status.observed.kubernetesVersion`
-// +kubebuilder:printcolumn:name="Adopted",type=string,JSONPath=`.status.conditions[?(@.type=="Adopted")].status`
+// +kubebuilder:printcolumn:name="Proven",type=string,JSONPath=`.status.conditions[?(@.type=="ConfigProven")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // TalosCluster is a Talos Linux cluster managed (or observed) by the operator.

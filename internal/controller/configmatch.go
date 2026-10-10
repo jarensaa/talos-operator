@@ -43,8 +43,6 @@ const maxStatusDiff = 8 << 10
 // maxChangeReasons bounds status.config.changeReasons, as the CRD does.
 const maxChangeReasons = 16
 
-// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
-
 // configError is a config source that cannot be used. Its message names the source, never content.
 type configError struct{ msg string }
 

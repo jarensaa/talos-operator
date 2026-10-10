@@ -26,8 +26,8 @@ spec:
     - jsonPath: .status.observed.kubernetesVersion
       name: Kubernetes
       type: string
-    - jsonPath: .status.conditions[?(@.type=="Adopted")].status
-      name: Adopted
+    - jsonPath: .status.conditions[?(@.type=="ConfigProven")].status
+      name: Proven
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -337,12 +337,25 @@ spec:
               adoption:
                 description: Adoption tracks adoption progress.
                 properties:
+                  adoptedAt:
+                    description: |-
+                      AdoptedAt is when the cluster was first proven. From then on the operator never writes the
+                      TalosCluster's spec, a TalosMachinePool or a TalosMachine again; nothing unsets it.
+                    format: date-time
+                    type: string
                   liveConfigHashes:
                     additionalProperties:
                       type: string
                     description: LiveConfigHashes maps TalosMachine name to the hash
                       of the live config proven at adoption.
                     type: object
+                  notes:
+                    description: |-
+                      Notes are facts about the live cluster worth knowing when taking the resources over, such
+                      as a node whose Talos version differs from the one its config installs.
+                    items:
+                      type: string
+                    type: array
                   preconditions:
                     description: Preconditions that must hold before adoption can
                       be proven.
@@ -366,24 +379,14 @@ spec:
                     x-kubernetes-list-map-keys:
                     - name
                     x-kubernetes-list-type: map
-                  proposalRef:
-                    description: ProposalRef names the ConfigMap holding the proposed
-                      TalosCluster and TalosMachine specs.
-                    properties:
-                      name:
-                        default: ""
-                        description: |-
-                          Name of the referent.
-                          This field is effectively required, but due to backwards compatibility is
-                          allowed to be empty. Instances of this type with an empty value here are
-                          almost certainly wrong.
-                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                        type: string
-                    type: object
-                    x-kubernetes-map-type: atomic
                   provenAt:
                     description: ProvenAt is when the no-changes proof last succeeded.
                     format: date-time
+                    type: string
+                  source:
+                    description: |-
+                      Source fingerprints the live state the resources were last derived from, so they are
+                      derived again only when the cluster changes.
                     type: string
                   unmatchedMembers:
                     description: UnmatchedMembers lists live members (by hostname)
@@ -706,7 +709,6 @@ spec:
               phase:
                 description: Phase summarises the lifecycle position.
                 enum:
-                - Observing
                 - Adopting
                 - Adopted
                 - Managed

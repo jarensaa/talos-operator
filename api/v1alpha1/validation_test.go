@@ -347,7 +347,7 @@ func TestMachineDesiredStateDefaultsToPresent(t *testing.T) {
 
 // Messages of the admission policies in config/admission/policies.yaml.
 const (
-	gateMessage     = "may become Manage only once status shows Adopted=True"
+	gateMessage     = "may become Manage only once status shows ConfigProven=True"
 	deletionMessage = "cannot be deleted"
 )
 
@@ -430,12 +430,12 @@ func orphanAndDelete(ctx context.Context, tm *talosv1alpha1.TalosMachine) error 
 	return k8sClient.Delete(ctx, tm)
 }
 
-// setAdopted writes the Adopted condition through the status subresource, as the operator does.
-func setAdopted(t *testing.T, tc *talosv1alpha1.TalosCluster, status metav1.ConditionStatus) {
+// setProven writes the ConfigProven condition through the status subresource, as the operator does.
+func setProven(t *testing.T, tc *talosv1alpha1.TalosCluster, status metav1.ConditionStatus) {
 	t.Helper()
 
 	meta.SetStatusCondition(&tc.Status.Conditions, metav1.Condition{
-		Type: talosv1alpha1.ConditionAdopted, Status: status, Reason: talosv1alpha1.ReasonSucceeded, Message: "test",
+		Type: talosv1alpha1.ConditionConfigProven, Status: status, Reason: talosv1alpha1.ReasonSucceeded, Message: "test",
 	})
 
 	if err := k8sClient.Status().Update(context.Background(), tc); err != nil {
@@ -443,7 +443,7 @@ func setAdopted(t *testing.T, tc *talosv1alpha1.TalosCluster, status metav1.Cond
 	}
 }
 
-func TestManagementGateRefusesManageUntilAdopted(t *testing.T) {
+func TestManagementGateRefusesManageUntilProven(t *testing.T) {
 	ctx := context.Background()
 
 	born := minimalCluster("born-managed")
@@ -463,15 +463,15 @@ func TestManagementGateRefusesManageUntilAdopted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	setAdopted(t, tc, metav1.ConditionTrue)
+	setProven(t, tc, metav1.ConditionTrue)
 
 	tc.Spec.Management.Config = talosv1alpha1.ConfigManagementManage
 	if err := k8sClient.Update(ctx, tc); err != nil {
-		t.Fatalf("Manage after Adopted=True: %v", err)
+		t.Fatalf("Manage after ConfigProven=True: %v", err)
 	}
 
 	// Once managed, a later invalidated proof does not lock the spec.
-	setAdopted(t, tc, metav1.ConditionFalse)
+	setProven(t, tc, metav1.ConditionFalse)
 
 	tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled
 	if err := k8sClient.Update(ctx, tc); err != nil {

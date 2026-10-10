@@ -2,16 +2,6 @@
 
 The [README](../README.md#getting-started) takes you from installing the operator to a first config change. This guide has what those steps leave out.
 
-## Until the next release
-
-**The operator does not create the resources; it proposes them.** After step 3, wait for the `AdoptionProposed` condition, then read the proposal:
-
-```bash
-kubectl -n talos-operator get configmap my-cluster-adoption-proposal -o yaml
-```
-
-It holds the `TalosCluster` spec, one `TalosMachinePool` per role and one `TalosMachine` per node, under the keys `taloscluster.yaml`, `talosmachinepools.yaml` and `talosmachines.yaml`. Apply the three documents however you manage your cluster. The rest is as the README says, with two differences: the phase column reads `Observing` until you switch management on, with `ADOPTED` showing `True` next to it; and `Adopted` goes back to false whenever the resources and the nodes stop matching.
-
 ## Upgrading from 0.4
 
 Up to 0.4 the chart installed the CRDs once and never upgraded them. From 0.5 on they are part of the release, so `helm upgrade` upgrades them, and uninstalling the chart leaves them and every object of theirs in place.
@@ -27,6 +17,11 @@ done
 ```
 
 Use your own release name and namespace if they differ. If you install CRDs some other way, set `crds.enabled=false` instead.
+
+Two more things changed with adoption in 0.6:
+
+- The operator no longer writes a proposal to a ConfigMap. If you have `<cluster>-adoption-proposal` from 0.4, delete it; nothing reads it.
+- The `Adopted` condition is now `ConfigProven`, and the phase `Observing` is gone: a cluster is `Adopting` until it is first proven and `Adopted` from then on. A cluster that 0.4 had proven or managed is `Adopted`, and the operator writes nothing for it.
 
 ## Allowing Talos API access
 
@@ -57,6 +52,11 @@ The conditions tell you where it is:
 | `CredentialsValid` | Talos issued the certificate. `TalosAPIAccessDisabled` here means step 1 didn't take effect. |
 | `TalosAPIReachable`, `Healthy` | The operator can read every node, and Talos's own health checks pass. |
 | `AdoptionPreconditionsMet` | The cluster is in a state that's safe to adopt. The status lists each check. |
+| `SecretsMatchLive` | The secrets bundle, recovered or supplied, is the one every node's config was made with. |
+| `ResourcesDerived` | The operator wrote the pools and machines. False with reason `ChangedElsewhere` names resources it left alone because someone else set a value the cluster contradicts. |
+| `ConfigProven` | The resources render exactly what every node runs, and Talos's dry run agrees. The first time this is true, the cluster is adopted. |
+
+`status.adoption.notes` lists what is worth knowing before you take the resources over, such as a node whose Talos version differs from the one its config installs.
 
 Each machine reports on its own node:
 
@@ -73,9 +73,19 @@ Two Secrets appear next to the resources, and the operator never deletes them:
 - `my-cluster-talos-secrets`: the cluster's secrets bundle, recovered from a control plane.
 - `my-cluster-adoption-backup`: a copy of every node's config as it was before adoption.
 
+### Bringing your own resources
+
+The operator writes a machine only for a node that has none. If you create the pools and machines yourself before the `TalosCluster`, under whatever names you like, it writes nothing for those nodes and proves yours instead.
+
+It also never overwrites what you set. A field of the `TalosCluster` that is not empty stays as it is, and a pool or machine you changed is left alone. If what you set differs from what the nodes run, the machines say so in `ConfigMatchesLive`, and the cluster stays `Adopting` until they match.
+
+One Talos cluster has one `TalosCluster`. A second one finds every node described already and leaves the machines alone.
+
 ## Between adoption and management
 
-Once the cluster is adopted, the resources are yours and the operator only compares. If you change one so that it renders something else, or edit a node by hand, the `TalosCluster` and the machine concerned report that they no longer match, and the API server refuses `config: Manage` until they do again.
+Once the cluster is adopted, the resources are yours and the operator only compares. If you change one so that it renders something else, or edit a node by hand, `ConfigProven` goes false and the machine concerned shows the difference. The phase stays `Adopted`, and the API server refuses `config: Manage` until `ConfigProven` is true again.
+
+The operator no longer follows the cluster either: a node changed by hand is reported, not copied into its machine.
 
 When you switch management on, the operator repeats the dry run on every node. If it passes, `ConfigHandover` is true and the phase becomes `Managed`. What each node runs at that moment is recorded as its baseline, and `ConfigInSync` reports whether every node still runs its rendered config.
 

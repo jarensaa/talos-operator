@@ -27,11 +27,11 @@ spec:
     - name: adopted
       expression: >-
         request.operation == 'UPDATE' && has(oldObject.status) && has(oldObject.status.conditions) &&
-        oldObject.status.conditions.exists(c, c.type == 'Adopted' && c.status == 'True')
+        oldObject.status.conditions.exists(c, c.type == 'ConfigProven' && c.status == 'True')
   validations:
     - expression: "!variables.manage || variables.wasManaged || variables.adopted"
       message: >-
-        management.config may become Manage only once status shows Adopted=True: the operator
+        management.config may become Manage only once status shows ConfigProven=True: the operator
         must first prove that its rendered config changes nothing on any node
         (docs/scope.md §7.1 stage 3).
       reason: Forbidden

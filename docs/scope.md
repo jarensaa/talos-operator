@@ -185,7 +185,7 @@ metadata:
   name: my-cluster
 spec:
   # Management is enabled per capability, so trust grows gradually (§7.1 stage 4).
-  # config: Manage is refused at admission unless status says Adopted=True (§5.2); upgrades and
+  # config: Manage is refused at admission unless status says ConfigProven=True (§5.2); upgrades and
   # membership need config: Manage.
   management:
     config: Observe                # Observe | Manage
@@ -194,7 +194,7 @@ spec:
   credentials: { source: TalosServiceAccount }       # default: Talos issues the operator's certificate (§9)
   secretsRef: { name: my-cluster-talos-secrets }    # secrets bundle; written by the operator during adoption if absent
 
-  # Everything below is optional while observing; it is copied from the adoption proposal (§7.1).
+  # Everything below may be left empty: adoption fills it in from the live cluster (§7.1).
   clusterName: my-cluster          # immutable once set
   controlPlaneEndpoint: https://cluster.example.com:6443   # immutable once set
 
@@ -245,8 +245,8 @@ spec:
   paused: false                       # stops all mutating actions immediately
 
 status:
-  phase: Observing | Adopting | Adopted | Managed | Degraded
-  conditions:                         # Ready, Adopted, ConfigHandover, ConfigInSync, Healthy, RolloutBlocked, Locked, ...
+  phase: Adopting | Adopted | Managed | Degraded   # only moves forward (§12.14)
+  conditions:                         # ResourcesDerived, ConfigProven, ConfigHandover, ConfigInSync, Healthy, RolloutBlocked, ...
   observed:
     talosVersions: { v1.14.0: 3 }
     kubernetesVersion: 1.37.0
@@ -254,7 +254,9 @@ status:
   bootstrapped: true
   adoption:
     preconditions: [ … ]              # each with status + message
-    proposalRef: { name: my-cluster-adoption-proposal }   # ConfigMap with proposed CR YAML
+    adoptedAt: …                      # first proof; from then on the operator writes no spec (§12.14)
+    source: 5c1f…                     # fingerprint of the live state the resources were derived from
+    notes: []                         # facts worth knowing when taking the resources over
     unmatchedMembers: []              # live nodes with no TalosMachine yet
     liveConfigHashes: { node-a: sha256:… }
     provenAt: …
@@ -379,7 +381,7 @@ status:
 **Validation.** There is no webhook. Rules on one object are CEL in the CRDs. Rules that need the stored object or a DELETE are **ValidatingAdmissionPolicies** (`config/admission/policies.yaml`, shipped by the chart). The API server evaluates them itself, so they hold while the operator is down; a self-hosted operator's webhook would be unavailable during the very node drains it runs (§12.8).
 - Immutable fields stay immutable: a pool's `clusterRef` and `role` cannot change (CRD CEL).
 - `upgrades` and `membership` can be `Enabled` only with `config: Manage` (CRD CEL).
-- `config` may become `Manage` only while the **stored** status shows `Adopted=True` (policy `…-management-gate`). A spec update cannot carry its own status, so the gate reads `oldObject.status`. `Adopted` is kept current by the proof (§7.1 stage 3): any live or spec change since the proof sets it False. Once managed, a later invalidated proof does not lock the spec.
+- `config` may become `Manage` only while the **stored** status shows `ConfigProven=True` (policy `…-management-gate`). A spec update cannot carry its own status, so the gate reads `oldObject.status`. `Adopted` is kept current by the proof (§7.1 stage 3): any live or spec change since the proof sets it False. Once managed, a later invalidated proof does not lock the spec.
 - A TalosMachine cannot be **deleted while still `Present`** unless annotated `talos.jarensaa.github.io/orphan: "true"` (policy `…-deletion-guard`). This guards against a GitOps prune or a namespace deletion silently dropping a machine. `desiredState: Removed` is how a node leaves (§7.7).
 - **In-use objects are protected by the finalizer `talos.jarensaa.github.io/in-use`**, the way Kubernetes protects bound PVCs. Their `InUse` condition says what holds them. A TalosMachineConfig stays while anything references it, and a pool while it has members. Deletion completes once they are unreferenced. If the operator is down, the deletion waits, which is the safe direction.
 - **A missing reference fails closed.** A `configRef` or `secretKeyRef` that does not resolve sets `ConfigMatchesLive=False` (`ConfigUnresolved`) on every affected machine, and no rollout touches them.
@@ -467,12 +469,12 @@ A node that already runs its target config when its turn comes is not applied to
 
 ### 7.1 Adoption (R3)
 
-Adoption is a **staged trust ladder**. The operator is installed first and stays reactive: it only reports, while the user adds resources one at a time. Management is enabled per capability once each stage has been proven safe. The design draws on Omni's `cluster import`, including the lessons from its 1.14 bug #3424.
+Adoption is a **staged trust ladder**. The operator is installed first and writes nothing to a node: it describes the cluster in resources, proves that they change nothing, and hands them to the user. Management is enabled per capability once each stage has been proven safe. The design draws on Omni's `cluster import`, including the lessons from its 1.14 bug #3424.
 
 **Ground rules**
 - The live cluster is the only source of truth; the files it was built from are assumed stale.
-- *This rule is replaced with M4a (§12.14): while a cluster is being adopted the operator creates the resources that describe it. Until that is built, what follows is how adoption works.*
-- **The operator never creates or edits the user's `TalosCluster`/`TalosMachine` resources.** They come from the user (often from Git, through a GitOps tool that would fight operator-created objects). The operator only writes `status`, Events, a proposal ConfigMap, and the secrets/backup Secrets.
+- **While a cluster is being adopted, the operator writes the resources that describe it** (§12.14): the pools, the machines, and what the TalosCluster's spec leaves empty. Once the cluster is adopted they are the user's, and the operator never writes a spec again. Besides those it only writes `status`, Events, and the secrets/backup Secrets.
+- **The operator never overwrites what someone else set.** It writes pools and machines by server-side apply without force, under a field manager of its own (`talos-operator-adoption`). A field another manager set to something else is a conflict: the object is left as it is and named in `ResourcesDerived`. On the TalosCluster it only fills fields that are empty.
 - Until `management.config: Manage`, the controllers only receive a **read-only Talos client interface** that has no mutating methods. This is a guarantee in the type system, not a runtime check.
 - At every stage, a mismatch produces a report and nothing else: no node is ever written to in order to "fix" adoption.
 
@@ -515,7 +517,7 @@ The operator then does the following:
    - The annotation is `talos.jarensaa.github.io/secrets-backed-up: <bundle hash>`; the condition message carries the hash. Tying it to the hash means a changed bundle needs a fresh confirmation.
    - `SecretsBackedUp` is informational and never gates management: recovery from cluster loss uses fresh PKI (§12.7), so an off-cluster copy is only break-glass for a running cluster whose every client certificate is lost.
    - `acceptedCAs` and extra etcd encryption keys cannot be represented in the bundle, so they become part of the proposed cluster-wide config.
-4. **Proposal.**
+4. **Resources.**
    - Infer the generation inputs from live config:
      - contract = the current Talos minor;
      - name and endpoint from `KubeClusterConfig`;
@@ -524,21 +526,23 @@ The operator then does the following:
      - installer/schematic from `UnattendedInstallConfig` / `ImageFactorySchematic`;
      - KubePrism, discovery and CNI settings.
    - Regenerate the base config per role and derive `configdiff.Patch(base, live)` for each node.
-   - Factor the differences into layers. What is identical across every node goes on the TalosCluster. What is identical across a role goes on that role's pool (one per role, named `<cluster>-control-plane` and `<cluster>-workers`). The rest stays on the machine. Everything is proposed inline; extracting shared parts into TalosMachineConfigs is a refactoring the user can do afterwards, and `ConfigMatchesLive` confirms it renders the same.
+   - Factor the differences into layers. What is identical across every node goes on the TalosCluster. What is identical across a role goes on that role's pool (one per role, named `<cluster>-control-plane` and `<cluster>-workers`). The rest stays on the machine. Everything is written inline; extracting shared parts into TalosMachineConfigs is a refactoring the user can do afterwards, and `ConfigMatchesLive` confirms it renders the same.
    - Identity fields must never appear in derived config. If one does, the reconstruction is wrong: stop and report.
-   - Before publishing, render every node from the proposed specs through the same path the controllers use; the result must equal its live config.
-   - Write the proposed `TalosCluster` spec plus one `TalosMachine` per live node to the **proposal ConfigMap** `<cluster>-adoption-proposal` (owned by the TalosCluster; keys `taloscluster.yaml`, `talosmachinepools.yaml`, `talosmachines.yaml`, `notes.md`), as YAML ready to commit, with Renovate annotations on the versions. Status points at it through `status.adoption.proposalRef` and `AdoptionProposed`.
-   - The ConfigMap is annotated with a fingerprint of its inputs (per-node identity, version and config hash, the bundle hash and `secretsRef`) and is rebuilt only when that changes.
+   - Before writing anything, render every node from the derived specs through the same path the controllers use; the result must equal its live config.
+   - **Fill in the TalosCluster.** Name, endpoint, versions, generation inputs and the cluster-wide config are set where the spec leaves them empty, and never where it does not. The pass ends there; everything else is decided from the spec as stored.
+   - **Write the pools and machines**, by server-side apply without force. A node that already has a TalosMachine under another name is not given a second one, a machine of that name in another cluster's pool is left alone, and a pool is only written for machines written here. The result is `ResourcesDerived`: true with what was written, or false naming what was left alone because someone else changed it.
+   - **Keep them in line with the cluster** for as long as it is being adopted. The resources are derived again when a fingerprint of their inputs changes (per-node identity, version and config hash, the bundle hash and `secretsRef`; `status.adoption.source`), or when a node has no machine. Fields nobody else touched follow the cluster; fields someone else set stay theirs.
+   - What is worth knowing when taking the resources over, such as a node whose Talos version differs from the one its config installs, goes to `status.adoption.notes`.
    - Back up all live configs to a Secret (never a ConfigMap; they contain secrets). It is created once, before anything else is written to Talos, and never updated.
 
 **Stage 2: reactive loop**
 
-The user applies the proposed resources, editing them as desired; with GitOps that means committing them to Git, but any tool works (§12.9). For each `TalosMachine`, the operator:
+The resources may also come from the user, before the operator looks or in place of what it wrote; any tool works (§12.9). For each `TalosMachine`, whoever wrote it, the operator:
 1. Matches it to a live node by `identity.systemUUID`. A machine that matches no live member gets `Matched=False` and is never acted on. Live members with no `TalosMachine` are listed in `status.adoption.unmatchedMembers`.
 2. Renders the desired config and compares it with the live config **per document**. Config applies in layer order (cluster, pool, machine), from inline documents, TalosMachineConfigs or Secrets. A missing source is reported as `ConfigUnresolved`. Changes to a referenced TalosMachineConfig, pool or Secret, or to the bundle, re-evaluate the affected machines at once; live changes are picked up by the observe interval.
 3. Reports `ConfigMatchesLive=True`, or `False` naming the differing documents, with a redacted per-document diff (live → desired, truncated) in `status.config.diff`. Documents set by a patch from a Secret are named but their diff is withheld, because rule-based redaction only knows credential-named fields.
 
-The user adjusts config until every machine is green.
+Resources the operator derived are green by construction. Where the user wrote or changed them, the user adjusts config until every machine is green.
 
 **Stage 3: proof**
 
@@ -548,13 +552,18 @@ When every live member is matched and the client-side diff is empty for every no
 - **The server's verdict only.** The server's diff is an unredacted text diff of the whole config (`generateDiff`, `v1alpha1_server.go:323-334`), so the Reader returns only "no changes" or "changes". Anything to show the user comes from the operator's redacted per-document diff. A disagreement (`ServerReportsChanges`) names the nodes, never the diff.
 - **Same document order as live.** That text diff is order-sensitive, so the rendered documents are sent in the live config's order. Order carries no meaning to Talos.
 
-The operator then sets `Adopted=True` and records, per TalosMachine, the proven hash (`liveConfigHashes`, where live equals desired) and `provenAt`. While nothing moves, the proof is not re-run.
+The operator then sets `ConfigProven=True` and records, per TalosMachine, the proven hash (`liveConfigHashes`, where live equals desired) and `provenAt`. While nothing moves, the proof is not re-run.
 
-Any later change to live state (for example a manual `talosctl` edit) or to what the spec renders invalidates the proof (`Adopted=False`, `ProofInvalidated`), and the cluster returns to stage 2. The proof re-runs by itself once the gate holds again. The proof runs only while `config` is `Observe`.
+**The first proof adopts the cluster.** `status.adoption.adoptedAt` is set, the phase becomes `Adopted`, and nothing takes either back (§12.14). From here on:
+- The operator writes no spec. A resource that is edited or deleted stays edited or deleted, and a cluster that changes is reported, not followed.
+- The operator gives up what it is recorded as owning. On the TalosCluster its entry for the fields it filled in goes. On each pool and machine its entry shrinks to the one label it set (`talos.jarensaa.github.io/cluster`). It is not removed altogether: an object with no managed fields at all gets a `before-first-apply` owner of everything from the API server at the next apply (`managedfields/internal/skipnonapplied.go`), which would keep a field alive after its new owner dropped it, exactly as the operator's own entry would have.
+- If the status is lost, as when a TalosCluster is restored from a backup of its spec, the operator is adopting again. Applying without force is what makes that harmless: what someone else manages is a conflict and stays as it is.
+
+Any later change to live state (for example a manual `talosctl` edit) or to what the spec renders invalidates the proof (`ConfigProven=False`, `ProofInvalidated`). The phase stays `Adopted`; the proof re-runs by itself once the gate holds again. The proof runs only while `config` is `Observe`.
 
 **Stage 4: enable management, one capability at a time**
 
-Admission refuses `config: Manage` unless the stored status shows `Adopted=True`, and refuses `upgrades`/`membership: Enabled` without `config: Manage` (§5.2).
+Admission refuses `config: Manage` unless the stored status shows `ConfigProven=True`, and refuses `upgrades`/`membership: Enabled` without `config: Manage` (§5.2).
 
 1. **`config: Manage`**
    - **The first reconcile must be a no-op**, because desired equals live; this is asserted as the **handover**. Once the cluster is managed, the adoption proof stops being re-evaluated. So the handover repeats it: the proof's gate, then a fresh Talos dry run on every node (mode TRY, verdict only).
@@ -836,7 +845,7 @@ Task beads under a milestone are cut when the milestone starts, for the same rea
 |---|--------------|---------|
 | **M0 Foundations** | Project, CRDs, the Talos access layer, a fake Talos, the QEMU e2e harness | v0.1.0 |
 | **M1 Observe** | Read-only status of a cluster and its machines, with writes impossible by construction | v0.1.0 |
-| **M2 Adoption** | A proposal that reproduces a running cluster, proven by Talos's own dry run to change nothing, then a gated switch to `config: Manage`; pools and shared configs; Talos-issued credentials | v0.2.0, v0.3.0 |
+| **M2 Adoption** | Resources that reproduce a running cluster, written by the operator since 0.6 (§12.14), proven by Talos's own dry run to change nothing, then a gated switch to `config: Manage`; pools and shared configs; Talos-issued credentials | v0.2.0, v0.3.0 |
 | **M3 Config management** | Classified config changes rolled out one node at a time, tried and confirmed only after verification from outside; drift reporting and enforcement; fail-closed with retry, skip and abort | v0.4.0 |
 
 ### What every remaining milestone builds on
@@ -1001,11 +1010,11 @@ Decided 2026-10-08:
    - **When:** the weekly run uses three control planes, so the shape is exercised without anyone remembering it. A manual run takes the shape as inputs and is how a branch is shown before it is merged. Pull requests keep one control plane and one worker as their required check, because that is quick and every change needs it.
    - **What depends on people:** a change to how control planes are handled is run on three control planes before it is merged, and its pull request links the run (docs/dev/e2e.md). If that proves easy to forget, the next step is to run the larger shape on every pull request, which costs a few minutes each and nothing else.
    - **What would change this:** a scenario that does not fit 16 GB, for instance several upgrades with image pulls in flight, or a hosted runner that turns out too slow for the timeouts a real cluster would use.
-14. **Adoption creates the resources** (decided 2026-10-10, to be built with M4a). This replaces the ground rule of §7.1 that the operator never creates the user's resources. That rule was there because a GitOps tool fights an operator that keeps writing objects; a one-way handover removes the reason.
+14. **Adoption creates the resources** (decided 2026-10-10, built in 0.6). This replaces the ground rule of §7.1 that the operator never creates the user's resources. That rule was there because a GitOps tool fights an operator that keeps writing objects; a one-way handover removes the reason.
    - **While a cluster is being adopted, the cluster describes the resources.** The operator creates the pools and machines of the live cluster and fills in what the TalosCluster's spec leaves empty, without asking. Adding the TalosCluster is the consent, and none of this writes to a node.
-   - **Once adopted, the resources describe the cluster, and there is no way back.** The phase only moves forward: Adopting, Adopted, Managed. From Adopted on the operator never writes a spec again, and it gives up its recorded ownership of the fields it set, so that whoever manages the resources next is their only owner. A field later removed there is then really removed.
+   - **Once adopted, the resources describe the cluster, and there is no way back.** The phase only moves forward: Adopting, Adopted, Managed. From Adopted on the operator never writes a spec again, and it gives up its recorded ownership of every spec field it set, so that whoever manages the resources next is their only owner. A field later removed there is then really removed.
    - **Whether the resources match the nodes right now is a separate question**, answered by a condition that can turn false again and that still gates `config: Manage`. An edit made between adoption and management is checked like any other.
-   - **The operator only ever updates an object it created and nobody has changed since**, also while adopting. The phase lives in status, and status can be lost; that must never make the operator overwrite what someone else manages.
+   - **The operator never overwrites what someone else set**, also while adopting: it applies without force, so a field another manager changed is a conflict and the object is left alone (§7.1). The phase lives in status, and status can be lost; that must never make the operator overwrite what someone else manages.
    - **Delivery stays the owner's business** (§12.9). With Flux, a Kustomization leaves objects alone that are not in Git, and takes over the fields that are once they are committed. The proposal ConfigMap goes away: the resources themselves are what the operator found, and a second copy would only go stale once someone edits them. Whoever wants them in Git exports them from the cluster. What the proposal's notes said, such as a node whose Talos version differs from the one its config installs, is reported on the TalosCluster instead. Helm only takes over objects that carry its ownership labels, which is the user's to add if they deliver that way.
 15. **The chart installs and upgrades the CRDs; the operator never does** (decided 2026-10-10, built in 0.5). An operator that registers its own CRDs needs cluster-wide rights to do it, has two replicas of different versions writing them during an upgrade, and makes a first GitOps sync fail until it has started. Helm's `crds/` directory avoids that but installs once and never upgrades. So the CRDs become chart templates: on by default, so that `helm upgrade` upgrades them, switchable off for those who manage CRDs separately, and kept on uninstall, because deleting a CRD deletes every object of its kind. A release that installed them the old way hands them to Helm once, by label and annotation (docs/guide.md); the chart cannot do that for the user without the rights this decision keeps away from it.
 

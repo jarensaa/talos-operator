@@ -30,11 +30,15 @@ const (
 	ConditionSecretsMatchLive = "SecretsMatchLive"
 	// ConditionSecretsBackedUp reports whether the user confirmed an off-cluster export of the bundle.
 	ConditionSecretsBackedUp = "SecretsBackedUp"
-	// ConditionAdoptionProposed reports that a proven proposal of TalosCluster and TalosMachine specs
-	// is available in the ConfigMap named by status.adoption.proposalRef.
-	ConditionAdoptionProposed = "AdoptionProposed"
-	// ConditionAdopted reports that rendered configs were proven equal to live configs on every node.
-	ConditionAdopted = "Adopted"
+	// ConditionResourcesDerived reports, while a cluster is being adopted, whether the operator
+	// wrote the TalosMachinePools and TalosMachines that describe it (docs/scope.md §7.1 stage 1).
+	// Once the cluster is adopted the operator writes them no more, and the condition says so.
+	ConditionResourcesDerived = "ResourcesDerived"
+	// ConditionConfigProven reports whether the resources render exactly what every node runs right
+	// now, confirmed by Talos's dry run. It turns false again when either side changes, and it is
+	// what management.config: Manage is gated on. Whether the cluster was ever adopted is the
+	// phase, which never goes back.
+	ConditionConfigProven = "ConfigProven"
 	// ConditionConfigHandover reports whether entering config: Manage was verified to change
 	// nothing: the first reconcile in Manage found every node's rendered config equal to its live
 	// one, confirmed by Talos's dry run (docs/scope.md §7.1 stage 4).
@@ -84,8 +88,13 @@ const (
 	ReasonFailed            = "Failed"
 	ReasonPreconditionUnmet = "PreconditionUnmet"
 	ReasonMismatch          = "Mismatch"
-	ReasonAwaitingBackup    = "AwaitingBackup"
-	ReasonConfigUnresolved  = "ConfigUnresolved"
+	// ReasonChangedElsewhere: a resource the operator would write during adoption carries a value
+	// someone else set, so it is left as it is.
+	ReasonChangedElsewhere = "ChangedElsewhere"
+	// ReasonHandedOver: the cluster is adopted, and the resources are the user's from here on.
+	ReasonHandedOver       = "HandedOver"
+	ReasonAwaitingBackup   = "AwaitingBackup"
+	ReasonConfigUnresolved = "ConfigUnresolved"
 
 	// ReasonTalosAPIAccessDisabled: the talos.dev ServiceAccount CRD is missing, so no
 	// KubeTalosAPIAccessConfig is active on the control planes.
@@ -126,8 +135,6 @@ const (
 	// AnnotationSecretsBackedUp is set by the user on the secrets bundle Secret, to the bundle hash
 	// shown in the SecretsBackedUp condition, once the bundle is exported off-cluster.
 	AnnotationSecretsBackedUp = "talos.jarensaa.github.io/secrets-backed-up"
-	// AnnotationProposalSource fingerprints the live state a proposal was built from.
-	AnnotationProposalSource = "talos.jarensaa.github.io/proposal-source"
 	// AnnotationApproveDiff approves the change whose hash is in status.approval.
 	AnnotationApproveDiff = "talos.jarensaa.github.io/approve-diff"
 	// AnnotationRetry, AnnotationSkipMachine and AnnotationAbort act on a failed operation. Their
