@@ -59,7 +59,12 @@ podDisruptionBudget:
   maxUnavailable: 1
 
 nodeSelector: {}
-tolerations: []
+# The operator manages the cluster it runs on, and has to keep running on one that has no workers.
+# Talos taints its control planes unless scheduling on them is allowed, so the taint is tolerated.
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    operator: Exists
+    effect: NoSchedule
 
 metrics:
   # Serve metrics over HTTPS on 8443, authenticated via the Kubernetes API.

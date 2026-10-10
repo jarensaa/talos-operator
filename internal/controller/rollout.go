@@ -93,7 +93,10 @@ func (r *TalosClusterReconciler) rollout(ctx context.Context, tc *talosv1alpha1.
 // rolloutTiming reads spec.rollout. A duration that is not set takes its default; one set to
 // zero is zero.
 func rolloutTiming(ro talosv1alpha1.Rollout) plan.Timing {
-	t := plan.Timing{TryTimeout: plan.DefaultTryTimeout, Soak: plan.DefaultSoak, StepTimeout: plan.DefaultStepTimeout}
+	t := plan.Timing{
+		TryTimeout: plan.DefaultTryTimeout, Soak: plan.DefaultSoak, StepTimeout: plan.DefaultStepTimeout,
+		DrainTimeout: plan.DefaultDrainTimeout,
+	}
 
 	if ro.TryTimeout != nil {
 		t.TryTimeout = ro.TryTimeout.Duration
@@ -105,6 +108,10 @@ func rolloutTiming(ro talosv1alpha1.Rollout) plan.Timing {
 
 	if ro.StepTimeout != nil {
 		t.StepTimeout = ro.StepTimeout.Duration
+	}
+
+	if ro.DrainTimeout != nil {
+		t.DrainTimeout = ro.DrainTimeout.Duration
 	}
 
 	return t
@@ -161,7 +168,13 @@ func (r *TalosClusterReconciler) view(ctx context.Context, tc *talosv1alpha1.Tal
 	v.withhold = len(resolved.fromSecrets) > 0
 
 	if v.live != nil {
-		if v.change, err = classify.Classify(v.live, v.desired); err != nil {
+		// A node that runs what its config's installer installs takes that config like any other.
+		var opts []classify.Option
+		if runs(tc, v.pool, v.node) {
+			opts = append(opts, classify.Installed())
+		}
+
+		if v.change, err = classify.Classify(v.live, v.desired, opts...); err != nil {
 			v.desired, v.problem = nil, "classify the change: "+err.Error()
 		}
 	}
@@ -563,7 +576,7 @@ func (r *TalosClusterReconciler) step(ctx context.Context, tc *talosv1alpha1.Tal
 			"previousHash", cur.PreviousHash, "desiredHash", cur.DesiredHash, "gate", pre.Note)
 	}
 
-	switch action.Kind {
+	switch action.Kind { //nolint:exhaustive // the actions of an upgrade step never come out of a config step
 	case plan.Wait:
 		return action.Message, nil
 	case plan.Advance:
@@ -805,6 +818,15 @@ func remediation(reason, token string) string {
 		first = "Something other than this operator changed the node's config."
 	case plan.FailRejected:
 		first = "Fix the config in the spec."
+	case plan.FailImagePull:
+		first = "Nothing on the node changed. Check that the installer image exists and that the node can pull it."
+	case plan.FailInstall:
+		first = "The node still runs what it ran. Find out why the installer failed."
+	case plan.FailDrainTimeout:
+		first = "The node stays cordoned. Find out which pods could not be evicted; a PodDisruptionBudget may never allow it."
+	case plan.FailFellBack:
+		first = "The node runs its previous system again, and may still be cordoned. " +
+			"Find out why the new one did not boot: its console has the answer."
 	default:
 		first = "Find out what kept the step from finishing."
 	}
@@ -934,11 +956,12 @@ func (r *TalosClusterReconciler) patchMachineConfig(ctx context.Context, tm *tal
 func (r *TalosClusterReconciler) abandonOperation(tc *talosv1alpha1.TalosCluster) {
 	st := &tc.Status
 
-	if st.Operation != nil && st.Operation.Type == talosv1alpha1.OperationConfigRollout {
-		r.finish(tc, talosv1alpha1.OperationAborted, "config management returned to Observe")
+	if st.Operation != nil {
+		r.finish(tc, talosv1alpha1.OperationAborted, "config management returned to Observe"+leftCordoned(st.Operation))
 	}
 
-	st.Approval, st.AbortedTargets = nil, nil
+	st.Approval, st.AbortedTargets, st.Upgrades = nil, nil, nil
+	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionTalosUpToDate)
 }
 
 // operationEndpoints selects the Talos API endpoints of a cluster: never the node an operation is

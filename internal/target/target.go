@@ -53,6 +53,7 @@ type ReaderFactory interface {
 type ClientFactory interface {
 	ReaderFactory
 	ConfigWriter(ctx context.Context, t talos.Target) (talos.ConfigWriter, error)
+	Upgrader(ctx context.Context, t talos.Target) (talos.Upgrader, error)
 }
 
 // Target is everything needed to observe one cluster.
@@ -118,6 +119,26 @@ func (r *Resolver) ResolveWriter(ctx context.Context, tc *talosv1alpha1.TalosClu
 	}
 
 	return r.Factory.ConfigWriter(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
+}
+
+// ErrUpgradesDisabled is returned for an upgrade client while upgrades are not enabled.
+var ErrUpgradesDisabled = errors.New("an upgrader is only available while spec.management.upgrades is Enabled")
+
+// ResolveUpgrader returns a client that can upgrade and reboot tc's nodes. It refuses unless
+// spec.management.upgrades is Enabled and config is Manage, so nothing else can obtain one
+// (docs/scope.md §8.1, invariant 6).
+func (r *Resolver) ResolveUpgrader(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions,
+) (talos.Upgrader, error) {
+	if tc.Spec.Management.Config != talosv1alpha1.ConfigManagementManage || tc.Spec.Management.Upgrades != talosv1alpha1.CapabilityEnabled {
+		return nil, ErrUpgradesDisabled
+	}
+
+	c, endpoints, err := r.identity(ctx, tc, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.Factory.Upgrader(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
 }
 
 // identity loads tc's credentials and selects its endpoints.

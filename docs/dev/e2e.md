@@ -7,9 +7,14 @@ e2e tests run against a disposable Talos cluster built the way a hand-rolled bar
 
 ```bash
 make e2e-cluster-up     # prompts for sudo; reuses a running cluster
+make e2e-deploy         # builds the operator image, loads it into the nodes, installs the chart
 make test-e2e           # e2e-tagged tests in internal/talos and test/e2e
 make e2e-cluster-down   # prompts for sudo; removes .e2e/ entirely
 ```
+
+**The operator under test is the one a user runs** (docs/scope.md §12.18): the image built from the checkout, installed by the chart into the `talos-operator-e2e` namespace with two replicas on different nodes, with the chart's CRDs, admission policies and permissions. The suite starts no controllers itself. `hack/e2e/deploy.sh` builds the image, saves it as a tarball and loads it into every node through Talos's image import (`hack/e2e/import-image`), so no registry is involved and the nodes' config carries nothing that is only there for the tests. It needs `docker` and `helm`.
+
+The suite reads the operator's metrics from each pod's own endpoint, over HTTPS and as a reader the Kubernetes API authorizes, to check that no Talos call was refused by the operator's allowlist.
 
 `.e2e/` is gitignored. It holds throwaway secrets, generated configs, `talosconfig`, `kubeconfig` and an `env` file that `make test-e2e` sources.
 
@@ -19,7 +24,8 @@ Knobs (environment variables for `hack/e2e/cluster-up.sh`):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TALOS_VERSION` | `v1.14.2` | Talos version booted and installed |
+| `TALOS_VERSION` | `v1.14.1` | Talos version booted and installed: one patch release below `UPGRADE_TO` |
+| `UPGRADE_TO` | `v1.14.2` | The version the suite upgrades every node to; the one the operator is built for |
 | `KUBERNETES_VERSION` | `1.37.0` | Kubernetes version |
 | `CONTROLPLANES` / `WORKERS` | `3` / `1` | Configured nodes |
 | `MAINTENANCE_NODES` | `0` | Extra workers left unconfigured, for expansion tests (M7) |
@@ -53,7 +59,7 @@ Local runs are optional. The `E2E` workflow (`.github/workflows/e2e.yml`) runs t
 - weekly (Mondays), with three control planes, to catch drift such as new Image Factory builds or Talos releases;
 - on demand (`workflow_dispatch`), with the cluster shape you ask for.
 
-The job starts cluster creation in the background as soon as QEMU and `talosctl` are installed. Go setup and `make test-e2e-build` run while the VMs boot, so only the tests themselves wait for the cluster. `make test-e2e` runs only tests named `TestE2E*`; unit tests in the same packages run in the Tests workflow.
+The job starts cluster creation in the background as soon as QEMU and `talosctl` are installed. Go setup, `make test-e2e-build` and the build of the operator image run while the VMs boot, so only importing the image, installing the chart and the tests themselves wait for the cluster. `make test-e2e` runs only tests named `TestE2E*`; unit tests in the same packages run in the Tests workflow.
 
 Every pull request runs one control plane and one worker (`CONTROLPLANES=1 WORKERS=1 VM_CPUS=1.0`), which is quick and is the required check.
 
@@ -71,6 +77,8 @@ This is where scenarios that need several control planes are shown: serialising 
 
 The runner is GitHub's standard hosted one, which for a public repository has 4 vCPUs and 16 GB. Three control planes and a worker at 2 GiB each use half of that memory, and the whole run takes about as long as a pull request's. No larger or self-hosted runner is involved.
 
-What the suite covers on that cluster, in order and on one TalosCluster: adoption from an empty TalosCluster, with the operator writing the pools and machines, nothing applied by hand and no node changed; an edit made before management is on, which is caught and makes the API server refuse `config: Manage`; a label rolled out to the worker without a reboot; a worker whose kubelet is broken by a config applied behind the operator's back, which the operator repairs once the drift policy is `Enforce`, although the node is unhealthy; a protected field refused; and a config that makes the worker drop everything it sends to the control planes, which Talos must revert while the operator confirms nothing and leaves the control plane's own pending change unapplied. The last one waits out a four-minute try window, during which the worker is offline; `make test-e2e` therefore runs its packages one after the other.
+What the suite covers on that cluster, in order and on one TalosCluster: adoption from an empty TalosCluster, with the operator writing the pools and machines, nothing applied by hand and no node changed; an edit made before management is on, which is caught and makes the API server refuse `config: Manage`; a Talos upgrade of every node to the next patch release, the nodes the operator's own replicas run on included, with a workload behind a disruption budget kept up, followed by the config rollout that names the new installer; a rollout whose leader is killed in the middle of a node's try, finished by the other replica; a label rolled out to the worker without a reboot; a worker whose kubelet is broken by a config applied behind the operator's back, which the operator repairs once the drift policy is `Enforce`, although the node is unhealthy; a protected field refused; and a config that makes the worker drop everything it sends to the control planes, which Talos must revert while the operator confirms nothing and leaves the control plane's own pending change unapplied. The last one waits out a four-minute try window, during which the worker is offline; `make test-e2e` therefore runs its packages one after the other.
 
-On failure the workflow uploads `e2e-diagnostics`: VM console logs, plus `dmesg` and service status from each node it can reach. The cluster is always destroyed at the end.
+The upgrade reboots every node, so a run takes about half an hour on the small shape and longer on the larger ones. On a cluster with one control plane the Kubernetes API is down while that node reboots; the replica on the worker loses its lease, restarts, and carries on from the persisted step once the API is back.
+
+On failure the workflow uploads `e2e-diagnostics`: VM console logs, the operator's pods, logs and events, plus `dmesg` and service status from each node it can reach. The cluster is always destroyed at the end.

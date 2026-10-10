@@ -51,6 +51,34 @@ func InstallerImage(in talosv1alpha1.Installer, talosVersion string) (string, er
 	return fmt.Sprintf("%s/%s-installer/%s:%s", u.Host, in.Platform, in.SchematicID, talosVersion), nil
 }
 
+// Install is what a machine is to be installed from: the Talos version and the schematic its
+// spec asks for, and the installer image that carries both.
+type Install struct {
+	Version     string
+	SchematicID string
+	Image       string
+}
+
+// InstallTarget returns what a pool's machines are to be installed from: the cluster's version
+// and installer, with the pool's own schematic if it sets one.
+func InstallTarget(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.TalosMachinePoolSpec) (Install, error) {
+	if spec.Versions == nil || spec.Versions.Talos == "" || spec.ConfigGeneration == nil || spec.ConfigGeneration.Installer == nil {
+		return Install{}, fmt.Errorf("%w: versions.talos and configGeneration.installer", ErrIncompleteSpec)
+	}
+
+	installer := *spec.ConfigGeneration.Installer
+	if pool.Installer != nil && pool.Installer.SchematicID != "" {
+		installer.SchematicID = pool.Installer.SchematicID
+	}
+
+	image, err := InstallerImage(installer, spec.Versions.Talos)
+	if err != nil {
+		return Install{}, err
+	}
+
+	return Install{Version: spec.Versions.Talos, SchematicID: installer.SchematicID, Image: image}, nil
+}
+
 // ParseInstallerImage splits an Image Factory installer reference into the spec's fields and the
 // Talos version tag. Other installer images cannot be represented and are refused.
 func ParseInstallerImage(ref string) (talosv1alpha1.Installer, string, error) {
@@ -109,15 +137,12 @@ func RenderInput(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.Talos
 		return render.Input{}, fmt.Errorf("versionContract: %w", err)
 	}
 
-	installer := *spec.ConfigGeneration.Installer
-	if pool.Installer != nil && pool.Installer.SchematicID != "" {
-		installer.SchematicID = pool.Installer.SchematicID
-	}
-
-	image, err := InstallerImage(installer, spec.Versions.Talos)
+	install, err := InstallTarget(spec, pool)
 	if err != nil {
 		return render.Input{}, err
 	}
+
+	image := install.Image
 
 	in := render.Input{
 		ClusterName:       spec.ClusterName,

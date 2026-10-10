@@ -39,6 +39,8 @@ type nodeFacts struct {
 	activeConfig []byte
 	status       *talos.MachineStatus
 	schematicID  *string
+	// bootID changes with every boot; empty when it was not read.
+	bootID string
 	// persistentConfig is the raw persistent config; nil when the node has none, as after
 	// booting from disk. The same care applies as for activeConfig.
 	persistentConfig []byte
@@ -48,6 +50,8 @@ type nodeFacts struct {
 	// etcdStatusRead is set. Control planes only.
 	etcdErrors     []string
 	etcdStatusRead bool
+	// etcdLeader is true when the node's etcd member leads; like etcdErrors it needs etcdStatusRead.
+	etcdLeader bool
 	// kubeNode is what the Kubernetes API says about the member's Node; nil when the Nodes were
 	// not read.
 	kubeNode *plan.KubernetesNode
@@ -119,6 +123,7 @@ func (f *clusterFacts) observeKubeNodes(nodes []corev1.Node) {
 
 		if at >= 0 {
 			n.kubeNode.Registered = true
+			n.kubeNode.Unschedulable = nodes[at].Spec.Unschedulable
 			n.kubeNode.Ready = nodeConditionTrue(&nodes[at], corev1.NodeReady) &&
 				!nodeConditionTrue(&nodes[at], corev1.NodeNetworkUnavailable)
 		}

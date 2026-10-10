@@ -168,3 +168,67 @@ func TestClassStrategies(t *testing.T) {
 		}
 	}
 }
+
+// The installer image is the one boot-time setting an upgrade brings about. Naming another image
+// is refused as a config change until the node runs what it installs; then it is bookkeeping.
+func TestClassifyInstallerImage(t *testing.T) {
+	bundle := talostest.Bundle(t)
+
+	installDoc := func(version, disk string) string {
+		return "apiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n" +
+			"  image: factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:" + version + "\n" +
+			"provisioning:\n  diskSelector:\n    match: disk.transport == \"" + disk + "\"\n"
+	}
+
+	const (
+		volume = "apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: data\nprovisioning:\n" +
+			"  diskSelector:\n    match: disk.transport == \"nvme\"\n  minSize: 10GiB\n"
+		label = "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  example.com/zone: a\n"
+	)
+
+	base := rendered(t, bundle, installDoc("v1.14.1", "sata"))
+	newer := installDoc("v1.14.2", "sata")
+
+	tests := []struct {
+		name      string
+		desired   *render.Config
+		installed bool
+		want      classify.Class
+	}{
+		{"another image, not installed yet", rendered(t, bundle, newer), false, classify.Installer},
+		{"another image the node already runs", rendered(t, bundle, newer), true, classify.LiveSafe},
+		// Only the image is the installer's. A disk is chosen at install time and nowhere else.
+		{"another image and another disk", rendered(t, bundle, installDoc("v1.14.2", "nvme")), false, classify.BootTime},
+		{"another image and another disk, installed", rendered(t, bundle, installDoc("v1.14.2", "nvme")), true, classify.BootTime},
+		// What rides along keeps its own class, so an installed image never hides a change that
+		// needs approval.
+		{"another image and a label", rendered(t, bundle, newer, label), false, classify.Installer},
+		{"another image and a volume, installed", rendered(t, bundle, newer, volume), true, classify.Storage},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var opts []classify.Option
+			if tt.installed {
+				opts = append(opts, classify.Installed())
+			}
+
+			got, err := classify.Classify(base, tt.desired, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got.Class != tt.want {
+				t.Fatalf("got %s (%v), want %s", got.Class, got.Reasons, tt.want)
+			}
+		})
+	}
+
+	if !classify.Installer.Blocked() || classify.Installer.NeedsApproval() {
+		t.Fatal("an installer change waits for its upgrade; no approval makes it apply sooner")
+	}
+
+	if !classify.BootTime.Worse(classify.Installer) || !classify.Installer.Worse(classify.Unknown) {
+		t.Fatal("the installer sits between what needs approval and what only an install can change")
+	}
+}

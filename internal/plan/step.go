@@ -82,8 +82,10 @@ type Timing struct {
 	// Soak is how long a node must stay healthy under a config before it is confirmed.
 	Soak time.Duration
 	// StepTimeout bounds every other wait: for a gate to open, for a node that needs no change
-	// to verify, for a node to come back after a try ended.
+	// to verify, for a node to come back after a try ended or after a reboot.
 	StepTimeout time.Duration
+	// DrainTimeout bounds the eviction of a node's pods before an upgrade reboots it.
+	DrainTimeout time.Duration
 }
 
 // WithDefaults fills unset timings.
@@ -100,13 +102,17 @@ func (t Timing) WithDefaults() Timing {
 		t.StepTimeout = DefaultStepTimeout
 	}
 
+	if t.DrainTimeout == 0 {
+		t.DrainTimeout = DefaultDrainTimeout
+	}
+
 	return t
 }
 
 // Validate refuses timings under which a try could never be confirmed.
 func (t Timing) Validate() error {
-	if t.Soak < 0 || t.StepTimeout <= 0 {
-		return errors.New("soak must not be negative and stepTimeout must be positive")
+	if t.Soak < 0 || t.StepTimeout <= 0 || t.DrainTimeout <= 0 {
+		return errors.New("soak must not be negative, and stepTimeout and drainTimeout must be positive")
 	}
 
 	if t.TryTimeout < t.Soak+minVerifyWindow {
@@ -171,7 +177,14 @@ const (
 )
 
 func (k ActionKind) String() string {
-	return [...]string{"Wait", "Advance", "MarkHealthy", "MarkUnhealthy", "Try", "Rearm", "Confirm", "Complete", "Fail"}[k]
+	names := map[ActionKind]string{
+		Wait: "Wait", Advance: "Advance", MarkHealthy: "MarkHealthy", MarkUnhealthy: "MarkUnhealthy", Try: "Try", Rearm: "Rearm",
+		Confirm: "Confirm", Complete: "Complete", Fail: "Fail",
+		Pull: "Pull", Install: "Install", MarkCordoned: "MarkCordoned", Cordon: "Cordon", Evict: "Evict", Reboot: "Reboot",
+		Uncordon: "Uncordon",
+	}
+
+	return names[k]
 }
 
 // Action is the planner's answer for the step in flight.
@@ -184,6 +197,9 @@ type Action struct {
 	// Message explains a Wait or a Fail.
 	Message string
 }
+
+// notReachable is what a step waits for while its node does not answer.
+const notReachable = "the node is not reachable"
 
 func wait(format string, args ...any) Action {
 	return Action{Kind: Wait, Message: fmt.Sprintf(format, args...)}
@@ -234,7 +250,7 @@ func nextTrying(step Step, node Node, pre Gate, t Timing, now time.Time) Action 
 	case !now.Before(step.Deadline):
 		return advance(StepRollingBack)
 	case !node.Reachable:
-		return wait("the node is not reachable")
+		return wait(notReachable)
 	case node.ActiveHash == step.DesiredHash:
 		return advance(StepVerifying)
 	case node.ActiveHash != step.PreviousHash:
@@ -286,7 +302,7 @@ func nextVerifying(step Step, node Node, checks Gate, t Timing, now time.Time) A
 func unverified(node Node, settled bool, checks Gate) string {
 	switch {
 	case !node.Reachable:
-		return "the node is not reachable"
+		return notReachable
 	case !settled:
 		return "the node has a staged config waiting for a reboot"
 	default:
@@ -324,7 +340,7 @@ func nextVerifyingTry(step Step, node Node, checks Gate, t Timing, now time.Time
 
 func unverifiedTry(node Node, checks Gate) string {
 	if !node.Reachable {
-		return "the node is not reachable"
+		return notReachable
 	}
 
 	return checks.Reason
@@ -341,7 +357,7 @@ func nextConfirming(step Step, node Node, now time.Time) Action {
 		// that did land without an answer is recognised while rolling back.
 		return advance(StepRollingBack)
 	case !node.Reachable:
-		return wait("the node is not reachable")
+		return wait(notReachable)
 	case node.ActiveHash != step.DesiredHash:
 		return advance(StepRollingBack)
 	default:

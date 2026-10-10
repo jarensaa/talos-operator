@@ -89,6 +89,41 @@ subjects:
     name: {{ include "talos-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 ---
+# Upgrades reboot nodes, and drain them first (docs/scope.md §7.3): cordon and uncordon the Node,
+# list its pods wherever they live, and evict them, which is what makes PodDisruptionBudgets count.
+# Nothing else about pods: no reading their logs, no deleting them past a budget.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-drainer
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-drainer
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-operator.fullname" . }}-node-drainer
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
 # Node heartbeats: a rollout only confirms a config change on a node whose kubelet has renewed its
 # Lease since (docs/scope.md §8.5.1). Read access to that one namespace, nothing else.
 apiVersion: rbac.authorization.k8s.io/v1

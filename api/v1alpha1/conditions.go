@@ -45,6 +45,9 @@ const (
 	ConditionConfigHandover = "ConfigHandover"
 	// ConditionConfigInSync reports whether every node runs its rendered config.
 	ConditionConfigInSync = "ConfigInSync"
+	// ConditionTalosUpToDate reports whether every node runs the Talos version and installer its
+	// spec asks for (docs/scope.md §7.3).
+	ConditionTalosUpToDate = "TalosUpToDate"
 	// ConditionRolloutBlocked reports that a disruptive operation is halted and needs attention.
 	ConditionRolloutBlocked = "RolloutBlocked"
 )
@@ -124,6 +127,13 @@ const (
 	ReasonAborted           = "Aborted"
 	ReasonGateClosed        = "GateClosed"
 	ReasonInvalidRollout    = "InvalidRollout"
+	// ReasonAwaitingUpgrade: the config names another installer image than a node runs, which a
+	// Talos upgrade brings about, not a config rollout.
+	ReasonAwaitingUpgrade = "AwaitingUpgrade"
+	// Reasons of TalosUpToDate.
+	ReasonUpgrading        = "Upgrading"
+	ReasonUpgradesDisabled = "UpgradesDisabled"
+	ReasonIncompatible     = "Incompatible"
 	// ReasonAwaitingStatus: a TalosMachine's status does not reflect its spec and node yet.
 	ReasonAwaitingStatus = "AwaitingStatus"
 	// ReasonHeld: a machine does not run its rendered config and is on hold, or was skipped.

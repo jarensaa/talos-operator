@@ -86,6 +86,10 @@ e2e-cluster-up: ## Create (or reuse) the QEMU e2e Talos cluster. Requires sudo.
 e2e-cluster-down: ## Destroy the QEMU e2e Talos cluster. Requires sudo.
 	E2E_DIR=$(E2E_DIR) hack/e2e/cluster-down.sh
 
+.PHONY: e2e-deploy
+e2e-deploy: ## Build the operator image, load it into the e2e cluster's nodes and install the chart.
+	E2E_DIR=$(E2E_DIR) hack/e2e/deploy.sh
+
 E2E_PACKAGES ?= ./internal/talos/... ./test/e2e/...
 
 .PHONY: test-parity
@@ -97,11 +101,11 @@ test-e2e-build: ## Compile the e2e tests without running them (CI overlaps this 
 	go test -tags e2e -count=1 -run '^$$' $(E2E_PACKAGES)
 
 .PHONY: test-e2e
-test-e2e: ## Run e2e tests against the cluster from e2e-cluster-up.
-	@test -s $(E2E_DIR)/env || { echo "No e2e cluster; run 'make e2e-cluster-up' first."; exit 1; }
+test-e2e: ## Run e2e tests against the cluster from e2e-cluster-up, with the operator from e2e-deploy.
+	@test -s $(E2E_DIR)/env || { echo "No e2e cluster; run 'make e2e-cluster-up e2e-deploy' first."; exit 1; }
 	@# Only tests named TestE2E* run: unit tests in the same packages already run in test-unit.
 	@# -p 1: the packages share one cluster, and test/e2e takes a node offline for a while.
-	. $(E2E_DIR)/env && go test -tags e2e -run '^TestE2E' $(E2E_PACKAGES) -v -count=1 -p 1 -timeout 45m
+	. $(E2E_DIR)/env && go test -tags e2e -run '^TestE2E' $(E2E_PACKAGES) -v -count=1 -p 1 -timeout 100m
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter

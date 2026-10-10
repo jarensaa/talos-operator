@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +52,10 @@ const (
 	MethodEtcdStatus              = "EtcdStatus"
 	MethodHealthCheck             = "HealthCheck"
 	MethodApplyConfiguration      = "ApplyConfiguration"
+	MethodImagePull               = "ImagePull"
+	MethodInstall                 = "Install"
+	MethodEtcdForfeitLeadership   = "EtcdForfeitLeadership"
+	MethodReboot                  = "Reboot"
 )
 
 // Machine types as Talos reports them.
@@ -61,7 +66,9 @@ const (
 
 // mutatingMethods lists recorded methods that change node state. A dry-run apply is recorded
 // under ApplyConfiguration with DryRun set, which AssertNoMutations allows.
-var mutatingMethods = map[string]bool{MethodApplyConfiguration: true}
+var mutatingMethods = map[string]bool{
+	MethodApplyConfiguration: true, MethodImagePull: true, MethodInstall: true, MethodEtcdForfeitLeadership: true, MethodReboot: true,
+}
 
 func (n *Node) unhealthy() bool { return n.UnhealthyWhen != nil && n.UnhealthyWhen(n.Config.Active) }
 
@@ -93,6 +100,17 @@ type Node struct {
 	// tryPrevious is the config a pending try falls back to: whatever was active when the try
 	// was applied, exactly as Talos captures it.
 	tryPrevious []byte
+	// InstallExitCode makes the installer fail with this exit code when it is not zero.
+	InstallExitCode int32
+	// FallsBack makes the node come back from its next reboot on the system it ran before, as
+	// Talos does by itself when the newly installed one does not boot.
+	FallsBack bool
+	// pulled are the images on the node; installed is the installer image whose system sits in
+	// the inactive boot slot, waiting for a reboot.
+	pulled    map[string]bool
+	installed string
+	// down is true between a reboot and Boot: the node answers nothing.
+	down bool
 	// EtcdMemberID identifies the node's etcd member; 0 means none (workers).
 	EtcdMemberID uint64
 	EtcdLearner  bool
@@ -106,6 +124,8 @@ type Call struct {
 	DryRun bool
 	// Mode is the mode of a real apply; zero otherwise.
 	Mode talos.ApplyMode
+	// Image is the image of a pull or an install.
+	Image string
 }
 
 // Scenario is a simulated cluster. It is safe for concurrent use.
@@ -274,6 +294,62 @@ func (s *Scenario) TryPending(addr netip.Addr) bool {
 	return ok && n.tryPrevious != nil
 }
 
+// Down reports whether the node was rebooted and has not booted again.
+func (s *Scenario) Down(addr netip.Addr) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n, ok := s.nodes[addr]
+
+	return ok && n.down
+}
+
+// Boot brings a rebooted node back, as its firmware and Talos would: with a new boot ID, on the
+// system an install left in the inactive slot (unless the node FallsBack), and on its persistent
+// config, because a tried one does not survive a reboot. It reports whether the node was down.
+func (s *Scenario) Boot(addr netip.Addr) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n, ok := s.nodes[addr]
+	if !ok || !n.down {
+		return false
+	}
+
+	n.down = false
+	n.BootID += "+"
+
+	if n.installed != "" && !n.FallsBack {
+		if schematic, version, ok := ParseInstaller(n.installed); ok {
+			n.Schematic.ID, n.Version.Tag = schematic, version
+		}
+	}
+
+	n.installed = ""
+
+	if n.tryPrevious != nil {
+		n.Config.Active, n.tryPrevious = n.tryPrevious, nil
+	}
+
+	return true
+}
+
+// ParseInstaller splits an Image Factory installer image, <host>/<platform>-installer/<schematic>:<version>,
+// into its schematic and version.
+func ParseInstaller(image string) (schematic, version string, ok bool) {
+	slash, colon := strings.LastIndex(image, "/"), strings.LastIndex(image, ":")
+	if slash < 0 || colon < slash {
+		return "", "", false
+	}
+
+	return image[slash+1 : colon], image[colon+1:], true
+}
+
+// Upgrader returns a talos.Upgrader backed by the scenario.
+func (s *Scenario) Upgrader() talos.Upgrader {
+	return &upgrader{reader{s: s}}
+}
+
 // Writer returns a talos.ConfigWriter backed by the scenario.
 func (s *Scenario) Writer() talos.ConfigWriter {
 	return &writer{reader{s: s}}
@@ -302,6 +378,10 @@ func (s *Scenario) record(ctx context.Context, method string, node netip.Addr) (
 	n, ok := s.nodes[node]
 	if !ok {
 		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: no such node"))
+	}
+
+	if n.down {
+		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: node is rebooting"))
 	}
 
 	if n.UnreachableWhen != nil && n.UnreachableWhen(n.Config.Active) {
@@ -536,9 +616,28 @@ func (r *reader) HealthCheck(ctx context.Context, node netip.Addr, _ talos.Clust
 type Factory struct {
 	Scenario *Scenario
 
-	mu            sync.Mutex
-	targets       []talos.Target
-	writerTargets []talos.Target
+	mu              sync.Mutex
+	targets         []talos.Target
+	writerTargets   []talos.Target
+	upgraderTargets []talos.Target
+}
+
+// Upgrader implements target.ClientFactory.
+func (f *Factory) Upgrader(_ context.Context, t talos.Target) (talos.Upgrader, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.upgraderTargets = append(f.upgraderTargets, t)
+
+	return f.Scenario.Upgrader(), nil
+}
+
+// UpgraderTargets returns the targets an Upgrader was requested for.
+func (f *Factory) UpgraderTargets() []talos.Target {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.upgraderTargets)
 }
 
 // ConfigWriter implements target.ClientFactory.
@@ -659,6 +758,107 @@ func (w *writer) ApplyConfig(ctx context.Context, node netip.Addr, machineConfig
 	default:
 		return status.Error(codes.InvalidArgument, "fake: unsupported apply mode")
 	}
+
+	return nil
+}
+
+// upgrader implements talos.Upgrader the way a node behaves: an install only fills the inactive
+// boot slot, and nothing about the node changes until it reboots and is booted again (Boot).
+type upgrader struct {
+	reader
+}
+
+var _ talos.Upgrader = (*upgrader)(nil)
+
+func (u *upgrader) image(ctx context.Context, method string, node netip.Addr, image string) (*Node, error) {
+	if _, err := u.s.record(ctx, method, node); err != nil {
+		return nil, err
+	}
+
+	u.s.mu.Lock()
+	defer u.s.mu.Unlock()
+
+	u.s.calls[len(u.s.calls)-1].Image = image
+
+	return u.s.nodes[node], nil
+}
+
+// PullImage implements talos.Upgrader.
+func (u *upgrader) PullImage(ctx context.Context, node netip.Addr, image string) error {
+	n, err := u.image(ctx, MethodImagePull, node, image)
+	if err != nil {
+		return err
+	}
+
+	u.s.mu.Lock()
+	defer u.s.mu.Unlock()
+
+	if n.pulled == nil {
+		n.pulled = map[string]bool{}
+	}
+
+	n.pulled[image] = true
+
+	return nil
+}
+
+// Install implements talos.Upgrader.
+func (u *upgrader) Install(ctx context.Context, node netip.Addr, image string) error {
+	n, err := u.image(ctx, MethodInstall, node, image)
+	if err != nil {
+		return err
+	}
+
+	u.s.mu.Lock()
+	defer u.s.mu.Unlock()
+
+	switch {
+	case !n.pulled[image]:
+		return status.Error(codes.NotFound, "fake: the image was not pulled")
+	case n.InstallExitCode != 0:
+		return &talos.InstallError{ExitCode: n.InstallExitCode, Detail: "fake: the installer failed"}
+	}
+
+	n.installed = image
+
+	return nil
+}
+
+// ForfeitEtcdLeadership implements talos.Upgrader: the next control plane takes over.
+func (u *upgrader) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
+	n, err := u.s.record(ctx, MethodEtcdForfeitLeadership, node)
+	if err != nil {
+		return err
+	}
+
+	u.s.mu.Lock()
+	defer u.s.mu.Unlock()
+
+	if n.EtcdMemberID == 0 || u.s.etcdLeader != n.EtcdMemberID {
+		return nil
+	}
+
+	for _, other := range u.s.sortedNodesLocked() {
+		if other.EtcdMemberID != 0 && other.EtcdMemberID != n.EtcdMemberID {
+			u.s.etcdLeader = other.EtcdMemberID
+
+			break
+		}
+	}
+
+	return nil
+}
+
+// Reboot implements talos.Upgrader. The node is down until Boot.
+func (u *upgrader) Reboot(ctx context.Context, node netip.Addr) error {
+	if _, err := u.s.record(ctx, MethodReboot, node); err != nil {
+		return err
+	}
+
+	u.s.mu.Lock()
+	defer u.s.mu.Unlock()
+
+	u.s.nodes[node].down = true
 
 	return nil
 }

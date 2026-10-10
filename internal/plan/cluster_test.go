@@ -442,6 +442,9 @@ var ailments = []ailment{
 	{name: "Node not Ready", apply: func(m *Member) { m.Node = &KubernetesNode{Registered: true} }, known: true},
 	{name: "no Node", apply: func(m *Member) { m.Node = &KubernetesNode{} }, known: true},
 	{name: "Node unread", apply: func(m *Member) { m.Node = nil }},
+	// A cordoned node is someone's work in progress. Talos's cluster-wide checks fail on it, so it
+	// counts like a node that is known to be the fault.
+	{name: "cordoned", apply: func(m *Member) { m.Node = &KubernetesNode{Registered: true, Ready: true, Unschedulable: true} }, known: true},
 	{name: "config pending", apply: func(m *Member) { m.ConfigSettled = ptr(false) }, config: true},
 	{name: "config unread", apply: func(m *Member) { m.ConfigSettled = nil }, config: true},
 }

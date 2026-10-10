@@ -79,6 +79,26 @@ func checkReadOnly(method string, req any) error {
 	return status.Errorf(codes.PermissionDenied, "talos-operator: %s is not allowed on this connection", method)
 }
 
+// upgradeMethods are the RPCs an Upgrader connection may issue besides the read-only ones: pulling
+// an image, installing it to the inactive boot slot, handing off etcd leadership, and rebooting.
+// The deprecated MachineService.Upgrade is not among them, and neither is anything that resets a
+// node, changes etcd membership or applies config.
+var upgradeMethods = map[string]bool{
+	machineapi.ImageService_Pull_FullMethodName:                    true,
+	machineapi.LifecycleService_Upgrade_FullMethodName:             true,
+	machineapi.MachineService_EtcdForfeitLeadership_FullMethodName: true,
+	machineapi.MachineService_Reboot_FullMethodName:                true,
+}
+
+// checkUpgrade is the allowlist of an Upgrader connection.
+func checkUpgrade(method string, req any) error {
+	if upgradeMethods[method] {
+		return nil
+	}
+
+	return checkReadOnly(method, req)
+}
+
 // access is what a connection may do. Each level has its own connection, so the allowlist is fixed
 // for the connection's lifetime.
 type access int
@@ -88,11 +108,17 @@ const (
 	accessReadOnly access = iota
 	// accessConfig additionally allows applying machine config, in the modes checkConfig admits.
 	accessConfig
+	// accessUpgrade additionally allows upgradeMethods.
+	accessUpgrade
 )
 
 func (a access) check(method string, req any) error {
-	if a == accessConfig {
+	switch a {
+	case accessConfig:
 		return checkConfig(method, req)
+	case accessUpgrade:
+		return checkUpgrade(method, req)
+	case accessReadOnly:
 	}
 
 	return checkReadOnly(method, req)

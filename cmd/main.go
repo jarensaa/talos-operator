@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -68,6 +69,7 @@ type options struct {
 	probeAddr       string
 	leaderElection  bool
 	watchNamespace  string
+	observeInterval time.Duration
 	zap             zap.Options
 }
 
@@ -91,6 +93,9 @@ func parseFlags() *options {
 		"Namespace to watch for TalosClusters, TalosMachines and their Secrets. "+
 			"The Helm chart sets it to the release namespace so Secret access stays namespaced; "+
 			"empty watches all namespaces (local development only).")
+
+	flag.DurationVar(&o.observeInterval, "observe-interval", controller.DefaultObserveInterval,
+		"How often a cluster and its machines are observed when nothing else brings a reconcile.")
 
 	// Production logging (JSON, info level, no stack traces on warnings) unless --zap-devel asks
 	// for the development format; `make run` does.
@@ -144,7 +149,12 @@ func metricsOptions(o *options) (metricsserver.Options, *certwatcher.CertWatcher
 }
 
 // setupControllers registers every controller with the manager.
-func setupControllers(mgr ctrl.Manager, resolver *target.Resolver) error {
+func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) error {
+	evictor, err := controller.NewPodEvictor(mgr.GetConfig())
+	if err != nil {
+		return err
+	}
+
 	if err := (&controller.TalosClusterReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -152,15 +162,21 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver) error {
 		Recorder: mgr.GetEventRecorder("talos-operator"),
 		// Uncached reads: node heartbeat Leases, which live outside the watched namespace, and the
 		// TalosCluster itself right before a write to Talos.
-		APIReader: mgr.GetAPIReader(),
+		APIReader:       mgr.GetAPIReader(),
+		ObserveInterval: o.observeInterval,
+		Evictor:         evictor,
+		// The chart passes the node's name down; without it the operator simply does not know
+		// which node an upgrade should leave for last.
+		NodeName: os.Getenv("NODE_NAME"),
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("TalosCluster controller: %w", err)
 	}
 
 	if err := (&controller.TalosMachineReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Resolver: resolver,
+		Client:          mgr.GetClient(),
+		Scheme:          mgr.GetScheme(),
+		Resolver:        resolver,
+		ObserveInterval: o.observeInterval,
 	}).SetupWithManager(mgr); err != nil {
 		return fmt.Errorf("TalosMachine controller: %w", err)
 	}
@@ -216,7 +232,7 @@ func run(o *options) error {
 	talosFactory := talos.NewFactory()
 	defer talosFactory.Close()
 
-	if err := setupControllers(mgr, &target.Resolver{Client: mgr.GetClient(), Factory: talosFactory}); err != nil {
+	if err := setupControllers(mgr, &target.Resolver{Client: mgr.GetClient(), Factory: talosFactory}, o); err != nil {
 		return err
 	}
 
