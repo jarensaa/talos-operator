@@ -7,16 +7,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - configmaps
-  verbs:
-  - create
-  - get
-  - list
-  - update
-  - watch
-- apiGroups:
-  - ""
-  resources:
   - nodes
   verbs:
   - get
@@ -57,8 +47,6 @@ rules:
   resources:
   - talosclusters
   - talosmachineconfigs
-  - talosmachinepools
-  - talosmachines
   verbs:
   - get
   - list
@@ -85,3 +73,15 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - talos.jarensaa.github.io
+  resources:
+  - talosmachinepools
+  - talosmachines
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch

@@ -133,7 +133,7 @@ func normalizedLive(n nodeFacts) (*render.Config, error) {
 func (r *TalosClusterReconciler) prove(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation) error {
 	st := &tc.Status
 	gen := tc.Generation
-	adopted := meta.IsStatusConditionTrue(st.Conditions, talosv1alpha1.ConditionAdopted)
+	proven := meta.IsStatusConditionTrue(st.Conditions, talosv1alpha1.ConditionConfigProven)
 
 	pools, machines, err := membersOf(ctx, r.Client, tc.Namespace, tc.Name)
 	if err != nil {
@@ -142,31 +142,32 @@ func (r *TalosClusterReconciler) prove(ctx context.Context, tc *talosv1alpha1.Ta
 
 	nodes, why := proofGate(tc, obs.facts, obs.unmatched, pools, machines)
 	if why != "" {
+		// A cluster that was proven before has lost its proof; one that never was has not met it yet.
 		reason := talosv1alpha1.ReasonPreconditionUnmet
-		if adopted {
+		if proven || adopted(tc) {
 			reason = talosv1alpha1.ReasonProofInvalidated
 		}
 
-		setCondition(st, gen, talosv1alpha1.ConditionAdopted, metav1.ConditionFalse, reason, why)
+		setCondition(st, gen, talosv1alpha1.ConditionConfigProven, metav1.ConditionFalse, reason, why)
 
 		return nil
 	}
 
-	proven := make(map[string]string, len(nodes))
+	hashes := make(map[string]string, len(nodes))
 	for _, n := range nodes {
-		proven[n.machine.Name] = n.live.Hash
+		hashes[n.machine.Name] = n.live.Hash
 	}
 
 	// Desired equals live everywhere (the gate), so the hashes alone tell whether anything moved
 	// since the last proof; the dry runs only run again when something did.
-	if adopted && st.Adoption != nil && maps.Equal(st.Adoption.LiveConfigHashes, proven) {
+	if proven && st.Adoption != nil && maps.Equal(st.Adoption.LiveConfigHashes, hashes) {
 		return nil
 	}
 
 	if verdict, err := r.verifyNoChanges(ctx, tc, obs.reader, nodes); err != nil {
 		return err
 	} else if verdict != nil {
-		setCondition(st, gen, talosv1alpha1.ConditionAdopted, verdict.status, verdict.reason, verdict.msg)
+		setCondition(st, gen, talosv1alpha1.ConditionConfigProven, verdict.status, verdict.reason, verdict.msg)
 
 		return nil //nolint:nilerr // err is nil here: a verdict is reported in Adopted
 	}
@@ -176,10 +177,16 @@ func (r *TalosClusterReconciler) prove(ctx context.Context, tc *talosv1alpha1.Ta
 	}
 
 	now := metav1.NewTime(r.now())
-	st.Adoption.LiveConfigHashes = proven
+	st.Adoption.LiveConfigHashes = hashes
 	st.Adoption.ProvenAt = &now
 
-	setCondition(st, gen, talosv1alpha1.ConditionAdopted, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded,
+	// The first proof is what adopts the cluster. From here on the resources are the user's, and
+	// nothing takes that back (docs/scope.md §12.14).
+	if st.Adoption.AdoptedAt == nil {
+		st.Adoption.AdoptedAt = &now
+	}
+
+	setCondition(st, gen, talosv1alpha1.ConditionConfigProven, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded,
 		fmt.Sprintf("Talos's dry run reports no changes on all %d nodes", len(nodes)))
 
 	return nil

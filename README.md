@@ -8,7 +8,7 @@ It is built for clusters that already exist. The operator derives its resources 
 
 ## Features
 
-- **Adoption without changes.** The operator reads every node and derives the `TalosMachinePool` and `TalosMachine` resources that reproduce the cluster as it runs. They contain only what differs from Talos's generated defaults. Adoption completes when a dry-run apply on every node reports no changes. No node is rebooted or reconfigured, and from then on the resources are yours to manage.
+- **Adoption without changes.** The operator reads every node and writes the `TalosMachinePool` and `TalosMachine` resources that reproduce the cluster as it runs. They contain only what differs from Talos's generated defaults. Adoption completes when a dry-run apply on every node reports no changes. No node is rebooted or reconfigured, and from then on the resources are yours to manage.
 - **Read-only observation.** Until management is enabled, the operator uses a Talos client that rejects every API call that would modify a node.
 - **Config changes that revert by themselves.** Every change is applied in Talos's try mode, one node at a time. The operator confirms it only after the node answered through another node, sent kubelet heartbeats and stayed healthy for a soak period. Otherwise Talos restores the previous config and the rollout halts before the next node.
 - **Classified changes.** Changes to CAs, tokens and other cluster identity are refused. Changes to storage, and anything the operator has no rule for, wait for approval of that exact change.
@@ -27,8 +27,6 @@ You need:
 - installer images from [Image Factory](https://factory.talos.dev).
 
 Nothing on a node changes before step 6. The [guide](docs/guide.md) has what these steps leave out: what the conditions mean while a cluster is adopted, and what to do when a rollout halts, asks for approval, or finds a node changed by hand.
-
-> **Steps 4 and 5 arrive with the next release.** In the current release the operator does not create the resources itself: it writes them to a ConfigMap for you to apply. The guide has [that procedure](docs/guide.md#until-the-next-release).
 
 ### 1. Allow the operator to request Talos credentials
 
@@ -82,8 +80,8 @@ It then sends each node a dry-run apply of the config these resources render. Wh
 
 ```console
 $ kubectl -n talos-operator get taloscluster
-NAME         PHASE     TALOS     KUBERNETES   ADOPTED   AGE
-my-cluster   Adopted   v1.14.0   1.37.0       True      4m
+NAME         PHASE     TALOS     KUBERNETES   PROVEN   AGE
+my-cluster   Adopted   v1.14.0   1.37.0       True     4m
 
 $ kubectl -n talos-operator get talosmachinepools
 NAME                       CLUSTER      ROLE           MEMBERS   MATCHED   AGE
@@ -99,7 +97,7 @@ kubectl -n talos-operator describe taloscluster my-cluster
 
 ### 5. Take over the resources
 
-From `Adopted` on the operator never writes to these resources again. They are yours, and there is no way back to `Adopting`.
+From `Adopted` on the operator never writes to these resources again. They are yours, and there is no way back to `Adopting`. `PROVEN` keeps saying whether they still render exactly what the nodes run.
 
 You can leave them in the cluster and edit them with `kubectl`. To manage them from Git, export them and strip what the API server added (this uses [yq](https://github.com/mikefarah/yq)):
 
@@ -194,20 +192,19 @@ spec:
 | Area | State |
 |---|---|
 | Observing clusters and machines | Implemented |
-| Adoption: proposal, config comparison, dry-run proof, gated switch to `Manage` | Implemented |
+| Adoption: resources written from the live cluster, dry-run proof, gated switch to `Manage` | Implemented |
 | CRDs installed and upgraded with the chart | Implemented |
-| Adoption that creates the resources itself | Planned next |
 | Machine pools and reusable config | Implemented |
 | Drift reporting and enforcement | Implemented |
 | Applying config changes, with Talos try-mode rollback | Implemented |
 | Config changes that need a reinstall (installer image, kernel arguments) | Planned |
-| Talos and Kubernetes upgrades | Planned |
+| Talos and Kubernetes upgrades | Planned next |
 | Adding and removing machines | Planned |
 | Metrics, alerts and dashboards | Planned |
 
 The API is `v1alpha1` and may change incompatibly between releases.
 
-Adoption and config rollouts are tested in CI against Talos clusters running in QEMU. The tests assert that adoption leaves boot IDs and config hashes unchanged, that a label reaches a node without a reboot, and that a config which cuts a node off is reverted and never confirmed.
+Adoption and config rollouts are tested in CI against Talos clusters running in QEMU. The tests assert that adoption needs nothing applied by hand and leaves boot IDs and config hashes unchanged, that a label reaches a node without a reboot, and that a config which cuts a node off is reverted and never confirmed.
 
 ## Non-goals
 

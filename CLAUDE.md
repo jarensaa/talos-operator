@@ -87,6 +87,7 @@ They live in `docs/scope.md` §8 and are enforced in pure planners (`internal/pl
 - At most one control-plane node not Ready or not a healthy etcd member.
 - A node is touched only while every other node is known to be healthy (`plan.TouchGate`). The node's own health is not asked about, so a rollout can repair it; verification afterwards leaves nobody out (`plan.VerifyGate`).
 - Never pass `force`. Never write Talos-owned META keys.
+- While a cluster is being adopted, the operator writes its pools and machines by server-side apply **without force**, as `talos-operator-adoption`, and only fills empty fields of the TalosCluster. Once adopted (`status.adoption.adoptedAt`), it never writes a spec again; nothing unsets that (docs/scope.md §12.14).
 - No writes while a capability is not enabled in `spec.management`. Observe mode uses a read-only client interface, so writes are impossible by construction.
 - Fail closed: on failure, halt and surface the problem. Never move on to the next node.
 - Losing contact with a node must result in rollback (TRY-then-confirm, §8.5).

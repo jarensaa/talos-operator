@@ -96,6 +96,15 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// An adopted cluster's resources are the user's: nothing of them is recorded as the
+	// operator's any more. Giving that up on the TalosCluster changes the object this pass read,
+	// so the pass ends here and the change itself brings the next one.
+	if adopted(tc) {
+		if released, err := r.release(ctx, tc); err != nil || released {
+			return ctrl.Result{}, err
+		}
+	}
+
 	original := tc.DeepCopy()
 
 	var obs observation
@@ -114,8 +123,14 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	r.applyObservation(tc, obs)
 
 	var adoptErr error
-	if proposing(tc, obs) {
-		adoptErr = r.propose(ctx, tc, obs.facts)
+
+	if adopting(tc, obs) {
+		var filled bool
+		if filled, adoptErr = r.adopt(ctx, tc, obs); filled {
+			// The spec was filled in from the live cluster. Everything else is decided from the
+			// spec as stored, in the pass that change brings.
+			return ctrl.Result{}, nil
+		}
 	}
 
 	if adoptErr == nil && proving(tc, obs) {
@@ -174,9 +189,10 @@ func proving(tc *talosv1alpha1.TalosCluster, obs observation) bool {
 	return observeOnly && obs.facts != nil && obs.reader != nil
 }
 
-// proposing reports whether an adoption proposal is due: the cluster is observed only and every
-// adoption precondition holds (docs/scope.md §7.1 stage 1).
-func proposing(tc *talosv1alpha1.TalosCluster, obs observation) bool {
+// adopting reports whether the adoption step runs: the cluster is observed only and every
+// adoption precondition holds (docs/scope.md §7.1 stage 1). The step itself only writes resources
+// until the cluster is adopted; after that it keeps checking the secrets bundle against the nodes.
+func adopting(tc *talosv1alpha1.TalosCluster, obs observation) bool {
 	observeOnly := tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == ""
 
 	return observeOnly && obs.facts != nil &&
@@ -486,9 +502,18 @@ func (r *TalosClusterReconciler) applyObservation(tc *talosv1alpha1.TalosCluster
 	st.ObservedGeneration = gen
 
 	if tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == "" {
-		st.Phase = talosv1alpha1.ClusterPhaseObserving
+		st.Phase = talosv1alpha1.ClusterPhaseAdopting
+		if adopted(tc) {
+			st.Phase = talosv1alpha1.ClusterPhaseAdopted
+		}
+
 		forgetHandover(st)
 		r.abandonOperation(tc)
+	}
+
+	if adopted(tc) {
+		setCondition(st, gen, talosv1alpha1.ConditionResourcesDerived, metav1.ConditionTrue, talosv1alpha1.ReasonHandedOver,
+			"the cluster is adopted: its TalosMachinePools and TalosMachines are yours, and the operator does not write them")
 	}
 
 	if obs.credsErr != nil {
@@ -788,7 +813,6 @@ func (r *TalosClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&talosv1alpha1.TalosCluster{}).
-		Owns(&corev1.ConfigMap{}).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(target.ClustersForSecret(mgr.GetClient()))).
 		Watches(&talosv1alpha1.TalosMachine{}, handler.EnqueueRequestsFromMapFunc(clusterOfMachine(mgr.GetClient()))).
 		Watches(&talosv1alpha1.TalosMachinePool{}, handler.EnqueueRequestsFromMapFunc(clusterOfPool)).

@@ -424,16 +424,17 @@ var _ = Describe("Config rollout", func() {
 		reconciler = newReconciler()
 		machineReconciler = &TalosMachineReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Resolver: reconciler.Resolver}
 
-		// Adopt: the first pass publishes the bundle the machines render with.
-		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(tc)})
-		Expect(err).NotTo(HaveOccurred())
-
+		// The specs bring their own machines, under their own names, so the operator writes none.
 		for _, n := range rolloutNodes {
 			Expect(k8sClient.Create(ctx, machine(ns, n.machine, n.role, n.addr, n.uuid))).To(Succeed())
 		}
 
+		// Adopt: the first pass stores the bundle the machines render with.
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(tc)})
+		Expect(err).NotTo(HaveOccurred())
+
 		settle(nil)
-		Expect(condition(tc, talosv1alpha1.ConditionAdopted).Status).To(Equal(metav1.ConditionTrue), "the cluster must adopt cleanly")
+		Expect(condition(tc, talosv1alpha1.ConditionConfigProven).Status).To(Equal(metav1.ConditionTrue), "the cluster must adopt cleanly")
 
 		updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Management.Config = talosv1alpha1.ConfigManagementManage })
 		settle(nil)
@@ -1120,7 +1121,7 @@ var _ = Describe("Config rollout", func() {
 
 		Expect(operation()).To(BeNil())
 		Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-		Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseObserving))
+		Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseAdopted))
 		Expect(applies()).To(Equal([]string{tried(worker1)}), "observing writes nothing: Talos reverts the try by itself")
 		Expect(scenario.TryPending(workerAddr)).To(BeTrue())
 	})

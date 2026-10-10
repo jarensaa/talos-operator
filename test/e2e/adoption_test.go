@@ -35,7 +35,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
-	sigsyaml "sigs.k8s.io/yaml"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/plan"
@@ -148,6 +147,8 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		machines []*talosv1alpha1.TalosMachine
 		harness  talos.Reader
 		nodes    []netip.Addr
+		// untouched is every node's state before the TalosCluster existed.
+		untouched map[netip.Addr]nodeState
 	)
 
 	conditionTrue := func(ctx context.Context, obj client.Object, conditions func() []metav1.Condition, condType string,
@@ -244,22 +245,33 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		harness = harnessReader(ctx)
 		nodes = harnessNodes()
 		pools = map[talosv1alpha1.MachineRole]*talosv1alpha1.TalosMachinePool{}
+		untouched = snapshot(ctx, harness, nodes)
 
+		// All a user does to have a cluster adopted: a TalosCluster with nothing in it.
 		tc = &talosv1alpha1.TalosCluster{ObjectMeta: metav1.ObjectMeta{Name: "adopt", Namespace: testNamespace}}
 		Expect(k8sClient.Create(ctx, tc)).To(Succeed())
 	})
 
 	AfterAll(func(ctx context.Context) {
-		// Machines before their pools: a pool with members waits.
-		for _, tm := range machines {
-			deleteMachine(ctx, tm)
-		}
-
-		for _, pool := range pools {
-			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, pool))).To(Succeed())
-		}
-
+		// The TalosCluster first, so that nothing is written again; then machines before their
+		// pools, because a pool with members waits. None of them is owned by the TalosCluster.
 		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, tc))).To(Succeed())
+
+		ofCluster := []client.ListOption{client.InNamespace(testNamespace), client.MatchingLabels{talosv1alpha1.LabelCluster: tc.Name}}
+
+		var written talosv1alpha1.TalosMachineList
+		Expect(k8sClient.List(ctx, &written, ofCluster...)).To(Succeed())
+
+		for i := range written.Items {
+			deleteMachine(ctx, &written.Items[i])
+		}
+
+		var writtenPools talosv1alpha1.TalosMachinePoolList
+		Expect(k8sClient.List(ctx, &writtenPools, ofCluster...)).To(Succeed())
+
+		for i := range writtenPools.Items {
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, &writtenPools.Items[i]))).To(Succeed())
+		}
 
 		// Kept on purpose when a TalosCluster goes (no ownerRef), so the suite removes them.
 		for _, name := range []string{"adopt-talos-secrets", "adopt-adoption-backup"} {
@@ -268,30 +280,118 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}
 	})
 
-	// Observe, review the proposal, commit it, and let Talos prove that it changes nothing.
-	It("adopts the cluster from its own proposal without changing a node", func(ctx context.Context) {
-		before := snapshot(ctx, harness, nodes)
+	// No credentials are supplied: the operator requests its certificate from Talos, which the
+	// harness allows for this namespace (hack/e2e/patches/controlplane.patch.yaml).
+	It("reports the live cluster's state in TalosCluster status", func(ctx context.Context) {
+		for _, c := range []string{
+			talosv1alpha1.ConditionCredentialsValid, talosv1alpha1.ConditionTalosAPIReachable,
+			talosv1alpha1.ConditionAdoptionPreconditionsMet, talosv1alpha1.ConditionHealthy,
+		} {
+			Eventually(conditionTrue(ctx, tc, clusterConditions, c)).WithContext(ctx).WithTimeout(2 * time.Minute).Should(Succeed())
+		}
 
-		By("waiting for the operator's proposal")
-		Eventually(conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionAdoptionProposed)).
-			WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
+		Expect(tc.Status.Observed.EtcdMembers).NotTo(BeEmpty())
+		Expect(tc.Status.Observed.KubernetesVersion).To(HavePrefix("1."))
 
-		proposal := &corev1.ConfigMap{}
-		proposalKey := client.ObjectKey{Namespace: testNamespace, Name: tc.Status.Adoption.ProposalRef.Name}
-		Expect(k8sClient.Get(ctx, proposalKey, proposal)).To(Succeed())
+		var observed int32
+		for tag, n := range tc.Status.Observed.TalosVersions {
+			Expect(tag).To(HavePrefix("v1.14."))
+			observed += n
+		}
 
-		By("committing the proposal as a user would")
-		proposed := &talosv1alpha1.TalosCluster{}
-		Expect(sigsyaml.Unmarshal([]byte(proposal.Data["taloscluster.yaml"]), proposed)).To(Succeed())
+		Expect(int(observed)).To(Equal(len(nodes)), "every node's Talos version is observed")
+	}, NodeTimeout(5*time.Minute))
 
-		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
-			tc.Spec = proposed.Spec
-			tc.Spec.Rollout.Soak = &metav1.Duration{Duration: e2eSoak}
-			tc.Spec.Rollout.TryTimeout = &metav1.Duration{Duration: e2eTryTimeout}
-		})
+	// The whole of adoption, with nothing applied by hand (docs/scope.md §7.1, §12.14): the
+	// operator writes the resources that describe the cluster, Talos proves that they change
+	// nothing, and from then on they are the user's.
+	It("adopts the cluster by writing the resources that describe it, without changing a node", func(ctx context.Context) {
+		By("waiting for the operator to write the resources and for Talos's dry run to prove them")
+		Eventually(func(g Gomega) {
+			conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionConfigProven)(g)
+			g.Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseAdopted))
+		}).WithContext(ctx).WithTimeout(5 * time.Minute).Should(Succeed())
 
-		By("checking that the API server refuses config: Manage before adoption is proven")
-		gate := ContainSubstring("may become Manage only once status shows Adopted=True")
+		Expect(tc.Status.Adoption.AdoptedAt).NotTo(BeNil())
+		Expect(tc.Status.Adoption.LiveConfigHashes).To(HaveLen(len(nodes)))
+		Expect(tc.Spec.ClusterName).NotTo(BeEmpty(), "what the spec left empty is filled in from the cluster")
+		Expect(tc.Spec.Versions).NotTo(BeNil())
+		Expect(tc.Spec.ConfigGeneration).NotTo(BeNil())
+		Expect(tc.Spec.Management.Config).To(Equal(talosv1alpha1.ConfigManagementObserve), "adoption never switches management on")
+
+		By("collecting what it wrote: a pool per role and a machine per node")
+		ofCluster := []client.ListOption{client.InNamespace(testNamespace), client.MatchingLabels{talosv1alpha1.LabelCluster: tc.Name}}
+
+		var writtenPools talosv1alpha1.TalosMachinePoolList
+		Expect(k8sClient.List(ctx, &writtenPools, ofCluster...)).To(Succeed())
+
+		for i := range writtenPools.Items {
+			pools[writtenPools.Items[i].Spec.Role] = &writtenPools.Items[i]
+		}
+
+		Expect(pools).To(HaveKey(talosv1alpha1.MachineRoleControlPlane))
+
+		var written talosv1alpha1.TalosMachineList
+		Expect(k8sClient.List(ctx, &written, ofCluster...)).To(Succeed())
+		Expect(written.Items).To(HaveLen(len(nodes)), "one TalosMachine per node")
+
+		for i := range written.Items {
+			tm := &written.Items[i]
+			machines = append(machines, tm)
+
+			By("checking that " + tm.Name + " is pinned to the hardware at its address, and matches it")
+			si, err := harness.SystemInformation(ctx, netip.MustParseAddr(tm.Spec.Address))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(tm.Spec.Identity.SystemUUID).To(Equal(si.UUID))
+
+			machineConditions := func() []metav1.Condition { return tm.Status.Conditions }
+			// Evaluated on failure, so it shows the latest diff.
+			lastDiff := func() string { return "TalosMachine " + tm.Name + " diff:\n" + diffOf(tm) }
+
+			Eventually(conditionTrue(ctx, tm, machineConditions, talosv1alpha1.ConditionMatched)).WithContext(ctx).Should(Succeed())
+			Eventually(conditionTrue(ctx, tm, machineConditions, talosv1alpha1.ConditionConfigMatchesLive)).
+				WithContext(ctx).WithTimeout(2*time.Minute).Should(Succeed(), lastDiff)
+			Expect(tm.Status.Phase).To(Equal(talosv1alpha1.MachinePhase("Ready")))
+			Expect(tm.Status.Config.LiveHash).To(HavePrefix("sha256:"))
+		}
+
+		By("checking that the operator let go of them: it owns nothing of their specs any more")
+		ownsSpec := func(obj client.Object) bool {
+			return slices.ContainsFunc(obj.GetManagedFields(), func(e metav1.ManagedFieldsEntry) bool {
+				return e.Manager == "talos-operator-adoption" && e.FieldsV1 != nil && strings.Contains(e.FieldsV1.GetRawString(), `"f:spec"`)
+			})
+		}
+
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(ownsSpec(tc)).To(BeFalse(), "TalosCluster")
+
+			for _, tm := range machines {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tm), tm)).To(Succeed())
+				g.Expect(ownsSpec(tm)).To(BeFalse(), "TalosMachine %s", tm.Name)
+			}
+
+			for _, pool := range pools {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool)).To(Succeed())
+				g.Expect(ownsSpec(pool)).To(BeFalse(), "TalosMachinePool %s", pool.Name)
+			}
+		}).WithContext(ctx).WithTimeout(time.Minute).Should(Succeed())
+
+		By("editing a pool before management is on: the edit is caught, and the API server refuses config: Manage")
+		controlPlaneConfig := poolConfig(ctx, talosv1alpha1.MachineRoleControlPlane)
+		setPoolConfig(ctx, talosv1alpha1.MachineRoleControlPlane, with(controlPlaneConfig, labelDocument("early")))
+
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+
+			proven := meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionConfigProven)
+			g.Expect(proven).NotTo(BeNil())
+			g.Expect(proven.Status).To(Equal(metav1.ConditionFalse), proven.Message)
+			g.Expect(proven.Reason).To(Equal(talosv1alpha1.ReasonProofInvalidated))
+			g.Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseAdopted), "an adopted cluster is never adopting again")
+		}).WithContext(ctx).WithTimeout(2 * time.Minute).Should(Succeed())
+
+		gate := ContainSubstring("may become Manage only once status shows ConfigProven=True")
 
 		// The operator writes status all the time, so an update may lose to it: only the admission
 		// policy's own refusal counts, on the object as it is now.
@@ -306,42 +406,14 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		refresh(ctx, Default)
 		Expect(tc.Spec.Management.Config).To(Equal(talosv1alpha1.ConfigManagementObserve), "a refused update changes nothing")
 
-		for doc := range strings.SplitSeq(proposal.Data["talosmachinepools.yaml"], "\n---\n") {
-			pool := &talosv1alpha1.TalosMachinePool{}
-			Expect(sigsyaml.Unmarshal([]byte(doc), pool)).To(Succeed())
-			Expect(k8sClient.Create(ctx, pool)).To(Succeed())
-
-			pools[pool.Spec.Role] = pool
-		}
-
-		for doc := range strings.SplitSeq(proposal.Data["talosmachines.yaml"], "\n---\n") {
-			tm := &talosv1alpha1.TalosMachine{}
-			Expect(sigsyaml.Unmarshal([]byte(doc), tm)).To(Succeed())
-			Expect(k8sClient.Create(ctx, tm)).To(Succeed())
-
-			machines = append(machines, tm)
-		}
-
-		Expect(machines).To(HaveLen(len(nodes)), "one proposed TalosMachine per node")
-
-		By("waiting for every machine to match its live config")
-		for _, tm := range machines {
-			machineConditions := func() []metav1.Condition { return tm.Status.Conditions }
-			// Evaluated on failure, so it shows the latest diff.
-			lastDiff := func() string { return "TalosMachine " + tm.Name + " diff:\n" + diffOf(tm) }
-
-			Eventually(conditionTrue(ctx, tm, machineConditions, talosv1alpha1.ConditionConfigMatchesLive)).
-				WithContext(ctx).WithTimeout(2*time.Minute).Should(Succeed(), lastDiff)
-		}
-
-		By("waiting for Talos's own dry run to prove adoption")
-		Eventually(conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionAdopted)).
+		setPoolConfig(ctx, talosv1alpha1.MachineRoleControlPlane, controlPlaneConfig)
+		Eventually(conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionConfigProven)).
 			WithContext(ctx).WithTimeout(2 * time.Minute).Should(Succeed())
-		Expect(tc.Status.Adoption.LiveConfigHashes).To(HaveLen(len(machines)))
-		Expect(tc.Status.Adoption.ProvenAt).NotTo(BeNil())
 
 		By("entering config: Manage, which must change nothing")
 		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
+			tc.Spec.Rollout.Soak = &metav1.Duration{Duration: e2eSoak}
+			tc.Spec.Rollout.TryTimeout = &metav1.Duration{Duration: e2eTryTimeout}
 			tc.Spec.Management.Config = talosv1alpha1.ConfigManagementManage
 		})
 
@@ -351,9 +423,9 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseManaged))
 
 		By("checking that no node changed and nothing mutating was attempted")
-		Expect(snapshot(ctx, harness, nodes)).To(Equal(before))
+		Expect(snapshot(ctx, harness, nodes)).To(Equal(untouched))
 		Expect(rejectedRPCs()).To(BeZero())
-	}, NodeTimeout(10*time.Minute))
+	}, NodeTimeout(15*time.Minute))
 
 	// A change of the spec reaches the nodes: applied in try mode, verified from outside, and
 	// confirmed only after the node stayed healthy (docs/scope.md §8.5.1).

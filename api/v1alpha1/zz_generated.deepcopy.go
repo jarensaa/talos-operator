@@ -21,7 +21,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -34,10 +33,14 @@ func (in *AdoptionStatus) DeepCopyInto(out *AdoptionStatus) {
 		*out = make([]Precondition, len(*in))
 		copy(*out, *in)
 	}
-	if in.ProposalRef != nil {
-		in, out := &in.ProposalRef, &out.ProposalRef
-		*out = new(corev1.LocalObjectReference)
-		**out = **in
+	if in.AdoptedAt != nil {
+		in, out := &in.AdoptedAt, &out.AdoptedAt
+		*out = (*in).DeepCopy()
+	}
+	if in.Notes != nil {
+		in, out := &in.Notes, &out.Notes
+		*out = make([]string, len(*in))
+		copy(*out, *in)
 	}
 	if in.UnmatchedMembers != nil {
 		in, out := &in.UnmatchedMembers, &out.UnmatchedMembers
