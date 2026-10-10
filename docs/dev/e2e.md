@@ -25,6 +25,7 @@ Knobs (environment variables for `hack/e2e/cluster-up.sh`):
 | `MAINTENANCE_NODES` | `0` | Extra workers left unconfigured, for expansion tests (M7) |
 | `SCHEMATIC_ID` | vanilla schematic | Installer schematic |
 | `VM_CPUS` / `VM_MEMORY` | `2.0` / `2GiB` | Per-VM resources (CI uses less) |
+| `WORKER_MEMORY` | `VM_MEMORY` | Memory per worker VM, when workers can be smaller than control planes |
 
 ## Why QEMU, and why sudo
 
@@ -54,7 +55,15 @@ Local runs are optional. The `E2E` workflow (`.github/workflows/e2e.yml`) runs t
 
 The job starts cluster creation in the background as soon as QEMU and `talosctl` are installed. Go setup and `make test-e2e-build` run while the VMs boot, so only the tests themselves wait for the cluster. `make test-e2e` runs only tests named `TestE2E*`; unit tests in the same packages run in the Tests workflow.
 
-Standard private-repo runners have 2 vCPUs and 7 GB RAM, so CI uses one control plane and one worker (`CONTROLPLANES=1 WORKERS=1 VM_CPUS=1.0`). Multi-control-plane scenarios (etcd membership, rolling control-plane upgrades in M4/M7/M8) will need a larger runner.
+Every pull request runs one control plane and one worker (`CONTROLPLANES=1 WORKERS=1 VM_CPUS=1.0`), which is quick and fits any runner.
+
+**Other cluster shapes run on request.** A manual run of the workflow takes the number of control planes and workers, and the memory per worker, as inputs:
+
+```bash
+gh workflow run e2e.yml -f controlplanes=3 -f workers=1 -f worker_memory=1GiB
+```
+
+Three control planes, with and without a 1 GiB worker, have passed on a runner with 2 vCPUs and 8 GB. Scenarios that need several control planes (serialising them in an upgrade, growing or replacing them) are run this way: they cost more time and are not a required check.
 
 What the suite covers on that cluster, in order and on one TalosCluster: adoption from the operator's own proposal with no node changed; a label rolled out to the worker without a reboot; a protected field refused; and a config that makes the worker drop everything it sends to the control planes, which Talos must revert while the operator confirms nothing and leaves the control plane's own pending change unapplied. The last one waits out a four-minute try window, during which the worker is offline; `make test-e2e` therefore runs its packages one after the other.
 

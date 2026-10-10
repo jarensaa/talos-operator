@@ -4,7 +4,19 @@ name: E2E
 # passwordless and /dev/kvm is available. This is the project's e2e path; local runs are optional.
 
 on:
+  # A manual run can ask for another cluster shape, such as three control planes. Those runs cost
+  # more and are not a required check.
   workflow_dispatch:
+    inputs:
+      controlplanes:
+        description: Control-plane nodes
+        default: "1"
+      workers:
+        description: Worker nodes
+        default: "1"
+      worker_memory:
+        description: Memory per worker VM
+        default: 2GiB
   # Weekly drift check against new Image Factory builds and Talos releases (Monday 03:00 UTC).
   schedule:
     - cron: "0 3 * * 1"
@@ -14,16 +26,18 @@ on:
   pull_request:
 
 concurrency:
-  group: e2e-${{ github.ref }}
+  # Runs of different cluster shapes on one ref do not cancel each other.
+  group: e2e-${{ github.ref }}-${{ inputs.controlplanes || '1' }}-${{ inputs.workers || '1' }}
   cancel-in-progress: true
 
 env:
   TALOSCTL_VERSION: v1.14.2
-  # Standard private-repo runners have 2 vCPUs and 7 GB RAM: one control plane and one worker fit.
-  CONTROLPLANES: "1"
-  WORKERS: "1"
+  # One control plane and one worker by default: quick, and it fits the smallest runner.
+  CONTROLPLANES: ${{ inputs.controlplanes || '1' }}
+  WORKERS: ${{ inputs.workers || '1' }}
   VM_CPUS: "1.0"
   VM_MEMORY: 2GiB
+  WORKER_MEMORY: ${{ inputs.worker_memory || '2GiB' }}
 
 jobs:
   changes:

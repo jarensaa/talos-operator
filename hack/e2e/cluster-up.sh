@@ -22,6 +22,7 @@ CIDR_PREFIX=${CIDR_PREFIX:-10.5.0}
 # Per-VM resources; CI runners are small, so these are tunable.
 VM_CPUS=${VM_CPUS:-2.0}
 VM_MEMORY=${VM_MEMORY:-2GiB}
+WORKER_MEMORY=${WORKER_MEMORY:-$VM_MEMORY}
 # The vanilla Image Factory schematic (no extensions).
 SCHEMATIC_ID=${SCHEMATIC_ID:-376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba}
 INSTALL_IMAGE="factory.talos.dev/metal-installer/${SCHEMATIC_ID}:${TALOS_VERSION}"
@@ -110,7 +111,7 @@ if [[ ! -d "$STATE_DIR/$CLUSTER_NAME" ]]; then
     --cpus-controlplanes "$VM_CPUS" \
     --cpus-workers "$VM_CPUS" \
     --memory-controlplanes "$VM_MEMORY" \
-    --memory-workers "$VM_MEMORY" \
+    --memory-workers "$WORKER_MEMORY" \
     --presets iso,maintenance \
     --talosconfig-destination "$E2E_DIR/provisioner/talosconfig")
   # Files written under sudo belong to root; the state directory stays root-owned for QEMU.
