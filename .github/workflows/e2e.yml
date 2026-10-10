@@ -4,8 +4,8 @@ name: E2E
 # passwordless and /dev/kvm is available. This is the project's e2e path; local runs are optional.
 
 on:
-  # A manual run can ask for another cluster shape, such as three control planes. Those runs cost
-  # more and are not a required check.
+  # A manual run can ask for another cluster shape, such as three control planes. Those runs take
+  # longer and are not a required check (docs/scope.md §12.13).
   workflow_dispatch:
     inputs:
       controlplanes:
@@ -18,6 +18,7 @@ on:
         description: Memory per worker VM
         default: 2GiB
   # Weekly drift check against new Image Factory builds and Talos releases (Monday 03:00 UTC).
+  # It runs three control planes, so that shape is exercised without anyone having to remember it.
   schedule:
     - cron: "0 3 * * 1"
   # Runs on every pull request so "QEMU Talos cluster" can be a required check. The changes job
@@ -27,13 +28,14 @@ on:
 
 concurrency:
   # Runs of different cluster shapes on one ref do not cancel each other.
-  group: e2e-${{ github.ref }}-${{ inputs.controlplanes || '1' }}-${{ inputs.workers || '1' }}
+  group: e2e-${{ github.ref }}-${{ inputs.controlplanes || (github.event_name == 'schedule' && '3') || '1' }}-${{ inputs.workers || '1' }}
   cancel-in-progress: true
 
 env:
   TALOSCTL_VERSION: v1.14.2
-  # One control plane and one worker by default: quick, and it fits the smallest runner.
-  CONTROLPLANES: ${{ inputs.controlplanes || '1' }}
+  # One control plane and one worker for pull requests: quick, and enough for what every change
+  # must show. The weekly run has three control planes.
+  CONTROLPLANES: ${{ inputs.controlplanes || (github.event_name == 'schedule' && '3') || '1' }}
   WORKERS: ${{ inputs.workers || '1' }}
   VM_CPUS: "1.0"
   VM_MEMORY: 2GiB

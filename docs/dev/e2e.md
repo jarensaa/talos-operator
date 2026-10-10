@@ -50,20 +50,26 @@ Addresses: the provisioner assigns `10.5.0.1` to the gateway, then control plane
 
 Local runs are optional. The `E2E` workflow (`.github/workflows/e2e.yml`) runs the same harness on a GitHub-hosted Linux runner, where sudo is passwordless and `/dev/kvm` is available. It runs:
 - on every pull request. A first job skips the cluster when nothing it exercises changed, so the check can be required;
-- weekly (Mondays), to catch drift such as new Image Factory builds or Talos releases;
-- on demand (`workflow_dispatch`).
+- weekly (Mondays), with three control planes, to catch drift such as new Image Factory builds or Talos releases;
+- on demand (`workflow_dispatch`), with the cluster shape you ask for.
 
 The job starts cluster creation in the background as soon as QEMU and `talosctl` are installed. Go setup and `make test-e2e-build` run while the VMs boot, so only the tests themselves wait for the cluster. `make test-e2e` runs only tests named `TestE2E*`; unit tests in the same packages run in the Tests workflow.
 
-Every pull request runs one control plane and one worker (`CONTROLPLANES=1 WORKERS=1 VM_CPUS=1.0`), which is quick and fits any runner.
+Every pull request runs one control plane and one worker (`CONTROLPLANES=1 WORKERS=1 VM_CPUS=1.0`), which is quick and is the required check.
 
-**Other cluster shapes run on request.** A manual run of the workflow takes the number of control planes and workers, and the memory per worker, as inputs:
+**Three control planes run weekly, and on request** (docs/scope.md §12.13). A manual run of the workflow takes the number of control planes and workers, and the memory per worker, as inputs, and `--ref` picks the branch:
 
 ```bash
-gh workflow run e2e.yml -f controlplanes=3 -f workers=1 -f worker_memory=1GiB
+gh workflow run e2e.yml --ref my-branch -f controlplanes=3 -f workers=1
 ```
 
-Three control planes, with and without a 1 GiB worker, have passed on a runner with 2 vCPUs and 8 GB. Scenarios that need several control planes (serialising them in an upgrade, growing or replacing them) are run this way: they cost more time and are not a required check.
+This is where scenarios that need several control planes are shown: serialising them in an upgrade, growing them, replacing one. The rules that keep that honest:
+
+- **A change to how control planes are handled is run this way before it is merged**, and the pull request links the run. That covers the order and gates of a rollout, upgrades, etcd membership, and adding or removing a control plane. The pull request's own check cannot show any of it.
+- **A spec that needs several control planes says so and skips on a smaller cluster**, with a message that names what it needs. It must never pass without having run.
+- **It is not a required check.** A failure of the weekly run is a failure of `main` and is looked at like one.
+
+The runner is GitHub's standard hosted one, which for a public repository has 4 vCPUs and 16 GB. Three control planes and a worker at 2 GiB each use half of that memory, and the whole run takes about as long as a pull request's. No larger or self-hosted runner is involved.
 
 What the suite covers on that cluster, in order and on one TalosCluster: adoption from the operator's own proposal with no node changed; a label rolled out to the worker without a reboot; a protected field refused; and a config that makes the worker drop everything it sends to the control planes, which Talos must revert while the operator confirms nothing and leaves the control plane's own pending change unapplied. The last one waits out a four-minute try window, during which the worker is offline; `make test-e2e` therefore runs its packages one after the other.
 
