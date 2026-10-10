@@ -34,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/plan"
@@ -65,26 +64,12 @@ func snapshot(ctx context.Context, r talos.Reader, nodes []netip.Addr) map[netip
 	return out
 }
 
-// rejectedRPCs sums talos_operator_rejected_rpcs_total from the in-process manager's registry.
-func rejectedRPCs() float64 {
+// rejectedRPCs is how many Talos calls the operator's own allowlist refused: mutations that a
+// connection was not allowed to make. Nothing the operator does should ever get that far.
+func rejectedRPCs(ctx context.Context) float64 {
 	GinkgoHelper()
 
-	families, err := metrics.Registry.Gather()
-	Expect(err).NotTo(HaveOccurred())
-
-	var total float64
-
-	for _, f := range families {
-		if f.GetName() != "talos_operator_rejected_rpcs_total" {
-			continue
-		}
-
-		for _, m := range f.GetMetric() {
-			total += m.GetCounter().GetValue()
-		}
-	}
-
-	return total
+	return operatorCounter(ctx, "talos_operator_rejected_rpcs_total")
 }
 
 // The spec cluster's rollout timings. The soak is long enough for a real kubelet to prove itself
@@ -424,7 +409,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		By("checking that no node changed and nothing mutating was attempted")
 		Expect(snapshot(ctx, harness, nodes)).To(Equal(untouched))
-		Expect(rejectedRPCs()).To(BeZero())
+		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(15*time.Minute))
 
 	// A change of the spec reaches the nodes: applied in try mode, verified from outside, and
@@ -478,8 +463,77 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			}
 		}
 
-		Expect(rejectedRPCs()).To(BeZero())
+		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(15*time.Minute))
+
+	// Two replicas, and every step persisted before its side effect: when the leader dies in the
+	// middle of a node's try, the other replica takes the rollout over from what is in status and
+	// on the node, and finishes it (docs/scope.md §4.2, §8.5.1).
+	It("finishes a rollout when the operator's leader is killed in the middle of it", func(ctx context.Context) {
+		workers := addrsOf("E2E_WORKERS")
+		if len(workers) == 0 {
+			Skip("the harness cluster has no worker")
+		}
+
+		before := snapshot(ctx, harness, nodes)
+		ended := rollouts(ctx)
+
+		setPoolConfig(ctx, talosv1alpha1.MachineRoleWorker,
+			with(poolConfig(ctx, talosv1alpha1.MachineRoleWorker), labelDocument("two")))
+
+		By("waiting until a node's config is tried and being verified")
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(tc.Status.Operation).NotTo(BeNil(), "no rollout in flight")
+			g.Expect(tc.Status.Operation.Current).NotTo(BeNil())
+			g.Expect(tc.Status.Operation.Current.Step).To(Equal(plan.StepVerifying))
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).WithPolling(time.Second).Should(Succeed())
+
+		By("killing the leader: no grace, so it cannot hand its lease over")
+		leader := operatorLeader(ctx, Default)
+		Expect(leader).NotTo(BeNil(), "the Lease is held by none of the operator's pods")
+		Expect(k8sClient.Delete(ctx, leader, client.GracePeriodSeconds(0))).To(Succeed())
+
+		By("waiting for another replica to lead")
+		Eventually(func(g Gomega) {
+			successor := operatorLeader(ctx, g)
+			g.Expect(successor).NotTo(BeNil())
+			g.Expect(successor.Name).NotTo(Equal(leader.Name))
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
+
+		By("waiting for the rollout to finish under the new leader")
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
+			g.Expect(tc.Status.History).To(HaveLen(ended + 1))
+		}).WithContext(ctx).WithTimeout(time.Duration(len(workers)) * 6 * time.Minute).Should(Succeed())
+
+		record := tc.Status.History[0]
+		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		Expect(record.Completed).To(HaveLen(len(workers)))
+		inSync(ctx, time.Minute)
+
+		By("checking that the change arrived everywhere, confirmed, and nothing rebooted")
+		Eventually(func(g Gomega) {
+			var labelled corev1.NodeList
+			g.Expect(k8sClient.List(ctx, &labelled, client.MatchingLabels{rolloutLabel: "two"})).To(Succeed())
+			g.Expect(labelled.Items).To(HaveLen(len(workers)))
+		}).WithContext(ctx).WithTimeout(time.Minute).Should(Succeed())
+
+		after := snapshot(ctx, harness, nodes)
+
+		for _, n := range nodes {
+			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
+
+			if slices.Contains(workers, n) {
+				cfgs, err := harness.MachineConfig(ctx, n)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(cfgs.PendingConfigChange()).To(BeFalse(), "nothing is left tried on %s", n)
+			}
+		}
+
+		Expect(rejectedRPCs(ctx)).To(BeZero())
+	}, NodeTimeout(20*time.Minute))
 
 	// A rollout may touch a node that is unhealthy, as long as it is the only one: that is how a
 	// config that broke a node is taken back (docs/scope.md §6.3, §8.3). Here the admin breaks a
@@ -593,7 +647,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Rollout.DriftPolicy = policy })
 		inSync(ctx, time.Minute)
-		Expect(rejectedRPCs()).To(BeZero())
+		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(e2eTryTimeout+15*time.Minute))
 
 	It("refuses to change a protected field", func(ctx context.Context) {
@@ -708,7 +762,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		// The cluster is whole again once the worker's kubelet is back.
 		inSync(ctx, 5*time.Minute)
 		Expect(snapshot(ctx, harness, nodes)).To(Equal(before))
-		Expect(rejectedRPCs()).To(BeZero())
+		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(e2eTryTimeout+25*time.Minute))
 })
 
