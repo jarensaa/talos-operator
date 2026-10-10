@@ -903,10 +903,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 			Expect(backup.Data).To(HaveKey(cpNodename + ".yaml"))
 			Expect(backup.Data).To(HaveKey(workerNodename + ".yaml"))
 
-			By("leaving no proposal behind: the resources are the record")
-			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: clusterName + "-adoption-proposal"}, &corev1.ConfigMap{})).
-				To(Satisfy(apierrors.IsNotFound))
-
 			By("proving that they render what the nodes run")
 			reconcileAll()
 			reconcileAll()

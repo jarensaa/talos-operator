@@ -2,27 +2,6 @@
 
 The [README](../README.md#getting-started) takes you from installing the operator to a first config change. This guide has what those steps leave out.
 
-## Upgrading from 0.4
-
-Up to 0.4 the chart installed the CRDs once and never upgraded them. From 0.5 on they are part of the release, so `helm upgrade` upgrades them, and uninstalling the chart leaves them and every object of theirs in place.
-
-Helm does not take over objects it did not create, so an upgrade from 0.4 needs the existing CRDs handed to the release first, once:
-
-```bash
-for crd in talosclusters talosmachinepools talosmachines talosmachineconfigs; do
-  kubectl label crd "$crd.talos.jarensaa.github.io" app.kubernetes.io/managed-by=Helm
-  kubectl annotate crd "$crd.talos.jarensaa.github.io" \
-    meta.helm.sh/release-name=talos-operator meta.helm.sh/release-namespace=talos-operator
-done
-```
-
-Use your own release name and namespace if they differ. If you install CRDs some other way, set `crds.enabled=false` instead.
-
-Two more things changed with adoption in 0.6:
-
-- The operator no longer writes a proposal to a ConfigMap. If you have `<cluster>-adoption-proposal` from 0.4, delete it; nothing reads it.
-- The `Adopted` condition is now `ConfigProven`, and the phase `Observing` is gone: a cluster is `Adopting` until it is first proven and `Adopted` from then on. A cluster that 0.4 had proven or managed is `Adopted`, and the operator writes nothing for it.
-
 ## Allowing Talos API access
 
 The `KubeTalosAPIAccessConfig` document of step 1 is the one change you make to your nodes yourself. Patch one control plane at a time, with a dry run first to see what it changes and whether Talos wants a reboot for it:

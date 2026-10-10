@@ -501,19 +501,6 @@ func (r *TalosClusterReconciler) applyObservation(tc *talosv1alpha1.TalosCluster
 
 	st.ObservedGeneration = gen
 
-	// What an earlier release reported under other names.
-	meta.RemoveStatusCondition(&st.Conditions, "Adopted")
-	meta.RemoveStatusCondition(&st.Conditions, "AdoptionProposed")
-
-	// A cluster proven or managed before the operator recorded adoption is adopted all the same.
-	if st.Adoption != nil && st.Adoption.AdoptedAt == nil && (st.Adoption.ProvenAt != nil || managing(tc)) {
-		st.Adoption.AdoptedAt = st.Adoption.ProvenAt
-		if st.Adoption.AdoptedAt == nil {
-			now := metav1.NewTime(r.now())
-			st.Adoption.AdoptedAt = &now
-		}
-	}
-
 	if tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == "" {
 		st.Phase = talosv1alpha1.ClusterPhaseAdopting
 		if adopted(tc) {
