@@ -74,7 +74,14 @@ var (
 
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "talos-operator e2e suite")
+
+	// Ginkgo ends a suite after an hour unless told otherwise. This one upgrades Talos and then
+	// Kubernetes on every node, and takes longer than that on the larger clusters. `go test
+	// -timeout` (Makefile) is the bound that counts.
+	suite, reporter := GinkgoConfiguration()
+	suite.Timeout = 150 * time.Minute
+
+	RunSpecs(t, "talos-operator e2e suite", suite, reporter)
 }
 
 // The suite starts nothing itself: the operator under test is the one the chart installed, with

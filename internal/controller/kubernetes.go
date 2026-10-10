@@ -660,7 +660,7 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 
 		return action.Message, nil
 	case plan.Rearm:
-		deadline := metav1.NewTime(now.Add(timing.TryTimeout))
+		deadline := metav1.NewTime(now.Add(plan.KubernetesTryTimeout(cur.Component, timing)))
 		cur.Deadline = &deadline
 	case plan.Pull:
 		return r.pullComponent(ctx, tc, obs, v, timing, now)
@@ -727,7 +727,7 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 	}
 
 	// The deadline is persisted before the try is sent, as in a config rollout.
-	deadline := metav1.NewTime(now.Add(timing.TryTimeout))
+	deadline := metav1.NewTime(now.Add(plan.KubernetesTryTimeout(cur.Component, timing)))
 
 	if !plan.Runs(cur.Component) {
 		// Nothing on the node runs from this image, so there is nothing to pull to it.

@@ -384,3 +384,30 @@ func TestRuns(t *testing.T) {
 		}
 	}
 }
+
+// The API server's restart unsettles a control plane for longer than a config change does, most
+// of all where there is only one. Its turn gets the time a rebooted node gets; no other turn does.
+func TestKubernetesTryTimeout(t *testing.T) {
+	for _, component := range KubernetesComponents {
+		want := timing.TryTimeout
+		if component == ComponentAPIServer {
+			want = timing.StepTimeout + timing.Soak + ConfirmMargin
+		}
+
+		if got := KubernetesTryTimeout(component, timing); got != want {
+			t.Errorf("%s: got %s, want %s", component, got, want)
+		}
+	}
+
+	// Never less than any other change gets.
+	long := Timing{TryTimeout: time.Hour, Soak: time.Minute, StepTimeout: 5 * time.Minute}
+	if got := KubernetesTryTimeout(ComponentAPIServer, long); got != time.Hour {
+		t.Fatalf("got %s", got)
+	}
+
+	// With the defaults, a control plane has stepTimeout to settle in before the soak must begin.
+	window := KubernetesTryTimeout(ComponentAPIServer, timing)
+	if settle := window - timing.Soak - ConfirmMargin; settle != timing.StepTimeout {
+		t.Fatalf("time to settle in: %s", settle)
+	}
+}

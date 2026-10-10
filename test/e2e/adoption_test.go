@@ -103,6 +103,14 @@ const (
 	removedKubeletPatch = "apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  " + removedKubeletFlag + ": 1m0s\n"
 )
 
+// halted ends a wait for an operation that has halted: it stays halted until a human acts, so
+// waiting for the timeout would only take the time, and the time of every scenario after it.
+func halted(op *talosv1alpha1.Operation, what string) {
+	if op != nil && op.Failure != nil {
+		StopTrying(fmt.Sprintf("the %s halted: %+v", what, *op.Failure)).Now()
+	}
+}
+
 func labelDocument(value string) string {
 	return "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  " + rolloutLabel + ": " + value + "\n"
 }
@@ -521,7 +529,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			}
 
 			if op := tc.Status.Operation; op != nil {
-				g.Expect(op.Failure).To(BeNil(), "the upgrade halted: %+v", op.Failure)
+				halted(op, "upgrade")
 			}
 
 			g.Expect(upgraded()).NotTo(BeNil(), "still upgrading: %+v", tc.Status.Operation)
@@ -1042,7 +1050,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Eventually(func(g Gomega) {
 			refresh(ctx, g)
 			if op := tc.Status.Operation; op != nil {
-				g.Expect(op.Failure).To(BeNil(), "the rollout halted: %+v", op.Failure)
+				halted(op, "rollout")
 			}
 			g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
 			g.Expect(tc.Status.History).To(HaveLen(ended + 1))
@@ -1139,7 +1147,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			Eventually(func(g Gomega) {
 				refresh(ctx, g)
 				if op := tc.Status.Operation; op != nil {
-					g.Expect(op.Failure).To(BeNil(), "the rollout halted: %+v", op.Failure)
+					halted(op, "rollout")
 				}
 				g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
 				g.Expect(tc.Status.History).To(HaveLen(ended + 1))
@@ -1198,7 +1206,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Eventually(func(g Gomega) {
 			refresh(ctx, g)
 			if op := tc.Status.Operation; op != nil {
-				g.Expect(op.Failure).To(BeNil(), "the upgrade halted: %+v", op.Failure)
+				halted(op, "upgrade")
 			}
 			g.Expect(upgraded()).NotTo(BeEmpty(), "still upgrading: %+v", tc.Status.Operation)
 		}).WithContext(ctx).WithTimeout(time.Duration(turns) * 6 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())

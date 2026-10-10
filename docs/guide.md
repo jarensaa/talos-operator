@@ -208,7 +208,7 @@ One component on one node at a time, in this order: the API server on every cont
 
 A version more than one minor ahead of what the cluster runs is reached one minor at a time, each as an operation of its own. The steps in between go to the first release of each minor (`1.36.0` on the way from 1.35 to 1.37).
 
-With one control plane, the Kubernetes API is down while its API server restarts. The operator loses its leader lease then and restarts; whichever replica comes back carries on from what is in status.
+With one control plane, the Kubernetes API is down while its API server restarts, for a minute or two, and the rest of the control plane needs a few more to find its feet again. The operator loses its leader lease then and restarts; whichever replica comes back carries on from what is in status. Because of this the API server's turn is given `stepTimeout` (10m) to be healthy again before its soak, not the shorter `tryTimeout`. If an API server really does not come up, that is also how long it takes until Talos puts the previous one back.
 
 ### What is refused before any node is touched
 

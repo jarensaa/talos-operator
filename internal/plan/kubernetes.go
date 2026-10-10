@@ -391,6 +391,23 @@ func kubernetesBlock(u KubernetesUpgrade, s KubernetesSettings, p Pass, stale, h
 	return "", ""
 }
 
+// KubernetesTryTimeout is how long Talos keeps the tried config of a component's turn before it
+// reverts it.
+//
+// For most components that is the try window of any config change. The API server is different:
+// its restart takes the Kubernetes API away from everything on its node, and on a cluster with one
+// control plane from everything. The controller manager and the scheduler lose their leases and
+// restart, the operator loses its own, and none of it can be seen until the API answers again. A
+// cluster in that state is not unhealthy, it is settling, and it is given what a node gets to come
+// back after a reboot: stepTimeout to be healthy, then the soak and the margin to confirm in.
+func KubernetesTryTimeout(component string, t Timing) time.Duration {
+	if component != ComponentAPIServer {
+		return t.TryTimeout
+	}
+
+	return max(t.TryTimeout, t.StepTimeout+t.Soak+ConfirmMargin)
+}
+
 // NextKubernetesStep decides what to do for the turn in flight: one component on one node. Once
 // the image is on the node the turn is a config change like any other (NextStep), with one
 // more check: the component runs the new version.

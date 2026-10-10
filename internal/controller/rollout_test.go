@@ -2268,6 +2268,12 @@ var _ = Describe("Config rollout", func() {
 			Expect(imagesOf(cp1Machine)[plan.ComponentAPIServer]).To(Equal(apiServer + patch))
 			Expect(imagesOf(cp1Machine)[plan.ComponentControllerManager]).To(HaveSuffix(":v"+kubernetesVersion), "one component at a time")
 			Expect(scenario.TryPending(cpAddr)).To(BeTrue(), "tried, not yet kept")
+			Expect(operation().Current.Deadline.Sub(clock)).To(BeNumerically(">", plan.DefaultStepTimeout),
+				"an API server's restart leaves a control plane the time to settle that a reboot leaves a node")
+
+			runUntil("the controller manager is tried", turnIs(plan.ComponentControllerManager, cp1Machine, plan.StepVerifying))
+			Expect(operation().Current.Deadline.Sub(clock)).To(BeNumerically("<=", plan.DefaultTryTimeout),
+				"no other turn gets more than any change")
 
 			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
 			Expect(kubernetesOperations()[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))

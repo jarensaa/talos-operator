@@ -34,8 +34,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -870,6 +872,12 @@ func (r *TalosClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&talosv1alpha1.TalosMachinePool{}, handler.EnqueueRequestsFromMapFunc(clusterOfPool)).
 		// A hook's Job that finishes moves its operation on.
 		Owns(&batchv1.Job{}).
+		// A pass that fails is tried again soon, however often it failed before. The default backs
+		// off for up to a quarter of an hour, and a failing pass is usually the Kubernetes API being
+		// away for a while: when it is back, a config that is being tried has a deadline to keep.
+		WithOptions(controller.Options{
+			RateLimiter: workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](time.Second, 2*rolloutInterval),
+		}).
 		Named("taloscluster").
 		Complete(r)
 }

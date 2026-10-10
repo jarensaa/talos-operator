@@ -695,6 +695,8 @@ What cannot be read is not fine: a check that fails to run blocks the upgrade (`
 | `Verifying` | The component runs the new version and is ready (the static pod's mirror pod; the Node's `kubeletVersion`; nothing for kube-proxy), and the whole cluster and every gate are healthy for the soak. | `RolledBack`: Talos puts the previous image back when the try window ends. |
 | `Confirming` | Make the config persistent. | |
 
+**The API server's turn gets a longer try** (`plan.KubernetesTryTimeout`): `stepTimeout` to be healthy again, then the soak and the margin to confirm in, instead of `tryTimeout`. Its restart takes the Kubernetes API away from everything on its node, and on a cluster with one control plane from everything: the controller manager and the scheduler lose their leases and restart, the operator loses its own, and nothing can be verified until the API answers. On QEMU, with one control plane, the API was back after 80 seconds and the cluster was not whole again within the three minutes a four-minute try left, so Talos took back a change that was fine. A cluster in that state is settling, not unhealthy, and gets what a node gets to come back after a reboot. The price is on the other side: an API server that really does not come up is reverted after that longer time.
+
 A failure halts the operation (§8.3). There is no `skip-machine` here, for the reason a control plane cannot be on hold; `retry` and `abort` remain.
 
 Windows and gates hold a Kubernetes upgrade as they hold every operation (§6.4), and its `preRollout` and `postRollout` hooks run. A node's hooks do not: no node is taken out of the cluster. An aborted upgrade is not started again until the spec asks for another version (`status.upgrades.kubernetes`).
