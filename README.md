@@ -150,6 +150,39 @@ Leave the two Secrets where they are. They hold the cluster's keys and do not be
 
 ### 6. Switch management on
 
+Set `management.config` to `Manage` in the `TalosCluster`. In the exported file it is the one line that changes; everything else is what adoption filled in:
+
+```yaml
+apiVersion: talos.jarensaa.github.io/v1alpha1
+kind: TalosCluster
+metadata:
+  name: my-cluster
+  namespace: talos-operator
+spec:
+  management:
+    config: Manage          # was Observe
+    upgrades: Disabled
+    membership: Disabled
+  clusterName: my-cluster
+  controlPlaneEndpoint: https://cluster.example.com:6443
+  versions:
+    talos: v1.14.0
+    kubernetes: 1.37.0
+  configGeneration:
+    versionContract: v1.14
+    installer:
+      factoryURL: https://factory.talos.dev
+      platform: metal
+      schematicID: 376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba
+  config:                   # whatever every node sets beyond Talos's defaults
+    - inline: |
+        apiVersion: v1alpha1
+        kind: KubeProxyConfig
+        enabled: false
+```
+
+Commit it, or without Git:
+
 ```bash
 kubectl -n talos-operator patch taloscluster my-cluster --type merge \
   -p '{"spec":{"management":{"config":"Manage"}}}'
