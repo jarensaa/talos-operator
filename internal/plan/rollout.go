@@ -66,6 +66,8 @@ type Settings struct {
 	// AbortedTargets is what the operation a human aborted was rolling out: machine name to
 	// rendered config hash. Nil if nothing was aborted.
 	AbortedTargets map[string]string
+	// Policy is the user's rollout policy as it stands now (docs/scope.md §6.4).
+	Policy Policy
 }
 
 // Gate is a condition that must hold before a node is touched.
@@ -84,9 +86,11 @@ const (
 	BlockProtected         = "ProtectedChange"
 	BlockRequiresReinstall = "RequiresReinstall"
 	BlockAwaitingUpgrade   = "AwaitingUpgrade"
-	BlockAborted           = "Aborted"
-	BlockAwaitingApproval  = "AwaitingApproval"
-	BlockGateClosed        = "GateClosed"
+	// BlockAwaitingKubernetes: a Kubernetes upgrade has to change the config first.
+	BlockAwaitingKubernetes = "AwaitingKubernetesUpgrade"
+	BlockAborted            = "Aborted"
+	BlockAwaitingApproval   = "AwaitingApproval"
+	BlockGateClosed         = "GateClosed"
 )
 
 // Rollout is the planner's answer to "is a config rollout due, and may it start?".
@@ -187,7 +191,7 @@ func PlanRollout(machines []Machine, s Settings, p Pass) Rollout {
 	}
 
 	out.ChangeHash = changeHash(pending)
-	out.BlockReason, out.BlockMessage = rolloutBlock(pending, stale, s, TouchGate(p, pending[0].Node), out)
+	out.BlockReason, out.BlockMessage = rolloutBlock(pending, stale, s, TouchGate(p, pending[0].Node).And(s.Policy.Gates()), out)
 
 	return out
 }
@@ -243,13 +247,18 @@ func rolloutBlock(pending []Machine, stale []string, s Settings, gate Gate, r Ro
 		return BlockRequiresReinstall, "the change only takes effect through a reinstall, which is not supported yet: " + describe(blocked)
 	}
 
+	if blocked := withClass(pending, classify.Kubernetes); len(blocked) > 0 {
+		return BlockAwaitingKubernetes, "the config names another version of a Kubernetes component than the node runs, which a " +
+			"Kubernetes upgrade brings about, in its own order (spec.management.upgrades): " + describe(blocked)
+	}
+
 	if blocked := withClass(pending, classify.Installer); len(blocked) > 0 {
 		return BlockAwaitingUpgrade, "the config names an installer image the node does not run yet, which a Talos upgrade " +
 			"brings about (spec.management.upgrades); it is applied once the node runs it: " + describe(blocked)
 	}
 
-	if s.Paused {
-		return BlockPaused, "spec.paused is set"
+	if reason, message := s.Policy.block(s.Paused); reason != "" {
+		return reason, message
 	}
 
 	if len(stale) > 0 {

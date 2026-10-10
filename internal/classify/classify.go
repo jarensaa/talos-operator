@@ -60,6 +60,10 @@ const (
 	// (§7.3). As a config change it is applied once the node runs what the image installs, and
 	// then it changes nothing on the node: see Installed.
 	Installer Class = "Installer"
+	// Kubernetes changes name another version of a Kubernetes component Talos runs: the API
+	// server, controller manager, scheduler or kubelet. A config rollout never applies them: a
+	// Kubernetes upgrade does, one component at a time and the API servers first (§7.4).
+	Kubernetes Class = "Kubernetes"
 	// BootTime changes only take effect when a node is installed: kernel arguments, the install
 	// disk, disk encryption. The operator does not reinstall a node for them.
 	BootTime Class = "BootTime"
@@ -69,7 +73,8 @@ const (
 
 // severity orders the classes.
 var severity = map[Class]int{
-	None: 0, LiveSafe: 1, ControlPlaneRestart: 2, Connectivity: 3, Storage: 4, Unknown: 5, Installer: 6, BootTime: 7, Protected: 8,
+	None: 0, LiveSafe: 1, ControlPlaneRestart: 2, Connectivity: 3, Storage: 4, Unknown: 5, Kubernetes: 6, Installer: 7, BootTime: 8,
+	Protected: 9,
 }
 
 // Worse reports whether c is more severe than other.
@@ -80,7 +85,9 @@ func (c Class) NeedsApproval() bool { return c == Storage || c == Unknown }
 
 // Blocked reports whether a config rollout does not apply the change: because the operator never
 // makes it, or because an upgrade has to bring the node there first.
-func (c Class) Blocked() bool { return c == Protected || c == BootTime || c == Installer }
+func (c Class) Blocked() bool {
+	return c == Protected || c == BootTime || c == Installer || c == Kubernetes
+}
 
 // Change is the classification of the difference between two configs.
 type Change struct {
@@ -124,7 +131,10 @@ var kindClasses = map[string]Class{
 	"KubeAuthorizerConfig": ControlPlaneRestart,
 
 	"KubeNodeConfig": LiveSafe, "KubeletConfig": LiveSafe, "KubeCredentialProviderConfig": LiveSafe,
-	"SysctlConfig": LiveSafe, "SysfsConfig": LiveSafe, "TimeSyncConfig": LiveSafe, "RegistryMirrorConfig": LiveSafe,
+	// Talos applies the kube-proxy manifest once, when the cluster is bootstrapped, and never again
+	// (§12.20): what the config says about kube-proxy changes nothing that runs.
+	"KubeProxyConfig": LiveSafe,
+	"SysctlConfig":    LiveSafe, "SysfsConfig": LiveSafe, "TimeSyncConfig": LiveSafe, "RegistryMirrorConfig": LiveSafe,
 	"RegistryAuthConfig": LiveSafe, "RegistryTLSConfig": LiveSafe, "EnvironmentConfig": LiveSafe, "EtcFileConfig": LiveSafe,
 	"UdevRulesConfig": LiveSafe, "KmsgLogConfig": LiveSafe, "EventSinkConfig": LiveSafe, "WatchdogTimerConfig": LiveSafe,
 	"OOMConfig": LiveSafe, "TCPProbeConfig": LiveSafe, "HTTPProbeConfig": LiveSafe,
@@ -148,6 +158,9 @@ var pathRules = sortRules([]pathRule{
 	{"cluster.network.dnsDomain", Protected},
 
 	{v1alpha1InstallImage, Installer},
+	{"machine.kubelet.image", Kubernetes}, {"cluster.apiServer.image", Kubernetes},
+	{"cluster.controllerManager.image", Kubernetes}, {"cluster.scheduler.image", Kubernetes},
+	{"cluster.proxy", LiveSafe},
 	{"machine.install", BootTime}, {"machine.kernel", BootTime}, {"machine.systemDiskEncryption", BootTime},
 
 	{"machine.disks", Storage},
@@ -250,6 +263,27 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 			continue
 		}
 
+		// A document of a Kubernetes component: its image is the Kubernetes upgrade's to change,
+		// everything else in it is classified as the document is.
+		if kubernetesKinds[kindOf(k)] && inLive && inDesired {
+			paths, err := changedPaths(a, b)
+			if err != nil {
+				return Change{}, fmt.Errorf("compare %s: %w", k, err)
+			}
+
+			for _, p := range paths {
+				if p == componentImage {
+					note(Kubernetes, string(k)+": "+p)
+				} else {
+					note(kindClass(k), string(k)+": "+p)
+				}
+			}
+
+			if len(paths) > 0 {
+				continue
+			}
+		}
+
 		// The document that names the installer: a change of the image alone is the installer's
 		// class, anything else in it only an install can bring about.
 		if isKind(k, unattendedInstallKind) && inLive && inDesired {
@@ -281,11 +315,26 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 	return out, nil
 }
 
-func isKind(key render.DocKey, kind string) bool {
-	parts := strings.Split(string(key), "/")
+func isKind(key render.DocKey, kind string) bool { return kindOf(key) == kind }
 
-	return len(parts) >= 2 && parts[1] == kind
+// kindOf is the kind of a document key such as v1alpha1/BondConfig/bond0; empty for the legacy
+// root document.
+func kindOf(key render.DocKey) string {
+	parts := strings.Split(string(key), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+
+	return parts[1]
 }
+
+// kubernetesKinds are the documents that name the image of a Kubernetes component Talos runs,
+// each in its "image" field (machinery config/types/k8s).
+var kubernetesKinds = map[string]bool{
+	"KubeAPIServerConfig": true, "KubeControllerManagerConfig": true, "KubeSchedulerConfig": true, "KubeletConfig": true,
+}
+
+const componentImage = "image"
 
 // kindClass classifies a document key such as v1alpha1/BondConfig/bond0.
 func kindClass(key render.DocKey) Class {

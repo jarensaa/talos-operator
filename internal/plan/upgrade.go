@@ -346,6 +346,8 @@ type UpgradeSettings struct {
 	// Skipped and Aborted map a machine to the installer image a human skipped for it, or whose
 	// upgrade a human aborted. Neither is started again; any other image is.
 	Skipped, Aborted map[string]string
+	// Policy is the user's rollout policy as it stands now (docs/scope.md §6.4).
+	Policy Policy
 }
 
 // Block reasons of an upgrade, besides those of a config rollout.
@@ -449,18 +451,22 @@ func upgradeBlock(pending []UpgradeMachine, stale []string, s UpgradeSettings, u
 		}
 	}
 
-	switch {
-	case len(problems) > 0:
+	if len(problems) > 0 {
 		return BlockIncompatible, strings.Join(problems, "; ")
-	case s.Paused:
-		return BlockPaused, "spec.paused is set"
+	}
+
+	if reason, message := s.Policy.block(s.Paused); reason != "" {
+		return reason, message
+	}
+
+	switch {
 	case len(stale) > 0:
 		return BlockNotCurrent, "waiting for current status of " + strings.Join(stale, ", ")
 	case u.AbortStands:
 		return BlockAborted, "the upgrade to this installer was aborted; change the spec, or revert it, to continue"
 	}
 
-	if gate := RebootGate(p, pending[0].Node); !gate.Open {
+	if gate := RebootGate(p, pending[0].Node).And(s.Policy.Gates()); !gate.Open {
 		return BlockGateClosed, gate.Reason
 	}
 

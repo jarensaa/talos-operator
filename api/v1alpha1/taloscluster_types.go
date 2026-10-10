@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // ConfigManagement controls whether the operator only observes machine config or owns it.
@@ -175,6 +176,112 @@ type Rollout struct {
 	// 10m. A node that is not drained in time halts the upgrade and stays cordoned.
 	// +optional
 	DrainTimeout *metav1.Duration `json:"drainTimeout,omitempty"`
+	// MaintenanceWindows are the times at which an operation may start, and may begin another node
+	// (docs/scope.md §6.4). With none, any time is allowed. A node that is being changed when a
+	// window closes is finished.
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	MaintenanceWindows []MaintenanceWindow `json:"maintenanceWindows,omitempty"`
+	// Gates are conditions on objects in the cluster that must hold before a node is touched and
+	// while a changed node is verified, next to the cluster's own health (docs/scope.md §6.4).
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Gates []RolloutGate `json:"gates,omitempty"`
+	// Hooks are Jobs run around an operation and around each node's turn (docs/scope.md §6.4).
+	// +optional
+	Hooks *RolloutHooks `json:"hooks,omitempty"`
+}
+
+// MaintenanceWindow is a recurring time at which nodes may be changed.
+// +kubebuilder:validation:XValidation:rule="duration(self.duration) > duration('0s')",message="duration must be positive"
+type MaintenanceWindow struct {
+	// Schedule is when the window opens, as a cron expression of five fields: minute, hour, day of
+	// month, month, day of week. For example "0 2 * * 6" is Saturdays at 02:00.
+	// +kubebuilder:validation:Pattern=`^\S+(\s+\S+){4}$`
+	// +kubebuilder:validation:MaxLength=128
+	Schedule string `json:"schedule"`
+	// Duration is how long the window stays open.
+	Duration metav1.Duration `json:"duration"`
+	// TimeZone is the IANA time zone the schedule is read in, e.g. Europe/Oslo. UTC if empty.
+	// +kubebuilder:validation:MaxLength=64
+	// +optional
+	TimeZone string `json:"timeZone,omitempty"`
+}
+
+// GateObject names the object a gate asks about.
+type GateObject struct {
+	// APIVersion of the object, e.g. ceph.rook.io/v1.
+	// +kubebuilder:validation:MinLength=1
+	APIVersion string `json:"apiVersion"`
+	// Kind of the object, e.g. CephCluster.
+	// +kubebuilder:validation:MinLength=1
+	Kind string `json:"kind"`
+	// Namespace of the object; empty for a cluster-scoped one.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+	// Name of the object.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// RolloutGate is a condition on one object in the cluster. The operator needs permission to get
+// the object; the chart grants what its gates.rules value lists.
+type RolloutGate struct {
+	// Name of the gate, used in conditions.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+	// Object is what the gate asks about.
+	Object GateObject `json:"object"`
+	// Expression is a CEL expression over the object, as "object". The gate is open only while it
+	// evaluates to true, e.g. object.status.ceph.health == "HEALTH_OK". An object that does not
+	// exist, a field that is not there, or anything but a boolean closes the gate.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=1024
+	Expression string `json:"expression"`
+}
+
+// Hook is a Job the operator runs and waits for.
+type Hook struct {
+	// Name of the hook, used in the Job's name and in conditions.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]{0,22}[a-z0-9])?$`
+	Name string `json:"name"`
+	// Timeout is how long the Job may take. A Job that has not succeeded by then fails the hook,
+	// which halts the operation. Defaults to spec.rollout.stepTimeout.
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
+	// Job is a batch/v1 JobSpec. The operator creates the Job in the TalosCluster's namespace and
+	// adds the environment variables TALOS_CLUSTER, TALOS_OPERATION, TALOS_OPERATION_ID,
+	// TALOS_HOOK and, for a node's hooks, TALOS_MACHINE and TALOS_NODE to every container. It sets
+	// restartPolicy Never and backoffLimit 0 where the spec leaves them open. The spec is not
+	// validated before the Job is created: one the API server refuses fails the hook.
+	// +kubebuilder:pruning:PreserveUnknownFields
+	// +kubebuilder:validation:Type=object
+	Job runtime.RawExtension `json:"job"`
+}
+
+// RolloutHooks are the Jobs of an operation. The hooks of a list run in order, one at a time. A
+// hook may run more than once for the same node, after a retry, so it must be safe to repeat.
+type RolloutHooks struct {
+	// PreRollout runs after an operation took the lock, before its first node.
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	PreRollout []Hook `json:"preRollout,omitempty"`
+	// PostRollout runs when an operation that ran its preRollout hooks ends, however it ends.
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	PostRollout []Hook `json:"postRollout,omitempty"`
+	// PreNode runs when a node's turn comes, before anything is sent to it. A Kubernetes upgrade
+	// takes no node out of the cluster and runs no node hooks.
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	PreNode []Hook `json:"preNode,omitempty"`
+	// PostNode runs after a node was verified. A node that failed gets none.
+	// +kubebuilder:validation:MaxItems=8
+	// +optional
+	PostNode []Hook `json:"postNode,omitempty"`
 }
 
 // CredentialsSource is where the operator's Talos API client certificate comes from.
@@ -360,6 +467,10 @@ type UpgradeHolds struct {
 	// Aborted: the upgrade was aborted before it reached the machine, or while it was at it.
 	// +optional
 	Aborted map[string]string `json:"aborted,omitempty"`
+	// Kubernetes is the Kubernetes version whose upgrade a human aborted. It is not started again;
+	// an upgrade to any other version is (docs/scope.md §7.4).
+	// +optional
+	Kubernetes string `json:"kubernetes,omitempty"`
 }
 
 // OperationType is the kind of disruptive operation holding the cluster lock.
@@ -372,7 +483,44 @@ const (
 	// OperationTalosUpgrade installs another Talos version or installer, one node at a time, with a
 	// drain and a reboot each (docs/scope.md §7.3).
 	OperationTalosUpgrade OperationType = "TalosUpgrade"
+	// OperationKubernetesUpgrade brings the Kubernetes components Talos runs to another version,
+	// one component on one node at a time (docs/scope.md §7.4).
+	OperationKubernetesUpgrade OperationType = "KubernetesUpgrade"
 )
+
+// Stages at which hooks run (docs/scope.md §6.4).
+const (
+	HookPreRollout  = "preRollout"
+	HookPostRollout = "postRollout"
+	HookPreNode     = "preNode"
+	HookPostNode    = "postNode"
+)
+
+// HookRun is the hook of an operation that is running. It is persisted before its Job is created.
+type HookRun struct {
+	// Stage is preRollout, postRollout, preNode or postNode.
+	Stage string `json:"stage"`
+	// Index is the hook's position in its list, and Name its name.
+	Index int32  `json:"index"`
+	Name  string `json:"name"`
+	// Machine is the machine whose turn a node hook belongs to.
+	// +optional
+	Machine string `json:"machine,omitempty"`
+	// Job is the name of the hook's Job.
+	Job string `json:"job"`
+	// Attempt counts runs of this hook, starting at 1; retry increments it and so names a new Job.
+	Attempt int32 `json:"attempt"`
+	// Since is when the hook was started.
+	Since metav1.Time `json:"since"`
+}
+
+// OperationEnding is how an operation ends once its postRollout hooks ran.
+type OperationEnding struct {
+	// Outcome is Succeeded, Aborted or Superseded.
+	Outcome string `json:"outcome"`
+	// +optional
+	Message string `json:"message,omitempty"`
+}
 
 // Outcomes of a finished operation.
 const (
@@ -411,9 +559,13 @@ type OperationStep struct {
 	// PreRebootBootID is recorded before a reboot so a resumed step can tell whether it happened.
 	// +optional
 	PreRebootBootID string `json:"preRebootBootID,omitempty"`
-	// Image is the installer image an upgrade step installs.
+	// Image is the image an upgrade step installs: the installer of a Talos upgrade, or the
+	// component's image of a Kubernetes upgrade.
 	// +optional
 	Image string `json:"image,omitempty"`
+	// Component is the Kubernetes component a step of a Kubernetes upgrade changes.
+	// +optional
+	Component string `json:"component,omitempty"`
 	// Cordoned is set before the operator cordons the node, so that it later uncordons a node it
 	// cordoned itself and leaves alone one that someone else did.
 	// +optional
@@ -440,6 +592,9 @@ type OperationFailure struct {
 	// Reason is a machine-readable cause, e.g. RolledBack or NodeUnreachableAfterRollback.
 	// +optional
 	Reason string `json:"reason,omitempty"`
+	// Hook is the stage of the hook that failed, if a hook did.
+	// +optional
+	Hook string `json:"hook,omitempty"`
 	// Token identifies this failure. The retry, skip-machine and abort annotations must carry it,
 	// so an annotation left behind never acts on a later failure.
 	// +optional
@@ -458,7 +613,8 @@ type Operation struct {
 	// Target is the operation's goal, e.g. a version.
 	// +optional
 	Target string `json:"target,omitempty"`
-	// Plan lists machines in execution order.
+	// Plan lists the operation's turns in execution order: machines, or for a Kubernetes upgrade
+	// one component on one machine each, as "<component>/<machine>".
 	// +optional
 	Plan []string `json:"plan,omitempty"`
 	// Targets maps each planned machine to the rendered config hash it is to reach, and Bases to
@@ -481,6 +637,21 @@ type Operation struct {
 	// Failure is set when the operation is halted.
 	// +optional
 	Failure *OperationFailure `json:"failure,omitempty"`
+	// Hook is the hook that is running, if one is (docs/scope.md §6.4).
+	// +optional
+	Hook *HookRun `json:"hook,omitempty"`
+	// Announced is set once the preRollout hooks ran, or there were none: nodes may begin.
+	// +optional
+	Announced bool `json:"announced,omitempty"`
+	// Prepared is the turn whose preNode hooks ran, and Finishing the turn whose postNode hooks
+	// are due: it is verified, and counts as completed once they ran.
+	// +optional
+	Prepared string `json:"prepared,omitempty"`
+	// +optional
+	Finishing string `json:"finishing,omitempty"`
+	// Ending is set when the operation is over and only its postRollout hooks remain.
+	// +optional
+	Ending *OperationEnding `json:"ending,omitempty"`
 	// StartedAt is when the operation began.
 	StartedAt metav1.Time `json:"startedAt"`
 }
