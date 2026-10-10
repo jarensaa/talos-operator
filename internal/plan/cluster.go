@@ -78,7 +78,13 @@ type KubernetesNode struct {
 	Registered bool
 	// Ready is true when the Node is Ready and has a network.
 	Ready bool
+	// Unschedulable is true when the Node is cordoned.
+	Unschedulable bool
 }
+
+// cordoned reports whether the member's Node is known to be cordoned. Talos's cluster-wide health
+// checks fail on a cordoned node (K8sAllNodesSchedulableAssertion), whoever cordoned it.
+func (m Member) cordoned() bool { return m.Node != nil && m.Node.Unschedulable }
 
 // ails reports whether the member is known to be unhealthy itself. A fact that was not read is
 // not known: it closes gates, and it never excuses anything.
@@ -207,6 +213,9 @@ func checkAllNodesReady(c Cluster, except string) talosv1alpha1.Precondition {
 			failures = append(failures, "Kubernetes has no Node for "+m.Hostname)
 		case !m.Node.Ready:
 			failures = append(failures, "Kubernetes reports "+m.Hostname+" not Ready")
+		case m.Node.Unschedulable:
+			// Someone is working on that node. It is not the one this gate is asked for.
+			failures = append(failures, m.Hostname+" is cordoned")
 		}
 	}
 
@@ -384,9 +393,10 @@ func closedGate(format string, args ...any) Gate { return Gate{Reason: fmt.Sprin
 //
 // The health of the node itself is left out of it. A node may be the one thing that is wrong:
 // touching it takes nothing from the cluster that the cluster still has, and a rollout is how a
-// config that broke a node is taken back. When the node is known to be unhealthy, Talos's checks
-// are not asked either: they judge the cluster as a whole, cannot leave a node out, and cannot
-// pass. The other members then stand on their own facts alone, and the gate says so in its Note.
+// config that broke a node is taken back. When the node is known to be unhealthy, or is cordoned
+// as it is in the middle of its own upgrade, Talos's checks are not asked either: they judge the
+// cluster as a whole, cannot leave a node out, and cannot pass. The other members then stand on
+// their own facts alone, and the gate says so in its Note.
 //
 // An unhealthy node is therefore only ever touched while it is the only one, which is invariant 2
 // of §8.1 for every node, not just for control planes.
@@ -414,12 +424,32 @@ func TouchGate(p Pass, node string) Gate {
 		return gate
 	}
 
-	if known && target.ails() {
-		return Gate{Open: true, Note: node + " is unhealthy itself, so Talos's cluster-wide health checks were not asked: " +
+	if known && (target.ails() || target.cordoned()) {
+		return Gate{Open: true, Note: node + " is unhealthy or cordoned itself, so Talos's cluster-wide health checks were not asked: " +
 			"every other member is healthy by its own report, by Kubernetes and by etcd"}
 	}
 
 	return talosHealth(p)
+}
+
+// RebootGate is the gate before a node is taken down on purpose: cordoned, drained, rebooted
+// (docs/scope.md §7.3). It is TouchGate, and for a control plane also the guard Talos's own
+// upgrade path dropped with LifecycleService (§3.2): etcd must not have exactly two members. With
+// two, losing either loses quorum, and nothing brings it back while the node is down. With one
+// there is no quorum to protect beyond the node itself, and with three or more the others hold it,
+// which TouchGate has already established: every other member is a started voter that reports no
+// errors.
+func RebootGate(p Pass, node string) Gate {
+	gate := TouchGate(p, node)
+	if !gate.Open {
+		return gate
+	}
+
+	if target, known := p.Cluster.member(node); known && target.ControlPlane && len(p.Cluster.EtcdMembers) == 2 {
+		return closedGate("etcd has exactly two members, so taking %s down would lose quorum", node)
+	}
+
+	return gate
 }
 
 // VerifyGate is the cluster-wide part of verifying a node whose config was changed
