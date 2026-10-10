@@ -1,0 +1,71 @@
+# Default values for talos-operator.
+
+# Override the name of the chart.
+nameOverride: ""
+# Override the full name of the chart.
+fullnameOverride: ""
+
+# Two replicas with leader election: when a rollout drains the leader's node, the standby on
+# another node takes over and resumes from persisted status (docs/scope.md §4.2).
+replicas: 2
+
+image:
+  repository: ghcr.io/jarensaa/talos-operator
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Extra manager flags. Logs are JSON at info level; ["--zap-devel"] switches to the development
+# format with debug output, ["--zap-log-level=debug"] only raises the level.
+extraArgs: []
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # Defaults to the chart full name.
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# Replicas never share a node, so one node drain cannot take out both.
+# Set to "preferred" for single-node test clusters.
+podAntiAffinity: required
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+nodeSelector: {}
+tolerations: []
+
+metrics:
+  # Serve metrics over HTTPS on 8443, authenticated via the Kubernetes API.
+  enabled: true
+
+admissionPolicies:
+  # ValidatingAdmissionPolicies guarding the management gate and TalosMachine deletion
+  # (docs/scope.md §5.2). Disable only if they are installed some other way.
+  enabled: true

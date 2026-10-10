@@ -1,0 +1,16 @@
+# Machines of one role sharing config. Role and cluster are fixed once created.
+apiVersion: talos.jarensaa.github.io/v1alpha1
+kind: TalosMachinePool
+metadata:
+  name: example-control-plane
+spec:
+  clusterRef: { name: example }
+  role: ControlPlane
+  # A pool-level disk selector, so members need no install config of their own.
+  config:
+    - inline: |
+        apiVersion: v1alpha1
+        kind: UnattendedInstallConfig
+        provisioning:
+          diskSelector:
+            match: disk.transport == "nvme"

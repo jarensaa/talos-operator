@@ -1,0 +1,39 @@
+name: Set up Go with a warm build cache
+description: >-
+  Installs the Go version from go.mod and restores the newest module and build cache saved from
+  main. setup-go's own cache is off on purpose: it keys only on go.sum, so whichever job saved
+  first froze the build cache until go.sum changed, and later jobs recompiled most packages.
+
+outputs:
+  gomodcache:
+    description: GOMODCACHE path.
+    value: ${{ steps.paths.outputs.gomodcache }}
+  gocache:
+    description: GOCACHE path.
+    value: ${{ steps.paths.outputs.gocache }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v7
+      with:
+        go-version-file: go.mod
+        cache: false
+
+    - id: paths
+      shell: bash
+      run: |
+        echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+        echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+
+    # Pull requests can restore caches saved on main. Exact keys never match (they include the
+    # commit), so the newest entry for this go.sum wins, falling back to any older one.
+    - uses: actions/cache/restore@v6
+      with:
+        path: |
+          ${{ steps.paths.outputs.gomodcache }}
+          ${{ steps.paths.outputs.gocache }}
+        key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+        restore-keys: |
+          go-${{ runner.os }}-${{ hashFiles('go.sum') }}-
+          go-${{ runner.os }}-

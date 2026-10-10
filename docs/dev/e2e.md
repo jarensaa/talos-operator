@@ -1,0 +1,61 @@
+# End-to-end testing
+
+e2e tests run against a disposable Talos cluster built the way a hand-rolled bare-metal cluster usually is:
+- 3 control planes and 1 worker by default;
+- configs generated with `talosctl gen config --with-secrets` plus one all-nodes patch and one per-node patch;
+- a control-plane patch enabling Talos API access for the `talos-operator-e2e` namespace, so the operator runs on Talos-issued credentials as it does in production.
+
+```bash
+make e2e-cluster-up     # prompts for sudo; reuses a running cluster
+make test-e2e           # e2e-tagged tests in internal/talos and test/e2e
+make e2e-cluster-down   # prompts for sudo; removes .e2e/ entirely
+```
+
+`.e2e/` is gitignored. It holds throwaway secrets, generated configs, `talosconfig`, `kubeconfig` and an `env` file that `make test-e2e` sources.
+
+QEMU state (VM disks, console logs, sockets) lives in `~/.talos/clusters/talos-operator-e2e`, talosctl's default, not under the checkout. QEMU's monitor socket path must fit the Unix socket limit (104 bytes on macOS, 108 on Linux), and checkout paths are often too long. The harness checks the length before starting; override the location with `E2E_STATE_DIR`.
+
+Knobs (environment variables for `hack/e2e/cluster-up.sh`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TALOS_VERSION` | `v1.14.2` | Talos version booted and installed |
+| `KUBERNETES_VERSION` | `1.37.0` | Kubernetes version |
+| `CONTROLPLANES` / `WORKERS` | `3` / `1` | Configured nodes |
+| `MAINTENANCE_NODES` | `0` | Extra workers left unconfigured, for expansion tests (M7) |
+| `SCHEMATIC_ID` | vanilla schematic | Installer schematic |
+| `VM_CPUS` / `VM_MEMORY` | `2.0` / `2GiB` | Per-VM resources (CI uses less) |
+
+## Why QEMU, and why sudo
+
+Spike `talos-w3y.11`, 2026-10-09, on macOS arm64 with Docker Desktop 29.4.3:
+
+- **The Docker provisioner cannot run Talos 1.14 here.** Container mode needs a host kernel ≥ 6.15. Talos 1.14 builds its writable `/etc` overlay from file-descriptor lower layers (`fsconfig(FSCONFIG_SET_FD, "lowerdir+")`), which older kernels reject with `EBADF`. Docker Desktop runs kernel 6.12.76, so machined fails with `failed to compose writable /etc overlay` and apid never starts. Upstream tracks this in [siderolabs/talos#14476](https://github.com/siderolabs/talos/issues/14476). Container mode would also refuse `LifecycleService` upgrades, which M4 needs.
+- **The QEMU provisioner works but needs root** on macOS, for CNI networking and the HVF accelerator: `talosctl` exits with "please run as root user". The harness therefore runs only `talosctl cluster create/destroy` under `sudo -E`. Config generation, applies and bootstrap run as the invoking user.
+- **Pass `--talosconfig-destination`.** Without it, `talosctl cluster create` merges the new context into `~/.talos/config`, next to the contexts of real clusters.
+- QEMU from Homebrew (`brew install qemu`) provides `qemu-system-aarch64`. The Talos ISO comes from Image Factory and is cached in `~/.talos/cache`.
+
+## How the harness builds the cluster
+
+1. `talosctl cluster create qemu --presets iso,maintenance` boots every VM from the Image Factory ISO into maintenance mode. The provisioner's own configs are ignored.
+2. Throwaway secrets, then `gen config --with-secrets --install-disk /dev/vda --install-image factory.talos.dev/metal-installer/<schematic>:<version>`. With the 1.14 contract this produces an `UnattendedInstallConfig` with a disk selector, as in production.
+3. Per node: `machineconfig patch` with `hack/e2e/patches/all.patch.yaml`, on control planes also `controlplane.patch.yaml` (`KubeTalosAPIAccessConfig`), then a per-node `HostnameConfig` patch. Adoption has to factor these back into the `all`, `controlPlane` and per-machine patch layers.
+4. Dry-run every config, then apply each with `apply-config --insecure`. Nodes install to disk and reboot. The dry run's output is discarded: it is a diff of the whole config, keys included, and the harness log is printed in CI.
+5. Bootstrap the first control plane (retried until install and reboot finish; `AlreadyExists` counts as done), wait for `talosctl health`, then write the kubeconfig.
+
+Addresses: the provisioner assigns `10.5.0.1` to the gateway, then control planes from `.2` and workers after them.
+
+## CI is the e2e path
+
+Local runs are optional. The `E2E` workflow (`.github/workflows/e2e.yml`) runs the same harness on a GitHub-hosted Linux runner, where sudo is passwordless and `/dev/kvm` is available. It runs:
+- on every pull request. A first job skips the cluster when nothing it exercises changed, so the check can be required;
+- weekly (Mondays), to catch drift such as new Image Factory builds or Talos releases;
+- on demand (`workflow_dispatch`).
+
+The job starts cluster creation in the background as soon as QEMU and `talosctl` are installed. Go setup and `make test-e2e-build` run while the VMs boot, so only the tests themselves wait for the cluster. `make test-e2e` runs only tests named `TestE2E*`; unit tests in the same packages run in the Tests workflow.
+
+Standard private-repo runners have 2 vCPUs and 7 GB RAM, so CI uses one control plane and one worker (`CONTROLPLANES=1 WORKERS=1 VM_CPUS=1.0`). Multi-control-plane scenarios (etcd membership, rolling control-plane upgrades in M4/M7/M8) will need a larger runner.
+
+What the suite covers on that cluster, in order and on one TalosCluster: adoption from the operator's own proposal with no node changed; a label rolled out to the worker without a reboot; a protected field refused; and a config that makes the worker drop everything it sends to the control planes, which Talos must revert while the operator confirms nothing and leaves the control plane's own pending change unapplied. The last one waits out a four-minute try window, during which the worker is offline; `make test-e2e` therefore runs its packages one after the other.
+
+On failure the workflow uploads `e2e-diagnostics`: VM console logs, plus `dmesg` and service status from each node it can reach. The cluster is always destroyed at the end.

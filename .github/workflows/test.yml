@@ -1,0 +1,298 @@
+name: Verify and release
+
+# Every push to main is verified, then released by semantic-release from its Conventional Commits
+# (feat: minor, fix: patch, a breaking change: major) and published: the image on every push, and
+# for a release also the chart and the GitHub Release's artifacts. Releasing and publishing happen
+# in this run because tags created with GITHUB_TOKEN start no other workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Caches are written from main only. A cache saved on a pull request is visible to that pull
+# request alone, so it would only take space; pull requests restore the newest cache from main.
+jobs:
+  test:
+    name: Unit and envtest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Saving caches on main prunes the ones they supersede.
+      actions: write
+    env:
+      SAVE_CACHES: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-go
+
+      # Project tools (controller-gen, setup-envtest) and envtest's Kubernetes binaries live in
+      # ./bin; their versions are pinned in the Makefile.
+      - name: Restore project tools
+        id: tools
+        uses: actions/cache/restore@v6
+        with:
+          path: bin
+          key: bin-${{ runner.os }}-${{ hashFiles('Makefile', 'go.mod') }}
+
+      - name: Modules, generated code and formatting are committed
+        run: |
+          go mod tidy
+          make manifests generate fmt
+          git diff --exit-code
+
+      # test-unit skips the regenerate/fmt/vet prerequisites of `make test`: the step above checks
+      # them and golangci-lint runs vet.
+      - name: Test
+        run: make test-unit
+
+      # Render must reproduce `talosctl gen config` + `machineconfig patch` for the Talos version
+      # the operator is built against, or adoption cannot prove "no changes".
+      - uses: ./.github/actions/install-talosctl
+
+      - name: Render parity with talosctl
+        run: make test-parity
+
+      # The image job cross-compiles the manager with -trimpath for every platform; compile it here
+      # too so the saved cache holds those packages.
+      - name: Warm the image build cache
+        if: env.SAVE_CACHES == 'true'
+        run: make build-image-binaries
+
+      - name: Save project tools
+        if: env.SAVE_CACHES == 'true' && steps.tools.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: bin
+          key: ${{ steps.tools.outputs.cache-primary-key }}
+
+      - name: Prune superseded project tools
+        if: env.SAVE_CACHES == 'true' && steps.tools.outputs.cache-hit != 'true'
+        uses: ./.github/actions/prune-caches
+        with:
+          prefix: bin-${{ runner.os }}-
+          keep: ${{ steps.tools.outputs.cache-primary-key }}
+
+      - name: Save Go build cache
+        if: env.SAVE_CACHES == 'true'
+        uses: ./.github/actions/save-go-cache
+
+  build:
+    name: Image and chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-go
+
+      # Compiling on the host reuses the restored Go build cache; the Dockerfile only packages the
+      # binaries.
+      - name: Cross-compile the manager
+        run: make build-image-binaries
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          platforms: linux/amd64,linux/arm64
+
+      - uses: azure/setup-helm@v5
+
+      - name: Lint chart
+        run: helm lint charts/talos-operator
+
+  release-metadata:
+    name: Release metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "26"
+
+      - name: Install pnpm
+        run: npm install --global pnpm@10.28.0
+
+      - name: Install release tooling
+        run: pnpm install --frozen-lockfile
+
+      - name: Test release metadata
+        run: pnpm test:release
+
+  # main is verified before it gets here: pull requests must pass these jobs, lint and e2e.
+  release:
+    name: Release
+    if: github.event_name == 'push'
+    needs: [test, build, release-metadata]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      current: ${{ steps.current.outputs.current }}
+      release_created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      latest: ${{ steps.release.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check this is still the tip of main
+        id: current
+        run: |
+          remote_sha="$(git ls-remote origin refs/heads/main | cut -f1)"
+          if [[ "$remote_sha" == "$GITHUB_SHA" ]]; then
+            echo 'current=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'current=false' >> "$GITHUB_OUTPUT"
+            echo 'A newer commit reached main; skipping this release.'
+          fi
+
+      - uses: actions/setup-node@v7
+        if: steps.current.outputs.current == 'true'
+        with:
+          node-version: "26"
+
+      - name: Install pnpm
+        if: steps.current.outputs.current == 'true'
+        run: npm install --global pnpm@10.28.0
+
+      - name: Install release tooling
+        if: steps.current.outputs.current == 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Establish initial version boundary
+        if: steps.current.outputs.current == 'true'
+        run: |
+          if [[ -z "$(git tag --list 'v[0-9]*')" ]]; then
+            git tag v0.0.0 "$GITHUB_SHA"
+            git push origin refs/tags/v0.0.0
+          fi
+
+      - name: Create semantic release
+        if: steps.current.outputs.current == 'true'
+        id: release
+        run: pnpm release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish
+    if: github.event_name == 'push' && needs.release.outputs.current == 'true'
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      # Attaching the chart and artifacts to the GitHub Release.
+      contents: write
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/talos-operator
+      CHART_REPO: oci://ghcr.io/${{ github.repository_owner }}/charts
+      RELEASE_VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Determine image version and tags
+        id: version
+        env:
+          LATEST_RELEASE: ${{ needs.release.outputs.latest }}
+        run: |
+          if [[ -n "$RELEASE_VERSION" ]]; then
+            echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$LATEST_RELEASE" ]]; then
+            # Built on the latest release.
+            echo "version=$LATEST_RELEASE+${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dev.${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+          fi
+          {
+            echo 'tags<<EOF'
+            echo "$IMAGE:sha-$GITHUB_SHA"
+            echo "$IMAGE:main"
+            if [[ -n "$RELEASE_VERSION" ]]; then
+              echo "$IMAGE:v$RELEASE_VERSION"
+            fi
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # The Dockerfile packages binaries compiled here, with the Go build cache restored from main.
+      - uses: ./.github/actions/setup-go
+
+      - name: Cross-compile the manager
+        run: make build-image-binaries
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.version.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - uses: azure/setup-helm@v5
+        if: env.RELEASE_VERSION != ''
+
+      # The chart's default image tag is "v" + appVersion, so chart and image always match.
+      - name: Package and push chart
+        if: env.RELEASE_VERSION != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          helm package charts/talos-operator --version "$RELEASE_VERSION" --app-version "$RELEASE_VERSION" -d dist/
+          helm push "dist/talos-operator-${RELEASE_VERSION}.tgz" "$CHART_REPO"
+
+      # semantic-release wrote the notes; this adds what was published and attaches the chart. The
+      # artifacts block is replaced, not repeated, when a rerun publishes again.
+      - name: Add artifacts to the GitHub Release
+        if: env.RELEASE_VERSION != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          tag="v$RELEASE_VERSION"
+          gh release upload "$tag" "dist/talos-operator-${RELEASE_VERSION}.tgz" --repo "$GITHUB_REPOSITORY" --clobber
+
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo '<!-- artifacts:start -->'
+            echo '## Artifacts'
+            echo
+            echo "- Image: \`$IMAGE:$tag\` (\`$DIGEST\`), linux/amd64 and linux/arm64, with SBOM and provenance"
+            echo "- Helm chart: \`$CHART_REPO/talos-operator\` version \`$RELEASE_VERSION\` (also attached)"
+            echo '<!-- artifacts:end -->'
+            echo
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body --jq .body |
+              sed '/<!-- artifacts:start -->/,/<!-- artifacts:end -->/d'
+          } > "$notes"
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file "$notes"
+
+      - name: Record deployable image
+        run: |
+          echo "${{ steps.version.outputs.version }}: $IMAGE@${{ steps.image.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

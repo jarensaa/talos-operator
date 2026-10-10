@@ -1,0 +1,27 @@
+name: Install talosctl
+description: >-
+  Installs a checksum-verified talosctl. Without a version, it installs the release matching the
+  Talos machinery module in go.mod, so tools and the operator always speak the same Talos version.
+
+inputs:
+  version:
+    description: talosctl version (vX.Y.Z); defaults to the machinery version in go.mod.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        if [ -z "$VERSION" ]; then
+          VERSION=$(sed -nE 's#^[[:space:]]*github\.com/siderolabs/talos/pkg/machinery (v[^ ]+).*#\1#p' go.mod)
+        fi
+        base="https://github.com/siderolabs/talos/releases/download/${VERSION}"
+        curl -fsSLo /tmp/talosctl-linux-amd64 "${base}/talosctl-linux-amd64"
+        curl -fsSLo /tmp/sha256sum.txt "${base}/sha256sum.txt"
+        (cd /tmp && grep ' talosctl-linux-amd64$' sha256sum.txt | sha256sum -c -)
+        sudo install -m 0755 /tmp/talosctl-linux-amd64 /usr/local/bin/talosctl
+        talosctl version --client --short

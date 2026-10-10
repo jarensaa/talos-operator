@@ -1,0 +1,10 @@
+# One node: its pool, its hardware identity and its Talos API address.
+apiVersion: talos.jarensaa.github.io/v1alpha1
+kind: TalosMachine
+metadata:
+  name: example-cp-1
+spec:
+  poolRef: { name: example-control-plane }
+  address: 10.0.0.11
+  identity:
+    systemUUID: aaaaaaaa-bbbb-4ccc-8ddd-000000000001

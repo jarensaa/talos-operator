@@ -1,0 +1,27 @@
+name: Save the Go build cache
+description: >-
+  Saves the module and build cache under a per-commit key and deletes the caches it supersedes.
+  Call it from one job, on pushes to main only, after the job has compiled everything (see
+  .github/actions/setup-go). The job needs `actions: write`.
+
+runs:
+  using: composite
+  steps:
+    - id: paths
+      shell: bash
+      run: |
+        echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+        echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+        echo "key=go-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache/save@v6
+      with:
+        path: |
+          ${{ steps.paths.outputs.gomodcache }}
+          ${{ steps.paths.outputs.gocache }}
+        key: ${{ steps.paths.outputs.key }}
+
+    - uses: ./.github/actions/prune-caches
+      with:
+        prefix: go-${{ runner.os }}-
+        keep: ${{ steps.paths.outputs.key }}

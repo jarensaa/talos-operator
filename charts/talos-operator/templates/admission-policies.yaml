@@ -1,0 +1,7 @@
+{{- /*
+Admission rules the API server enforces itself (config/admission/policies.yaml, copied by
+`make manifests`). They are cluster-scoped and belong with the CRDs, so their names are fixed.
+*/ -}}
+{{- if .Values.admissionPolicies.enabled }}
+{{ .Files.Get "files/admission-policies.yaml" }}
+{{- end }}

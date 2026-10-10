@@ -1,0 +1,3 @@
+# The image packages prebuilt binaries only (see Dockerfile); nothing else belongs in the context.
+*
+!dist/manager-*

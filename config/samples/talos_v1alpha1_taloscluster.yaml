@@ -1,0 +1,15 @@
+# Observe-only: the operator reports state and proposes the rest of the spec (docs/scope.md §7.1).
+apiVersion: talos.jarensaa.github.io/v1alpha1
+kind: TalosCluster
+metadata:
+  name: example
+spec:
+  management:
+    config: Observe
+  # Cluster-wide layer, applied to every machine first.
+  config:
+    - configRef: { name: bonded-network }
+    - inline: |
+        apiVersion: v1alpha1
+        kind: KubeProxyConfig
+        enabled: false

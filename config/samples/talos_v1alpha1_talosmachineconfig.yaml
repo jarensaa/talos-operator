@@ -1,0 +1,16 @@
+# Reusable config documents; any cluster, pool or machine in the namespace can reference them.
+apiVersion: talos.jarensaa.github.io/v1alpha1
+kind: TalosMachineConfig
+metadata:
+  name: bonded-network
+spec:
+  documents: |
+    apiVersion: v1alpha1
+    kind: BondConfig
+    name: bond0
+    links: [eth0, eth1]
+    bondMode: 802.3ad
+    ---
+    apiVersion: v1alpha1
+    kind: DHCPv4Config
+    name: bond0

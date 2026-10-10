@@ -1,0 +1,347 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: talosmachines.talos.jarensaa.github.io
+spec:
+  group: talos.jarensaa.github.io
+  names:
+    kind: TalosMachine
+    listKind: TalosMachineList
+    plural: talosmachines
+    shortNames:
+    - tm
+    singular: talosmachine
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolRef.name
+      name: Pool
+      type: string
+    - jsonPath: .spec.address
+      name: Address
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.talos.version
+      name: Talos
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: TalosMachine is one Talos node, a member of one TalosMachinePool.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: TalosMachineSpec defines the desired state of TalosMachine.
+            properties:
+              address:
+                description: 'Address is the machine''s Talos API IP address. Hostnames
+                  are rejected: endpoints must be IPs.'
+                type: string
+                x-kubernetes-validations:
+                - message: address must be an IP address
+                  rule: isIP(self)
+              config:
+                description: |-
+                  Config is the machine's own layer, applied after its cluster's and its pool's. It holds only
+                  what this node has that its pool does not, such as a disk WWID.
+                items:
+                  description: |-
+                    ConfigSource is one entry of a config layer: config documents (multi-document YAML) merged onto
+                    the generated config with strategic merge (docs/scope.md §5). Documents of the multi-document
+                    kinds are declared whole; the legacy v1alpha1 document is a partial overlay. JSON6902 patches are
+                    refused: they cannot address multi-document configs. Exactly one source is set, and a layer
+                    holds at most 32 entries (MaxItems) so the CEL validation cost stays within the API server
+                    budget.
+                  properties:
+                    configRef:
+                      description: ConfigRef uses the documents of a TalosMachineConfig,
+                        so they can be shared.
+                      properties:
+                        name:
+                          description: Name of the TalosMachineConfig.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    inline:
+                      description: Inline config documents.
+                      maxLength: 262144
+                      type: string
+                    secretKeyRef:
+                      description: |-
+                        SecretKeyRef reads documents from a Secret key, for documents that carry sensitive values.
+                        The key is required. Diffs of the documents it sets are withheld from status.
+                      properties:
+                        key:
+                          description: Key within the Secret. Each referencing field
+                            documents its default.
+                          type: string
+                        name:
+                          description: Name of the Secret.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                  type: object
+                  x-kubernetes-validations:
+                  - message: exactly one of inline, configRef or secretKeyRef must
+                      be set
+                    rule: '(has(self.inline) ? 1 : 0) + (has(self.configRef) ? 1 :
+                      0) + (has(self.secretKeyRef) ? 1 : 0) == 1'
+                  - message: secretKeyRef.key is required for config
+                    rule: '!has(self.secretKeyRef) || has(self.secretKeyRef.key)'
+                maxItems: 32
+                type: array
+              desiredState:
+                default: Present
+                description: DesiredState is Present or Removed.
+                enum:
+                - Present
+                - Removed
+                type: string
+              hold:
+                description: Hold excludes the machine from rollouts.
+                type: boolean
+              identity:
+                description: Identity pins the machine's hardware.
+                properties:
+                  systemUUID:
+                    description: |-
+                      SystemUUID is the SMBIOS system UUID (talosctl get systeminformation).
+                      Config is never applied to a machine whose UUID does not match.
+                    pattern: ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$
+                    type: string
+                required:
+                - systemUUID
+                type: object
+              poolRef:
+                description: |-
+                  PoolRef names the TalosMachinePool in the same namespace. The pool decides the machine's
+                  cluster and role. It may change to another pool of the same role.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
+                x-kubernetes-validations:
+                - message: poolRef.name is required
+                  rule: size(self.name) > 0
+            required:
+            - address
+            - identity
+            - poolRef
+            type: object
+          status:
+            description: TalosMachineStatus defines the observed state of TalosMachine.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              config:
+                description: ConfigState tracks rendered, applied and live config
+                  hashes.
+                properties:
+                  appliedHash:
+                    description: |-
+                      AppliedHash is the config the operator last put on the node, or the live config it took
+                      over when management began. DesiredHash differing from it means the spec changed and a
+                      rollout is due; LiveHash differing from it means the node drifted.
+                    type: string
+                  changeClass:
+                    description: |-
+                      ChangeClass classifies the pending change from live to rendered config, e.g. LiveSafe or
+                      Connectivity (docs/scope.md §6.3). Empty when they are equal.
+                    type: string
+                  changeReasons:
+                    description: ChangeReasons names what put the change in its class,
+                      e.g. the documents or fields.
+                    items:
+                      type: string
+                    maxItems: 16
+                    type: array
+                  desiredHash:
+                    description: |-
+                      DesiredHash fingerprints the config rendered from the spec. Hashes are taken over the
+                      normalized config (per document, without comments, independent of document order), so
+                      DesiredHash equals LiveHash exactly when ConfigMatchesLive is True.
+                    type: string
+                  diff:
+                    description: |-
+                      Diff is the redacted per-document diff from the live config (a/) to the rendered one (b/),
+                      truncated to fit. Documents set by a patch from a Secret are named but not shown.
+                    maxLength: 16384
+                    type: string
+                  liveHash:
+                    description: LiveHash fingerprints the node's active config.
+                    type: string
+                  skippedHash:
+                    description: |-
+                      SkippedHash is a rendered config a human skipped for this machine after a failed rollout.
+                      The same config is not rolled out to it again.
+                    type: string
+                type: object
+              etcd:
+                description: EtcdState is the machine's observed etcd membership.
+                properties:
+                  isLearner:
+                    type: boolean
+                  memberID:
+                    type: string
+                type: object
+              identity:
+                description: ObservedIdentity is the identity read from the live node.
+                properties:
+                  hostname:
+                    type: string
+                  kubernetesNodeName:
+                    type: string
+                  nodeID:
+                    description: NodeID is the Talos discovery node ID (reset on wipe).
+                    type: string
+                  systemUUID:
+                    type: string
+                type: object
+              kubelet:
+                description: KubeletState is the observed kubelet state.
+                properties:
+                  version:
+                    type: string
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              phase:
+                description: MachinePhase summarises the machine's lifecycle position.
+                enum:
+                - Pending
+                - AwaitingIdentity
+                - Provisioning
+                - Joining
+                - Ready
+                - Updating
+                - Draining
+                - Rebooting
+                - Removing
+                - Failed
+                type: string
+              talos:
+                description: TalosState is the observed Talos runtime state.
+                properties:
+                  bootID:
+                    description: |-
+                      BootID changes on every reboot. It is empty unless it was read in the last pass, so a node
+                      that is rebooting never shows the boot it left.
+                    type: string
+                  ready:
+                    description: Ready is true only if the node reported itself ready
+                      in the last pass.
+                    type: boolean
+                  schematicID:
+                    type: string
+                  stage:
+                    description: Stage is the Talos machine stage, e.g. running. Empty
+                      unless read in the last pass.
+                    type: string
+                  version:
+                    description: |-
+                      Version and SchematicID keep their last known value when they cannot be read; the
+                      NodeObserved condition says whether they were.
+                    type: string
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

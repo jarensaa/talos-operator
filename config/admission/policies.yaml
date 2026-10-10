@@ -1,0 +1,80 @@
+# Admission rules that need the stored object or a DELETE, so CRD validation cannot express them
+# (docs/scope.md §5.2). They are ValidatingAdmissionPolicies: the API server evaluates them itself,
+# so they hold while the operator is down, which a self-hosted operator's webhook could not
+# guarantee during the very node drains it runs. `make manifests` copies this file into the chart.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: talosclusters.talos.jarensaa.github.io-management-gate
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [talos.jarensaa.github.io]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE]
+        resources: [talosclusters]
+  variables:
+    - name: manage
+      expression: >-
+        has(object.spec.management) && has(object.spec.management.config) &&
+        object.spec.management.config == 'Manage'
+    - name: wasManaged
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.spec.management) &&
+        has(oldObject.spec.management.config) && oldObject.spec.management.config == 'Manage'
+    # Status is read from the stored object: a spec update cannot carry its own status.
+    - name: adopted
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.status) && has(oldObject.status.conditions) &&
+        oldObject.status.conditions.exists(c, c.type == 'Adopted' && c.status == 'True')
+  validations:
+    - expression: "!variables.manage || variables.wasManaged || variables.adopted"
+      message: >-
+        management.config may become Manage only once status shows Adopted=True: the operator
+        must first prove that its rendered config changes nothing on any node
+        (docs/scope.md §7.1 stage 3).
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: talosclusters.talos.jarensaa.github.io-management-gate
+spec:
+  policyName: talosclusters.talos.jarensaa.github.io-management-gate
+  validationActions: [Deny]
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: talosmachines.talos.jarensaa.github.io-deletion-guard
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [talos.jarensaa.github.io]
+        apiVersions: ["*"]
+        operations: [DELETE]
+        resources: [talosmachines]
+  validations:
+    # A GitOps prune or namespace deletion must not silently drop a machine the cluster still
+    # runs on. Deleting the CR never touches the node; desiredState Removed is how a node leaves
+    # (§7.7), and the orphan annotation releases a machine knowingly.
+    - expression: >-
+        (has(oldObject.spec.desiredState) && oldObject.spec.desiredState == 'Removed') ||
+        (has(oldObject.metadata.annotations) &&
+        oldObject.metadata.annotations.exists(k, k == 'talos.jarensaa.github.io/orphan') &&
+        oldObject.metadata.annotations['talos.jarensaa.github.io/orphan'] == 'true')
+      message: >-
+        a TalosMachine with desiredState Present cannot be deleted: set desiredState Removed to
+        take the node out of the cluster, or annotate it talos.jarensaa.github.io/orphan=true to
+        stop managing it while it keeps running.
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: talosmachines.talos.jarensaa.github.io-deletion-guard
+spec:
+  policyName: talosmachines.talos.jarensaa.github.io-deletion-guard
+  validationActions: [Deny]

@@ -1,0 +1,6 @@
+# Applied to every node, as a cluster-wide patch would be: adoption must factor this
+# into the TalosCluster's "all" patch layer.
+apiVersion: v1alpha1
+kind: KubeNodeConfig
+labels:
+  e2e.talos-operator/patched: "true"

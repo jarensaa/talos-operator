@@ -1,0 +1,722 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: talosclusters.talos.jarensaa.github.io
+spec:
+  group: talos.jarensaa.github.io
+  names:
+    kind: TalosCluster
+    listKind: TalosClusterList
+    plural: talosclusters
+    shortNames:
+    - tc
+    singular: taloscluster
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.versions.talos
+      name: Talos
+      type: string
+    - jsonPath: .status.observed.kubernetesVersion
+      name: Kubernetes
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Adopted")].status
+      name: Adopted
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: TalosCluster is a Talos Linux cluster managed (or observed) by
+          the operator.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: TalosClusterSpec defines the desired state of TalosCluster.
+            properties:
+              clusterName:
+                description: ClusterName is the Talos/Kubernetes cluster name. Optional
+                  while observing; immutable once set.
+                type: string
+              config:
+                description: Config is the cluster-wide layer, applied to every machine
+                  before its pool's and its own.
+                items:
+                  description: |-
+                    ConfigSource is one entry of a config layer: config documents (multi-document YAML) merged onto
+                    the generated config with strategic merge (docs/scope.md §5). Documents of the multi-document
+                    kinds are declared whole; the legacy v1alpha1 document is a partial overlay. JSON6902 patches are
+                    refused: they cannot address multi-document configs. Exactly one source is set, and a layer
+                    holds at most 32 entries (MaxItems) so the CEL validation cost stays within the API server
+                    budget.
+                  properties:
+                    configRef:
+                      description: ConfigRef uses the documents of a TalosMachineConfig,
+                        so they can be shared.
+                      properties:
+                        name:
+                          description: Name of the TalosMachineConfig.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    inline:
+                      description: Inline config documents.
+                      maxLength: 262144
+                      type: string
+                    secretKeyRef:
+                      description: |-
+                        SecretKeyRef reads documents from a Secret key, for documents that carry sensitive values.
+                        The key is required. Diffs of the documents it sets are withheld from status.
+                      properties:
+                        key:
+                          description: Key within the Secret. Each referencing field
+                            documents its default.
+                          type: string
+                        name:
+                          description: Name of the Secret.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                  type: object
+                  x-kubernetes-validations:
+                  - message: exactly one of inline, configRef or secretKeyRef must
+                      be set
+                    rule: '(has(self.inline) ? 1 : 0) + (has(self.configRef) ? 1 :
+                      0) + (has(self.secretKeyRef) ? 1 : 0) == 1'
+                  - message: secretKeyRef.key is required for config
+                    rule: '!has(self.secretKeyRef) || has(self.secretKeyRef.key)'
+                maxItems: 32
+                type: array
+              configGeneration:
+                description: ConfigGeneration holds the base config generation inputs.
+                properties:
+                  installer:
+                    description: Installer is the default installer; a pool may override
+                      its schematic.
+                    properties:
+                      factoryURL:
+                        default: https://factory.talos.dev
+                        description: FactoryURL is the Image Factory base URL.
+                        pattern: ^https://
+                        type: string
+                      platform:
+                        default: metal
+                        description: Platform of the installer image, e.g. metal.
+                        type: string
+                      schematicID:
+                        description: SchematicID is the Image Factory schematic ID
+                          (64 hex characters).
+                        pattern: ^[0-9a-f]{64}$
+                        type: string
+                    type: object
+                  options:
+                    description: Options for config generation.
+                    properties:
+                      dnsDomain:
+                        description: DNSDomain of the cluster.
+                        type: string
+                      kubePrismPort:
+                        description: KubePrismPort is the KubePrism listen port.
+                        format: int32
+                        maximum: 65535
+                        minimum: 1
+                        type: integer
+                      podSubnets:
+                        description: PodSubnets are the pod CIDRs.
+                        items:
+                          type: string
+                        type: array
+                      serviceSubnets:
+                        description: ServiceSubnets are the service CIDRs.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  versionContract:
+                    description: |-
+                      VersionContract pins the machine config contract, e.g. v1.14. It is never implied from the
+                      operator's machinery version, so a newer operator cannot silently change generated defaults.
+                    pattern: ^v\d+\.\d+$
+                    type: string
+                type: object
+              controlPlaneEndpoint:
+                description: ControlPlaneEndpoint is the Kubernetes API endpoint.
+                  Optional while observing; immutable once set.
+                pattern: ^https://
+                type: string
+              credentials:
+                default:
+                  source: TalosServiceAccount
+                description: |-
+                  Credentials selects how the operator authenticates to the Talos API (docs/scope.md §9).
+                  By default Talos issues the operator's certificate.
+                properties:
+                  secretRef:
+                    description: |-
+                      SecretRef points to a Secret holding an admin talosconfig (key defaults to "talosconfig").
+                      Only for source Secret.
+                    properties:
+                      key:
+                        description: Key within the Secret. Each referencing field
+                          documents its default.
+                        type: string
+                      name:
+                        description: Name of the Secret.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  source:
+                    default: TalosServiceAccount
+                    description: Source is TalosServiceAccount (default) or Secret.
+                    enum:
+                    - TalosServiceAccount
+                    - Secret
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: secretRef is required for source Secret and not allowed
+                    otherwise
+                  rule: (has(self.source) && self.source == 'Secret') == has(self.secretRef)
+              management:
+                default: {}
+                description: Management enables operator capabilities. Defaults to
+                  observe-only.
+                properties:
+                  config:
+                    default: Observe
+                    description: Config is Observe (read-only) or Manage (the operator
+                      owns the rendered machine config).
+                    enum:
+                    - Observe
+                    - Manage
+                    type: string
+                  membership:
+                    default: Disabled
+                    description: Membership enables adding, removing and replacing
+                      machines.
+                    enum:
+                    - Disabled
+                    - Enabled
+                    type: string
+                  upgrades:
+                    default: Disabled
+                    description: Upgrades enables Talos and Kubernetes version rollouts.
+                    enum:
+                    - Disabled
+                    - Enabled
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: 'upgrades can be Enabled only with config: Manage'
+                  rule: '!has(self.upgrades) || self.upgrades != ''Enabled'' || (has(self.config)
+                    && self.config == ''Manage'')'
+                - message: 'membership can be Enabled only with config: Manage'
+                  rule: '!has(self.membership) || self.membership != ''Enabled'' ||
+                    (has(self.config) && self.config == ''Manage'')'
+              paused:
+                description: Paused stops all mutating actions immediately.
+                type: boolean
+              rollout:
+                default: {}
+                description: Rollout tunes how config changes are applied once config
+                  is Manage.
+                properties:
+                  driftPolicy:
+                    default: Report
+                    description: DriftPolicy is Report (default) or Enforce.
+                    enum:
+                    - Report
+                    - Enforce
+                    type: string
+                  soak:
+                    description: |-
+                      Soak is how long a node must stay healthy under a new config before it is confirmed and the
+                      rollout moves on. Defaults to 2m.
+                    type: string
+                  stepTimeout:
+                    description: |-
+                      StepTimeout bounds every other wait of a node step: for the cluster to be healthy before the
+                      node is touched, and for the node to come back after a try ended unconfirmed.
+                      Defaults to 10m. A timeout is a failure, never a skip.
+                    type: string
+                  tryTimeout:
+                    description: |-
+                      TryTimeout is how long Talos keeps a config applied in try mode before reverting it by
+                      itself. Every change is applied that way. The operator must verify the node from outside,
+                      soak, and confirm within it. Defaults to 5m; it must exceed soak by at least two minutes.
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: soak must not be negative
+                  rule: 'duration(has(self.soak) ? self.soak : ''2m'') >= duration(''0s'')'
+                - message: tryTimeout must exceed soak by at least 2m, or a tried
+                    config could never be confirmed
+                  rule: 'duration(has(self.tryTimeout) ? self.tryTimeout : ''5m'')
+                    >= duration(has(self.soak) ? self.soak : ''2m'') + duration(''2m'')'
+                - message: stepTimeout must exceed soak
+                  rule: 'duration(has(self.stepTimeout) ? self.stepTimeout : ''10m'')
+                    > duration(has(self.soak) ? self.soak : ''2m'')'
+              secretsRef:
+                description: |-
+                  SecretsRef points to a Secret holding the cluster secrets bundle (key defaults to "secrets.yaml";
+                  the Secret defaults to "<name>-talos-secrets").
+                  During adoption the operator writes it if absent and verifies it if present.
+                properties:
+                  key:
+                    description: Key within the Secret. Each referencing field documents
+                      its default.
+                    type: string
+                  name:
+                    description: Name of the Secret.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              versions:
+                description: Versions are the desired Talos and Kubernetes versions.
+                properties:
+                  kubernetes:
+                    description: Kubernetes version, e.g. 1.37.1.
+                    pattern: ^\d+\.\d+\.\d+$
+                    type: string
+                  talos:
+                    description: Talos version, e.g. v1.14.2.
+                    pattern: ^v\d+\.\d+\.\d+$
+                    type: string
+                type: object
+            type: object
+            x-kubernetes-validations:
+            - message: clusterName is immutable once set
+              rule: '!has(oldSelf.clusterName) || (has(self.clusterName) && self.clusterName
+                == oldSelf.clusterName)'
+            - message: controlPlaneEndpoint is immutable once set
+              rule: '!has(oldSelf.controlPlaneEndpoint) || (has(self.controlPlaneEndpoint)
+                && self.controlPlaneEndpoint == oldSelf.controlPlaneEndpoint)'
+          status:
+            description: TalosClusterStatus defines the observed state of TalosCluster.
+            properties:
+              abortedTargets:
+                additionalProperties:
+                  type: string
+                description: |-
+                  AbortedTargets is what the operation a human aborted was rolling out: machine name to
+                  rendered config hash. Those configs are not rolled out to those machines again; a spec that
+                  renders anything else, a revert included, rolls out and clears this.
+                type: object
+              adoption:
+                description: Adoption tracks adoption progress.
+                properties:
+                  liveConfigHashes:
+                    additionalProperties:
+                      type: string
+                    description: LiveConfigHashes maps TalosMachine name to the hash
+                      of the live config proven at adoption.
+                    type: object
+                  preconditions:
+                    description: Preconditions that must hold before adoption can
+                      be proven.
+                    items:
+                      description: Precondition is one named adoption precondition.
+                      properties:
+                        message:
+                          description: Message explains a False or Unknown status.
+                          type: string
+                        name:
+                          description: Name of the precondition, e.g. EtcdHealthy.
+                          type: string
+                        status:
+                          description: Status is True, False or Unknown.
+                          type: string
+                      required:
+                      - name
+                      - status
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  proposalRef:
+                    description: ProposalRef names the ConfigMap holding the proposed
+                      TalosCluster and TalosMachine specs.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  provenAt:
+                    description: ProvenAt is when the no-changes proof last succeeded.
+                    format: date-time
+                    type: string
+                  unmatchedMembers:
+                    description: UnmatchedMembers lists live members (by hostname)
+                      that no TalosMachine claims.
+                    items:
+                      type: string
+                    type: array
+                type: object
+              approval:
+                description: Approval is the change waiting for a human's approval,
+                  if any.
+                properties:
+                  hash:
+                    description: |-
+                      Hash identifies exactly this change: the machines and their current and rendered config
+                      hashes. Annotate the TalosCluster with talos.jarensaa.github.io/approve-diff=<hash> to approve
+                      it; the approval cannot be replayed onto a different change.
+                    type: string
+                  machines:
+                    description: |-
+                      Machines lists the machines whose change needs approval, with the reason. Each machine's
+                      status.config.diff shows its redacted diff.
+                    items:
+                      type: string
+                    type: array
+                required:
+                - hash
+                type: object
+              conditions:
+                description: Conditions represent the latest observations of the cluster.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              history:
+                description: History holds the most recent finished operations, newest
+                  first.
+                items:
+                  description: OperationRecord is a finished operation, kept for the
+                    record.
+                  properties:
+                    completed:
+                      items:
+                        type: string
+                      type: array
+                    finishedAt:
+                      format: date-time
+                      type: string
+                    id:
+                      type: string
+                    message:
+                      type: string
+                    outcome:
+                      description: Outcome is Succeeded, Aborted or Superseded.
+                      type: string
+                    skipped:
+                      items:
+                        type: string
+                      type: array
+                    startedAt:
+                      format: date-time
+                      type: string
+                    type:
+                      description: OperationType is the kind of disruptive operation
+                        holding the cluster lock.
+                      enum:
+                      - ConfigRollout
+                      - TalosUpgrade
+                      - KubernetesUpgrade
+                      - AddControlPlane
+                      - RemoveMachine
+                      - Bootstrap
+                      type: string
+                  required:
+                  - finishedAt
+                  - id
+                  - outcome
+                  - startedAt
+                  - type
+                  type: object
+                maxItems: 10
+                type: array
+              observed:
+                description: Observed is the last observed live state.
+                properties:
+                  etcdMembers:
+                    description: EtcdMembers is the observed etcd membership.
+                    items:
+                      description: EtcdMember is one observed etcd member.
+                      properties:
+                        hostname:
+                          description: Hostname of the member.
+                          type: string
+                        id:
+                          description: ID is the etcd member ID in hex.
+                          type: string
+                        isLearner:
+                          description: IsLearner is true while the member is not yet
+                            a voter.
+                          type: boolean
+                      required:
+                      - hostname
+                      - id
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  kubernetesVersion:
+                    description: KubernetesVersion is the lowest control-plane Kubernetes
+                      version observed.
+                    type: string
+                  observedAt:
+                    description: ObservedAt is when this observation completed.
+                    format: date-time
+                    type: string
+                  talosVersions:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: TalosVersions counts nodes per running Talos version.
+                    type: object
+                type: object
+              observedGeneration:
+                description: ObservedGeneration is the spec generation the status
+                  reflects.
+                format: int64
+                type: integer
+              operation:
+                description: Operation is the in-flight disruptive operation, if any.
+                properties:
+                  bases:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  completed:
+                    description: Completed lists machines already done.
+                    items:
+                      type: string
+                    type: array
+                  current:
+                    description: Current is the in-flight step.
+                    properties:
+                      attempt:
+                        description: Attempt counts tries of this machine's step,
+                          starting at 1; retry increments it.
+                        format: int32
+                        type: integer
+                      class:
+                        description: Class is the change class that selected the node's
+                          apply strategy (docs/scope.md §6.3).
+                        type: string
+                      deadline:
+                        description: Deadline is the step's timeout, e.g. the end
+                          of a TRY window.
+                        format: date-time
+                        type: string
+                      desiredHash:
+                        description: DesiredHash is the hash of the config being applied.
+                        type: string
+                      healthySince:
+                        description: |-
+                          HealthySince is when every verification check first passed without interruption; the
+                          soak is measured from it.
+                        format: date-time
+                        type: string
+                      machine:
+                        description: Machine is the TalosMachine being acted on.
+                        type: string
+                      preRebootBootID:
+                        description: PreRebootBootID is recorded before a reboot so
+                          a resumed step can tell whether it happened.
+                        type: string
+                      previousHash:
+                        description: PreviousHash is the node's config hash before
+                          the step; a reverted try returns to it.
+                        type: string
+                      since:
+                        description: Since is when the step started.
+                        format: date-time
+                        type: string
+                      step:
+                        description: Step is the step name, e.g. Trying or Verifying.
+                        type: string
+                    required:
+                    - machine
+                    - since
+                    - step
+                    type: object
+                  failure:
+                    description: Failure is set when the operation is halted.
+                    properties:
+                      at:
+                        description: At is when the failure was recorded.
+                        format: date-time
+                        type: string
+                      machine:
+                        description: Machine where the failure happened.
+                        type: string
+                      message:
+                        description: Message describes the failure.
+                        type: string
+                      reason:
+                        description: Reason is a machine-readable cause, e.g. RolledBack
+                          or NodeUnreachableAfterRollback.
+                        type: string
+                      remediation:
+                        description: Remediation suggests the next human action.
+                        type: string
+                      step:
+                        description: Step that failed.
+                        type: string
+                      token:
+                        description: |-
+                          Token identifies this failure. The retry, skip-machine and abort annotations must carry it,
+                          so an annotation left behind never acts on a later failure.
+                        type: string
+                    required:
+                    - message
+                    - step
+                    type: object
+                  id:
+                    description: ID uniquely identifies the operation.
+                    type: string
+                  plan:
+                    description: Plan lists machines in execution order.
+                    items:
+                      type: string
+                    type: array
+                  skipped:
+                    description: Skipped lists machines a human skipped after a failure.
+                    items:
+                      type: string
+                    type: array
+                  startedAt:
+                    description: StartedAt is when the operation began.
+                    format: date-time
+                    type: string
+                  target:
+                    description: Target is the operation's goal, e.g. a version.
+                    type: string
+                  targets:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Targets maps each planned machine to the rendered config hash it is to reach, and Bases to
+                      the live config hash it had when the operation was planned. An operation applies exactly
+                      these pairs. A machine that renders, or runs, something else by the time its turn comes ends
+                      the operation, so the new change is planned, classified and approved afresh.
+                    type: object
+                  type:
+                    description: Type of operation.
+                    enum:
+                    - ConfigRollout
+                    - TalosUpgrade
+                    - KubernetesUpgrade
+                    - AddControlPlane
+                    - RemoveMachine
+                    - Bootstrap
+                    type: string
+                required:
+                - id
+                - startedAt
+                - type
+                type: object
+              phase:
+                description: Phase summarises the lifecycle position.
+                enum:
+                - Observing
+                - Adopting
+                - Adopted
+                - Managed
+                - Degraded
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

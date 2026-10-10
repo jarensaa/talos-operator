@@ -1,0 +1,7 @@
+## Append samples of your project ##
+resources:
+- talos_v1alpha1_taloscluster.yaml
+- talos_v1alpha1_talosmachineconfig.yaml
+- talos_v1alpha1_talosmachinepool.yaml
+- talos_v1alpha1_talosmachine.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

@@ -1,0 +1,34 @@
+name: Prune superseded caches
+description: >-
+  Deletes caches of this ref whose key starts with a prefix, except the one just saved. Caches are
+  saved under new keys (per commit, or per tool version), and only the newest is ever restored,
+  so older ones only take space until GitHub evicts them. Nothing is deleted unless the kept
+  cache exists. The job needs `actions: write`.
+
+inputs:
+  prefix:
+    description: Key prefix of the caches to prune.
+    required: true
+  keep:
+    description: Exact key of the cache to keep.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PREFIX: ${{ inputs.prefix }}
+        KEEP: ${{ inputs.keep }}
+      run: |
+        keys=$(gh cache list --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" --key "$PREFIX" --limit 100 --json id,key)
+        if ! jq -e --arg keep "$KEEP" 'any(.[]; .key == $keep)' <<<"$keys" >/dev/null; then
+          echo "::warning::cache $KEEP was not saved; keeping older caches"
+          exit 0
+        fi
+        jq -r --arg keep "$KEEP" '.[] | select(.key != $keep) | "\(.id) \(.key)"' <<<"$keys" |
+          while read -r id key; do
+            echo "deleting $key"
+            gh cache delete --repo "$GITHUB_REPOSITORY" "$id"
+          done

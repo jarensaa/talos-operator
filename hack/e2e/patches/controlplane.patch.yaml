@@ -1,0 +1,9 @@
+# Applied to control planes only (Talos rejects it on workers). Lets the operator, running in the
+# e2e namespace, request its os:admin certificate from Talos (docs/scope.md §9). Adoption must
+# factor this into the TalosCluster's controlPlane patch layer.
+apiVersion: v1alpha1
+kind: KubeTalosAPIAccessConfig
+allowedRoles:
+  - os:admin
+allowedKubernetesNamespaces:
+  - talos-operator-e2e

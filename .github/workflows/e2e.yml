@@ -1,0 +1,166 @@
+name: E2E
+
+# Runs the QEMU Talos harness (docs/dev/e2e.md) on a GitHub-hosted Linux runner, where sudo is
+# passwordless and /dev/kvm is available. This is the project's e2e path; local runs are optional.
+
+on:
+  workflow_dispatch:
+  # Weekly drift check against new Image Factory builds and Talos releases (Monday 03:00 UTC).
+  schedule:
+    - cron: "0 3 * * 1"
+  # Runs on every pull request so "QEMU Talos cluster" can be a required check. The changes job
+  # skips the cluster for PRs that touch nothing it exercises; GitHub treats a skipped required
+  # job as passing.
+  pull_request:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TALOSCTL_VERSION: v1.14.2
+  # Standard private-repo runners have 2 vCPUs and 7 GB RAM: one control plane and one worker fit.
+  CONTROLPLANES: "1"
+  WORKERS: "1"
+  VM_CPUS: "1.0"
+  VM_MEMORY: 2GiB
+
+jobs:
+  changes:
+    name: Detect e2e-relevant changes
+    runs-on: ubuntu-latest
+    outputs:
+      e2e: ${{ steps.filter.outputs.e2e }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          pattern='^(api/|cmd/|internal/|test/e2e/|hack/e2e/|config/crd/|go\.mod$|go\.sum$|Makefile$|\.github/workflows/e2e\.yml$)'
+          if git diff --name-only "$BASE"...HEAD | grep -qE "$pattern"; then
+            echo "e2e=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "e2e=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  e2e:
+    name: QEMU Talos cluster
+    needs: changes
+    if: needs.changes.outputs.e2e == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Cluster creation needs only QEMU and talosctl, so it starts first in the background; Go setup
+    # and test compilation run while the VMs boot, install and bootstrap (~3 minutes).
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable KVM
+        run: |
+          # Without KVM, QEMU falls back to emulation, which is too slow for a Talos cluster.
+          test -e /dev/kvm || { echo "::error::/dev/kvm is not available on this runner"; exit 1; }
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          echo "vCPUs: $(nproc)"; free -m
+
+      - name: Install QEMU and UEFI firmware
+        run: |
+          sudo apt-get update -qq
+          # Headless VMs need none of the recommended GUI/audio packages.
+          sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 qemu-utils ovmf iptables
+
+      - uses: ./.github/actions/install-talosctl
+        with:
+          version: ${{ env.TALOSCTL_VERSION }}
+
+      # Boot ISO and the CNI plugins talosctl downloads for the QEMU network.
+      # Only downloads are cached: the boot ISO and the CNI plugins. ~/.talos/cni/cache is
+      # root-owned runtime state that cannot be archived, which made every save fail.
+      - name: Restore Talos assets
+        id: talos-assets
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.talos/cache
+            ~/.talos/cni/bin
+          key: talos-assets-${{ env.TALOSCTL_VERSION }}
+
+      # The harness is called directly rather than through make: the Makefile needs Go, which is
+      # set up in parallel below. Background processes survive between steps of a job.
+      - name: Start cluster creation
+        run: |
+          # set +e: the step shell runs with -e, and the exit code must always be recorded or
+          # "Wait for cluster" would spin until its timeout.
+          (
+            set +e
+            E2E_DIR="$PWD/.e2e" hack/e2e/cluster-up.sh
+            echo "$?" > "$RUNNER_TEMP/cluster-up.exit"
+          ) > "$RUNNER_TEMP/cluster-up.log" 2>&1 &
+
+      - uses: ./.github/actions/setup-go
+
+      - name: Compile e2e tests
+        run: make test-e2e-build
+
+      - name: Wait for cluster
+        timeout-minutes: 25
+        run: |
+          while [ ! -f "$RUNNER_TEMP/cluster-up.exit" ]; do sleep 5; done
+          cat "$RUNNER_TEMP/cluster-up.log"
+          exit "$(cat "$RUNNER_TEMP/cluster-up.exit")"
+
+      # Caches are written from main only (see test.yml): the weekly run, or a manual one.
+      # talosctl runs under sudo, so the plugins it downloaded are root's; the save runs as the
+      # runner user.
+      - name: Hand Talos assets to the runner user
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.talos-assets.outputs.cache-hit != 'true'
+        run: sudo chown -R "$(id -u):$(id -g)" ~/.talos/cache ~/.talos/cni/bin
+
+      - name: Save Talos assets
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.talos-assets.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.talos/cache
+            ~/.talos/cni/bin
+          key: ${{ steps.talos-assets.outputs.cache-primary-key }}
+
+      - name: Run e2e tests
+        run: make test-e2e
+
+      - name: Collect diagnostics
+        if: failure()
+        run: |
+          mkdir -p e2e-diagnostics
+          cp "$RUNNER_TEMP/cluster-up.log" e2e-diagnostics/ 2>/dev/null || true
+          # VM console logs are the first place to look when nodes never come up.
+          sudo find ~/.talos/clusters/talos-operator-e2e -name '*.log' -exec cp {} e2e-diagnostics/ \; || true
+          sudo chown -R "$(id -u):$(id -g)" e2e-diagnostics || true
+          if [ -s .e2e/talosconfig ] && [ -s .e2e/nodes ]; then
+            while read -r node; do
+              talosctl --talosconfig .e2e/talosconfig -n "$node" dmesg > "e2e-diagnostics/dmesg-$node.log" 2>&1 || true
+              talosctl --talosconfig .e2e/talosconfig -n "$node" services > "e2e-diagnostics/services-$node.txt" 2>&1 || true
+            done < .e2e/nodes
+          fi
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-diagnostics
+          path: e2e-diagnostics/
+          retention-days: 7
+
+      - name: Destroy cluster
+        if: always()
+        run: E2E_DIR="$PWD/.e2e" hack/e2e/cluster-down.sh

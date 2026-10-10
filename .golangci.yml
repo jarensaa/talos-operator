@@ -1,0 +1,62 @@
+version: "2"
+run:
+  allow-parallel-runners: true
+  # Lint e2e-tagged tests too.
+  build-tags:
+    - e2e
+    - parity
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - dupl
+    - errcheck
+    - errorlint
+    - exhaustive
+    - ginkgolinter
+    - goconst
+    - gocyclo
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - nilerr
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    lll:
+      # Signatures with a context, a cluster and a machine do not fit 120; the default is kept
+      # nowhere in practice. One limit, enforced everywhere but in the kubebuilder markers of api/.
+      line-length: 140
+    exhaustive:
+      # A switch with a default has said what happens to everything it does not name.
+      default-signifies-exhaustive: true
+    revive:
+      rules:
+        - name: comment-spacings
+        - name: import-shadowing
+  exclusions:
+    generated: lax
+    rules:
+      - linters:
+          - lll
+        path: api/*
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

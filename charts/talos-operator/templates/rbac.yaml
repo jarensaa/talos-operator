@@ -1,0 +1,162 @@
+{{- /*
+Manager rules come from controller-gen (config/rbac/role.yaml, copied to files/ by `make manifests`)
+so the chart cannot drift from the code's +kubebuilder:rbac markers. They are granted through a
+RoleBinding, which confines them to the release namespace: the operator only ever reads Secrets
+where its TalosClusters live (docs/scope.md §9).
+*/}}
+{{- $generated := .Files.Get "files/manager-role.yaml" | fromYaml }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-manager
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  {{- toYaml $generated.rules | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-operator.fullname" . }}-manager
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Leader election leases in the release namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "talos-operator.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Cluster-scoped reads: Nodes map Talos machines to Kubernetes nodes (kubelet version, readiness).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-reader
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-reader
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-operator.fullname" . }}-node-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Node heartbeats: a rollout only confirms a config change on a node whose kubelet has renewed its
+# Lease since (docs/scope.md §8.5.1). Read access to that one namespace, nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-lease-reader
+  namespace: kube-node-lease
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-lease-reader
+  namespace: kube-node-lease
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "talos-operator.fullname" . }}-node-lease-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.metrics.enabled }}
+---
+# The metrics endpoint authenticates and authorizes scrapers via the Kubernetes API.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-metrics-auth
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-metrics-auth
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-operator.fullname" . }}-metrics-auth
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-metrics-reader
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+{{- end }}
