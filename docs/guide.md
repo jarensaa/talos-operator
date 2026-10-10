@@ -1,27 +1,29 @@
-# Getting started
+# Guide
 
-This installs the operator in observe mode, walks through adopting an existing cluster, and then through changing its config. Nothing on your nodes changes until the cluster is adopted and you choose to switch management on.
+The [README](../README.md#getting-started) takes you from installing the operator to a first config change. This guide has what those steps leave out.
 
-## Before you start
+## Until the next release
 
-You need:
+The README describes two things the current release does not do yet.
 
-- Talos 1.13 or 1.14;
-- Kubernetes 1.30 or newer, for the admission policies the chart installs;
-- installer images from [Image Factory](https://factory.talos.dev). Adoption doesn't understand other installers yet.
+**The operator does not create the resources; it proposes them.** After step 3, wait for the `AdoptionProposed` condition, then read the proposal:
 
-## 1. Let the operator request Talos credentials
-
-The operator doesn't take a talosconfig. Talos issues it a short-lived certificate, once you allow that for the operator's namespace. Add this document to each control plane's machine config:
-
-```yaml
-apiVersion: v1alpha1
-kind: KubeTalosAPIAccessConfig
-allowedRoles: [os:admin]
-allowedKubernetesNamespaces: [talos-operator]
+```bash
+kubectl -n talos-operator get configmap my-cluster-adoption-proposal -o yaml
 ```
 
-Patch one node at a time, with a dry run first to see what it changes and whether Talos wants a reboot for it:
+It holds the `TalosCluster` spec, one `TalosMachinePool` per role and one `TalosMachine` per node, under the keys `taloscluster.yaml`, `talosmachinepools.yaml` and `talosmachines.yaml`. Apply the three documents however you manage your cluster. The rest is as the README says, with two differences: the phase column reads `Observing` until you switch management on, with `ADOPTED` showing `True` next to it; and `Adopted` goes back to false whenever the resources and the nodes stop matching.
+
+**Upgrading the chart does not upgrade the CRDs.** After a `helm upgrade`, apply them yourself:
+
+```bash
+helm show crds oci://ghcr.io/jarensaa/charts/talos-operator --version <version> \
+  | kubectl apply --server-side -f -
+```
+
+## Allowing Talos API access
+
+The `KubeTalosAPIAccessConfig` document of step 1 is the one change you make to your nodes yourself. Patch one control plane at a time, with a dry run first to see what it changes and whether Talos wants a reboot for it:
 
 ```bash
 talosctl -n <node-ip> -e <another-node-ip> patch machineconfig --patch @talos-api-access.yaml --dry-run
@@ -33,30 +35,9 @@ Once it's applied, Talos installs a `serviceaccounts.talos.dev` CRD:
 kubectl get crd serviceaccounts.talos.dev
 ```
 
-## 2. Install the chart
+The operator needs Kubernetes 1.30 or newer for the admission policies the chart installs, and installer images from Image Factory: adoption doesn't understand other installers yet.
 
-Take the version from the [latest release](https://github.com/jarensaa/talos-operator/releases/latest):
-
-```bash
-helm install talos-operator oci://ghcr.io/jarensaa/charts/talos-operator \
-  --version <version> --namespace talos-operator --create-namespace
-```
-
-## 3. Create a cluster
-
-An empty spec means observe only:
-
-```bash
-kubectl apply -f - <<'EOF'
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosCluster
-metadata:
-  name: my-cluster
-  namespace: talos-operator
-EOF
-```
-
-Watch it look around:
+## While a cluster is being adopted
 
 ```bash
 kubectl -n talos-operator describe taloscluster my-cluster
@@ -69,80 +50,31 @@ The conditions tell you where it is:
 | `CredentialsValid` | Talos issued the certificate. `TalosAPIAccessDisabled` here means step 1 didn't take effect. |
 | `TalosAPIReachable`, `Healthy` | The operator can read every node, and Talos's own health checks pass. |
 | `AdoptionPreconditionsMet` | The cluster is in a state that's safe to adopt. The status lists each check. |
-| `AdoptionProposed` | The proposal is ready. |
 
-## 4. Read the proposal
-
-Once `AdoptionProposed` is true:
-
-```bash
-kubectl -n talos-operator get configmap my-cluster-adoption-proposal -o yaml
-```
-
-It holds three documents: the `TalosCluster` spec, one `TalosMachinePool` per role, and one `TalosMachine` per node. Together they reproduce your cluster as it runs now. Talos's defaults aren't in there; they're generated when the config is rendered.
-
-Two Secrets appear alongside it:
-
-- `my-cluster-talos-secrets`: the cluster's secrets bundle, recovered from a control plane.
-- `my-cluster-adoption-backup`: a copy of every node's config as it was before adoption.
-
-## 5. Apply it
-
-Apply the three documents however you manage your cluster: commit them to Git, or `kubectl apply` them. The operator doesn't care how they arrive.
-
-Each machine then reports whether it still matches its node:
+Each machine reports on its own node:
 
 ```bash
 kubectl -n talos-operator get talosmachines
 kubectl -n talos-operator describe talosmachine <name>
 ```
 
-If `ConfigMatchesLive` is false, `status.config.diff` shows what differs, with secrets replaced by a hash. Adjust the config until every machine matches.
+- `ConfigMatchesLive` says whether the machine renders exactly what its node runs. While it is false, `status.config.diff` shows what differs, with secrets replaced by a hash.
+- `NodeObserved` is false when the operator couldn't read everything from the node in its last pass, and names what it couldn't. The stage, readiness and boot ID in status are then empty rather than out of date.
 
-If `NodeObserved` is false, the operator couldn't read everything from that node in its last pass, and the condition names what it couldn't. The stage, readiness and boot ID in status are then empty rather than out of date.
+Two Secrets appear next to the resources, and the operator never deletes them:
 
-## 6. Adopted
+- `my-cluster-talos-secrets`: the cluster's secrets bundle, recovered from a control plane.
+- `my-cluster-adoption-backup`: a copy of every node's config as it was before adoption.
 
-When every node has a matching `TalosMachine`, the operator sends each node a dry-run apply of the config it would own. If every node answers "no changes", the cluster is adopted:
+## Between adoption and management
 
-```console
-$ kubectl -n talos-operator get taloscluster
-NAME         PHASE       TALOS     KUBERNETES   ADOPTED   AGE
-my-cluster   Observing   v1.14.0   1.37.0       True      2d
-```
+Once the cluster is adopted, the resources are yours and the operator only compares. If you change one so that it renders something else, or edit a node by hand, the `TalosCluster` and the machine concerned report that they no longer match, and the API server refuses `config: Manage` until they do again.
 
-If you edit a node by hand afterwards, or change the spec so it renders differently, `Adopted` goes back to false until things match again.
+When you switch management on, the operator repeats the dry run on every node. If it passes, `ConfigHandover` is true and the phase becomes `Managed`. What each node runs at that moment is recorded as its baseline, and `ConfigInSync` reports whether every node still runs its rendered config.
 
-## 7. Switching management on
+## Changing config
 
-Until `Adopted` is true, the API server refuses `config: Manage`. After that:
-
-```bash
-kubectl -n talos-operator patch taloscluster my-cluster --type merge \
-  -p '{"spec":{"management":{"config":"Manage"}}}'
-```
-
-The operator runs the dry-run check once more. If it passes, `ConfigHandover` is true and the phase becomes `Managed`.
-
-From here on the spec is the truth. What each node runs at this moment is recorded as its baseline, and `ConfigInSync` reports whether every node still runs its rendered config.
-
-## 8. Changing config
-
-Edit the config of the cluster, a pool, a machine, or a `TalosMachineConfig` they reference. A good first change is a node label on one pool:
-
-```yaml
-apiVersion: talos.jarensaa.github.io/v1alpha1
-kind: TalosMachinePool
-metadata:
-  name: my-cluster-workers
-spec:
-  config:
-    - inline: |
-        apiVersion: v1alpha1
-        kind: KubeNodeConfig
-        labels:
-          example.com/pool: general
-```
+Edit the config of the cluster, a pool, a machine, or a `TalosMachineConfig` they reference, as in step 7 of the README.
 
 Each affected `TalosMachine` shows what would change before anything does: `status.config.diff`, and `status.config.changeClass`.
 
@@ -214,4 +146,4 @@ A `TalosMachine` can't be deleted while it's `Present`, so a stray prune can't d
 kubectl -n talos-operator annotate talosmachine <name> talos.jarensaa.github.io/orphan=true
 ```
 
-The two Secrets from step 4 stay behind, because the operator never deletes them itself. Delete them if you don't want them.
+The two Secrets adoption wrote stay behind, because the operator never deletes them itself. Delete them if you don't want them.
