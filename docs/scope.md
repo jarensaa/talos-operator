@@ -471,6 +471,7 @@ Adoption is a **staged trust ladder**. The operator is installed first and stays
 
 **Ground rules**
 - The live cluster is the only source of truth; the files it was built from are assumed stale.
+- *This rule is replaced with M4a (§12.14): while a cluster is being adopted the operator creates the resources that describe it. Until that is built, what follows is how adoption works.*
 - **The operator never creates or edits the user's `TalosCluster`/`TalosMachine` resources.** They come from the user (often from Git, through a GitOps tool that would fight operator-created objects). The operator only writes `status`, Events, a proposal ConfigMap, and the secrets/backup Secrets.
 - Until `management.config: Manage`, the controllers only receive a **read-only Talos client interface** that has no mutating methods. This is a guarantee in the type system, not a runtime check.
 - At every stage, a mismatch produces a report and nothing else: no node is ever written to in order to "fix" adoption.
@@ -854,6 +855,10 @@ Three slices, in this order.
 
 **M4a: run as deployed.** So far the e2e runs the controllers inside the test process. After this slice the chart's image runs in the test cluster with two replicas, and a rollout that takes down the node its leader runs on is finished by the other replica. That is the clause of M3's acceptance not yet shown.
 
+Two things ride along, because this is where the chart is first installed, upgraded and adopted with under test:
+- **Adoption creates the resources** (§12.14). Installing the operator and adding a minimal TalosCluster is enough to arrive at `Adopted`, with nothing applied by hand in between.
+- **The chart upgrades its CRDs** (§12.15). An upgrade of the chart leaves the cluster with the CRDs of the new release, and uninstalling it leaves the CRDs and every object of theirs in place.
+
 **M4b: upgrades.** Changing the Talos version in the spec, or the installer a machine is built from, takes every node there one at a time, draining it first. A node that does not come back as expected halts the rollout, and Talos's own fallback to the previous boot is recognised for what it is. Config changes that only take effect through a reinstall, refused today (`RequiresReinstall`), roll out the same way.
 - In: refusing up front what cannot work (a jump Talos does not allow, a version this operator does not support, an installer that does not exist); workers before control planes, control planes one at a time with etcd never at risk; drains that respect disruption budgets and time out; retry, skip and abort as in M3.
 - Out: Kubernetes versions (M5); learning that a new version exists (M6).
@@ -922,7 +927,7 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 
 ### Owned by no milestone, and needing a decision
 
-- **Upgrading the operator itself.** The API is `v1alpha1` and may change between releases, but nothing says how an installed operator and its stored objects get from one release to the next, and Helm does not upgrade the CRDs a chart ships. This needs a rule before a real cluster depends on it.
+- **Upgrading the operator itself.** The API is `v1alpha1` and may change between releases, but nothing says what a release may change in it, or how stored objects get from one shape to the next. How the CRDs themselves are upgraded is settled (§12.15). The rest needs a rule before a real cluster depends on it.
 - **Scale.** Nodes are read one after the other and workers roll one at a time. Both are right for a handful of nodes and wrong for a hundred.
 
 ### Suggested order
@@ -996,6 +1001,13 @@ Decided 2026-10-08:
    - **When:** the weekly run uses three control planes, so the shape is exercised without anyone remembering it. A manual run takes the shape as inputs and is how a branch is shown before it is merged. Pull requests keep one control plane and one worker as their required check, because that is quick and every change needs it.
    - **What depends on people:** a change to how control planes are handled is run on three control planes before it is merged, and its pull request links the run (docs/dev/e2e.md). If that proves easy to forget, the next step is to run the larger shape on every pull request, which costs a few minutes each and nothing else.
    - **What would change this:** a scenario that does not fit 16 GB, for instance several upgrades with image pulls in flight, or a hosted runner that turns out too slow for the timeouts a real cluster would use.
+14. **Adoption creates the resources** (decided 2026-10-10, to be built with M4a). This replaces the ground rule of §7.1 that the operator never creates the user's resources. That rule was there because a GitOps tool fights an operator that keeps writing objects; a one-way handover removes the reason.
+   - **While a cluster is being adopted, the cluster describes the resources.** The operator creates the pools and machines of the live cluster and fills in what the TalosCluster's spec leaves empty, without asking. Adding the TalosCluster is the consent, and none of this writes to a node.
+   - **Once adopted, the resources describe the cluster, and there is no way back.** The phase only moves forward: Adopting, Adopted, Managed. From Adopted on the operator never writes a spec again, and it gives up its recorded ownership of the fields it set, so that whoever manages the resources next is their only owner. A field later removed there is then really removed.
+   - **Whether the resources match the nodes right now is a separate question**, answered by a condition that can turn false again and that still gates `config: Manage`. An edit made between adoption and management is checked like any other.
+   - **The operator only ever updates an object it created and nobody has changed since**, also while adopting. The phase lives in status, and status can be lost; that must never make the operator overwrite what someone else manages.
+   - **Delivery stays the owner's business** (§12.9). With Flux, a Kustomization leaves objects alone that are not in Git, and takes over the fields that are once they are committed. The proposal ConfigMap goes away: the resources themselves are what the operator found, and a second copy would only go stale once someone edits them. Whoever wants them in Git exports them from the cluster. What the proposal's notes said, such as a node whose Talos version differs from the one its config installs, is reported on the TalosCluster instead. Helm only takes over objects that carry its ownership labels, which is the user's to add if they deliver that way.
+15. **The chart installs and upgrades the CRDs; the operator never does** (decided 2026-10-10, to be built with M4a). An operator that registers its own CRDs needs cluster-wide rights to do it, has two replicas of different versions writing them during an upgrade, and makes a first GitOps sync fail until it has started. Helm's `crds/` directory avoids that but installs once and never upgrades. So the CRDs become chart templates: on by default, so that `helm upgrade` upgrades them, switchable off for those who manage CRDs separately, and kept on uninstall, because deleting a CRD deletes every object of its kind.
 
 ## 13. Prior art summary
 
