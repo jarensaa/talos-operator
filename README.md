@@ -12,6 +12,8 @@ It is built for clusters that already exist. The operator derives its resources 
 - **Read-only observation.** Until management is enabled, the operator uses a Talos client that rejects every API call that would modify a node.
 - **Config changes that revert by themselves.** Every change is applied in Talos's try mode, one node at a time. The operator confirms it only after the node answered through another node, sent kubelet heartbeats and stayed healthy for a soak period. Otherwise Talos restores the previous config and the rollout halts before the next node.
 - **Talos upgrades, one node at a time.** A new version or installer is installed to a node's inactive boot slot while it keeps working. Only then is the node drained, with disruption budgets respected, and rebooted. A node that does not come back on the new system, or does not get healthy, halts the upgrade with that node still cordoned. The operator runs two replicas and upgrades the nodes it runs on.
+- **Kubernetes upgrades, one component at a time.** A new version reaches the API servers first, then the other control-plane components, then the kubelets, one minor at a time. Each change is tried and kept only once the component runs the new version. An upgrade is refused up front when a node's Talos does not run the version, or when it would strand a flag or an object of a removed API.
+- **Windows, gates and hooks.** Changes can be held to maintenance windows, made to wait on a CEL expression over any object in the cluster, such as a storage cluster's health, and wrapped in Jobs that run around an operation and around each node.
 - **Classified changes.** Changes to CAs, tokens and other cluster identity are refused. Changes to storage, and anything the operator has no rule for, wait for approval of that exact change.
 - **Machine pools and shared config.** Config is layered: cluster, then pool, then machine. Reusable `TalosMachineConfig` resources can be referenced from any layer, and report how many machines use them.
 - **Config comparison and drift.** Each machine reports whether its rendered config equals the node's live config, per document, with a diff in which secrets are redacted. A node changed by hand is reported, and put back only if the drift policy says so.
@@ -203,6 +205,51 @@ spec:
 
 The operator takes the nodes there one at a time, workers first: it installs the new system next to the running one, drains the node, reboots it, and waits until it is back and healthy. Then it brings each node's config in line, which reboots nothing. `TalosUpToDate` carries the progress, and the [guide](docs/guide.md#upgrading-talos) says what happens when a node does not come back as expected.
 
+### 9. Upgrade Kubernetes
+
+Name the version, with upgrades on:
+
+```yaml
+spec:
+  versions:
+    kubernetes: 1.37.1
+```
+
+The operator changes one component on one node at a time: the API server on every control plane, then the controller manager, the scheduler, and the kubelet on every node. Each is tried first, and kept only once it runs the new version and the cluster stayed healthy. A version more than one minor ahead is reached one minor at a time. `KubernetesUpToDate` carries the progress, and says what stands in the way when the upgrade is refused. The [guide](docs/guide.md#upgrading-kubernetes) has the details, including what the operator leaves alone.
+
+### 10. Say when, and behind what
+
+Three things in `spec.rollout` hold for every kind of change, a config change included:
+
+```yaml
+spec:
+  rollout:
+    maintenanceWindows:
+      - schedule: "0 2 * * 6"       # Saturdays at 02:00
+        duration: 3h
+        timeZone: Europe/Oslo
+    gates:
+      - name: storage-healthy
+        object:
+          apiVersion: ceph.rook.io/v1
+          kind: CephCluster
+          namespace: storage
+          name: storage
+        expression: object.status.ceph.health == "HEALTH_OK"
+    hooks:
+      preNode:
+        - name: announce
+          job:
+            template:
+              spec:
+                containers:
+                  - name: announce
+                    image: registry.example.com/tools:1
+                    command: ["announce", "$(TALOS_NODE)"]
+```
+
+No node is begun outside a window; a node that is being changed when the window closes is finished. A gate must be true before a node is touched and stay true while the node is verified afterwards. A hook is a Job the operator runs and waits for, around the whole operation or around each node. The operator needs permission to read a gate's object, which the chart grants through `gates.rules`. The [guide](docs/guide.md#windows-gates-and-hooks) has the rest.
+
 ## Project status
 
 | Area | State |
@@ -214,15 +261,18 @@ The operator takes the nodes there one at a time, workers first: it installs the
 | Drift reporting and enforcement | Implemented |
 | Applying config changes, with Talos try-mode rollback | Implemented |
 | Talos upgrades: version or installer, drained and rebooted node by node | Implemented |
-| Maintenance windows, user-defined gates, hooks | Planned next |
-| Kubernetes upgrades | Planned |
+| Kubernetes upgrades: the components Talos runs, a minor at a time | Implemented |
+| Maintenance windows, gates on objects in the cluster, hook Jobs | Implemented |
+| The manifests Talos applies at bootstrap (kube-proxy, CoreDNS) | Not planned |
 | Config changes that only an install can make (kernel arguments, install disk) | Not planned |
 | Adding and removing machines | Planned |
 | Metrics, alerts and dashboards | Planned |
 
 The API is `v1alpha1` and may change incompatibly between releases.
 
-Adoption and config rollouts are tested in CI against Talos clusters running in QEMU. The operator under test is the chart's image, installed with two replicas. The tests assert that adoption needs nothing applied by hand and leaves boot IDs and config hashes unchanged, that every node is upgraded to the next Talos release while a workload stays up, that a rollout finishes when the leader is killed in the middle of it, that a label reaches a node without a reboot, and that a config which cuts a node off is reverted and never confirmed.
+Adoption, rollouts and upgrades are tested in CI against Talos clusters running in QEMU. The operator under test is the chart's image, installed with two replicas. The tests assert that adoption needs nothing applied by hand and leaves boot IDs and config hashes unchanged, that every node is upgraded to the next Talos release while a workload stays up, that a rollout finishes when the leader is killed in the middle of it, that a label reaches a node without a reboot, that a config which cuts a node off is reverted and never confirmed, that a rollout waits for its window and its gate and runs its hooks, and that Kubernetes is upgraded by a minor after being refused while an object of a removed API existed.
+
+No cluster other than those depends on the operator yet. That is on purpose: until one does, the API changes without migrations.
 
 ## Non-goals
 
