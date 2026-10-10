@@ -65,11 +65,21 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
-.PHONY: test
-test: manifests generate fmt vet test-unit ## Regenerate, format, vet, then run unit and envtest tests.
+.PHONY: tidy
+tidy: ## Run go mod tidy.
+	go mod tidy
 
-# CI runs test-unit directly: it checks generated code and formatting in a separate step, and
-# golangci-lint already runs vet.
+.PHONY: test
+test: tidy manifests generate fmt vet test-unit ## Tidy, regenerate, format, vet, then run unit and envtest tests.
+
+# What CI refuses: a go.mod that is not tidy, generated files that are stale, code that is not
+# formatted. Run it before pushing; `make test` does the same work and leaves the diff to you.
+.PHONY: committed
+committed: tidy manifests generate fmt ## Check that modules, generated code and formatting are committed.
+	git diff --exit-code
+
+# CI runs test-unit directly: it checks modules, generated code and formatting with `make committed`,
+# and golangci-lint already runs vet.
 .PHONY: test-unit
 test-unit: setup-envtest ## Run unit and envtest tests only.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out

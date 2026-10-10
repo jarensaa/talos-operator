@@ -120,7 +120,8 @@ Go 1.26.5 (required by machinery v1.14; `GOTOOLCHAIN=auto` fetches it). Builds n
 
 ```bash
 make build            # manager binary
-make test             # regenerate, fmt, vet, then unit + envtest
+make test             # tidy, regenerate, fmt, vet, then unit + envtest
+make committed        # what CI checks first: go.mod tidy, generated files and formatting committed
 make test-unit        # unit + envtest only (what CI runs)
 make lint             # golangci-lint, including e2e-tagged code
 make manifests        # CRDs + RBAC; also syncs them and config/admission into charts/talos-operator
