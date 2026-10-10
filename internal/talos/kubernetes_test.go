@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,6 +35,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
+	"go.yaml.in/yaml/v4"
 	"k8s.io/client-go/rest"
 )
 
@@ -425,5 +427,59 @@ func TestUpgraderPullsKubernetesImagesToWhereTheyRun(t *testing.T) {
 
 	if err := u.PullKubernetesImage(ctx, apiNode, "kube-proxy", "registry.k8s.io/kube-proxy:v1.37.1"); err == nil || len(api.pulls) != len(KubernetesComponents) {
 		t.Fatal("what Talos does not run from a node's config is not pulled")
+	}
+}
+
+// The checks may only ask what the operator is allowed to ask: the chart grants a list of exactly
+// the APIs go-kubernetes names as removed, over every hop this operator supports. A newer
+// go-kubernetes that knows of another removed API fails here until the chart grants it too.
+func TestChartGrantsTheUpgradeChecks(t *testing.T) {
+	raw, err := os.ReadFile("../../charts/talos-operator/files/upgrade-check-rules.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var granted struct {
+		Rules []struct {
+			APIGroups []string `yaml:"apiGroups"`
+			Resources []string `yaml:"resources"`
+			Verbs     []string `yaml:"verbs"`
+		} `yaml:"rules"`
+	}
+	if err := yaml.Unmarshal(raw, &granted); err != nil {
+		t.Fatal(err)
+	}
+
+	var may []string
+
+	for _, rule := range granted.Rules {
+		if !slices.Equal(rule.Verbs, []string{"list"}) {
+			t.Fatalf("the checks only list: %+v", rule)
+		}
+
+		for _, group := range rule.APIGroups {
+			for _, resource := range rule.Resources {
+				may = append(may, group+"/"+resource)
+			}
+		}
+	}
+
+	var asks []string
+
+	for _, path := range removedAPIPaths(t) {
+		// /apis/<group>/<version>/<resource>
+		parts := strings.Split(strings.TrimPrefix(path, "/apis/"), "/")
+		if len(parts) != 3 {
+			t.Fatalf("unexpected path %q", path)
+		}
+
+		asks = append(asks, parts[0]+"/"+parts[2])
+	}
+
+	slices.Sort(may)
+	slices.Sort(asks)
+
+	if !slices.Equal(may, slices.Compact(asks)) {
+		t.Fatalf("the chart grants lists of %v, the checks ask for %v", may, asks)
 	}
 }

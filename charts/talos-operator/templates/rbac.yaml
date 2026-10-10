@@ -153,6 +153,92 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "talos-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+---
+# A Kubernetes upgrade is refused while objects of an API exist that the new version stops serving
+# (docs/scope.md §7.4). Finding them means listing them, cluster-wide, and nothing more.
+{{- $checks := .Files.Get "files/upgrade-check-rules.yaml" | fromYaml }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-upgrade-checks
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  {{- toYaml $checks.rules | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-upgrade-checks
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-operator.fullname" . }}-upgrade-checks
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# The kube-proxy Talos deployed when the cluster was bootstrapped is not the operator's to change
+# (docs/scope.md §12.20). It is read to say so when a Kubernetes upgrade left it behind.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-kube-proxy-reader
+  namespace: kube-system
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["kube-proxy"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-kube-proxy-reader
+  namespace: kube-system
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "talos-operator.fullname" . }}-kube-proxy-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- with .Values.gates.rules }}
+---
+# What the gates of spec.rollout.gates read (docs/scope.md §6.4). The operator has no permission
+# for arbitrary kinds: every kind a gate names is granted here, by whoever installs the chart.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" $ }}-gates
+  labels:
+    {{- include "talos-operator.labels" $ | nindent 4 }}
+rules:
+  {{- toYaml . | nindent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" $ }}-gates
+  labels:
+    {{- include "talos-operator.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-operator.fullname" $ }}-gates
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
 {{- if .Values.metrics.enabled }}
 ---
 # The metrics endpoint authenticates and authorizes scrapers via the Kubernetes API.

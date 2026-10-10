@@ -70,6 +70,15 @@ metrics:
   # Serve metrics over HTTPS on 8443, authenticated via the Kubernetes API.
   enabled: true
 
+# Gates (spec.rollout.gates on a TalosCluster) are conditions on objects in the cluster, such as a
+# storage cluster's health. The operator reads a gate's object with its own ServiceAccount and may
+# read nothing it is not granted here: one rule for every kind a gate names, with the verb get.
+gates:
+  rules: []
+  # - apiGroups: ["ceph.rook.io"]
+  #   resources: ["cephclusters"]
+  #   verbs: ["get"]
+
 crds:
   # The CustomResourceDefinitions are part of the release, so `helm upgrade` upgrades them
   # (docs/scope.md §12.15). Disable only if they are installed some other way.
