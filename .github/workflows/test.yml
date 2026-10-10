@@ -107,7 +107,9 @@ jobs:
       - uses: azure/setup-helm@v5
 
       - name: Lint chart
-        run: helm lint charts/talos-operator
+        run: |
+          helm lint charts/talos-operator
+          hack/chart/check.sh charts/talos-operator
 
   release-metadata:
     name: Release metadata

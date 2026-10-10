@@ -113,7 +113,8 @@ make test             # regenerate, fmt, vet, then unit + envtest
 make test-unit        # unit + envtest only (what CI runs)
 make lint             # golangci-lint, including e2e-tagged code
 make manifests        # CRDs + RBAC; also syncs them and config/admission into charts/talos-operator
-make helm-lint        # chart lint
+                      # (CRDs go to the chart's files/crds and are rendered as templates; never add a crds/ directory)
+make helm-lint        # chart lint, and a check of what the chart renders (hack/chart/check.sh)
 ```
 
 e2e runs in CI (`.github/workflows/e2e.yml`) against a QEMU Talos cluster; see docs/dev/e2e.md. e2e tests must be named `TestE2E*` and carry the `e2e` build tag. A pull request's check has one control plane and one worker. A change to how control planes are handled (rollout order and gates, upgrades, etcd membership, adding or removing one) must also be shown on three: `gh workflow run e2e.yml --ref <branch> -f controlplanes=3 -f workers=1`, with the run linked in the pull request. A spec that needs several control planes skips on a smaller cluster and says why.
