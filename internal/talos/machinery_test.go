@@ -482,7 +482,7 @@ func TestMachineryReadsMembersAndEtcd(t *testing.T) {
 	r := reader(c)
 	ctx := context.Background()
 
-	for i, name := range []string{"cp-1", "cp-2", apiWorker} {
+	for i, name := range []string{apiControlPlane, "cp-2", apiWorker} {
 		m := cluster.NewMember(cluster.NamespaceName, name)
 		m.TypedSpec().Hostname = name
 		m.TypedSpec().NodeID = "id-" + name
@@ -510,7 +510,7 @@ func TestMachineryReadsMembersAndEtcd(t *testing.T) {
 
 	// Three voters and a member that was added but never started: an ID, no name.
 	api.etcdMembers = &machineapi.EtcdMemberListResponse{Messages: []*machineapi.EtcdMembers{{Members: []*machineapi.EtcdMember{
-		{Id: 0xa1, Hostname: "cp-1", PeerUrls: []string{"https://10.5.0.2:2380"}},
+		{Id: 0xa1, Hostname: apiControlPlane, PeerUrls: []string{"https://10.5.0.2:2380"}},
 		{Id: 0xa2, Hostname: "cp-2"},
 		{Id: 0xa3, Hostname: "cp-3", IsLearner: true},
 		{Id: 0xbeef},

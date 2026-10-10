@@ -39,9 +39,18 @@ import (
 	"k8s.io/client-go/rest"
 )
 
+const (
+	// kubeFrom is the Kubernetes version these tests upgrade from.
+	kubeFrom        = "1.36.2"
+	kubeTo          = "1.37.1"
+	apiControlPlane = "cp-1"
+	apiWorker1      = "w-1"
+	garbage         = "garbage"
+)
+
 // generated is a machine config as Talos generates it for a contract: Kubernetes components in
 // documents of their own from 1.14 on, in the v1alpha1 document before.
-func generated(t *testing.T, contract *config.VersionContract, role machine.Type, kubernetes string) []byte {
+func generated(t *testing.T, contract *config.VersionContract, role machine.Type) []byte {
 	t.Helper()
 
 	bundle, err := secrets.NewBundle(secrets.NewClock(), contract)
@@ -49,7 +58,7 @@ func generated(t *testing.T, contract *config.VersionContract, role machine.Type
 		t.Fatal(err)
 	}
 
-	input, err := generate.NewInput("c", "https://10.5.0.2:6443", kubernetes,
+	input, err := generate.NewInput("c", "https://10.5.0.2:6443", kubeFrom,
 		generate.WithSecretsBundle(bundle), generate.WithVersionContract(contract))
 	if err != nil {
 		t.Fatal(err)
@@ -73,7 +82,7 @@ var contracts = map[string]*config.VersionContract{"1.14": config.TalosVersion1_
 func TestKubernetesImages(t *testing.T) {
 	for name, contract := range contracts {
 		t.Run(name, func(t *testing.T) {
-			got, err := KubernetesImages(generated(t, contract, machine.TypeControlPlane, "1.36.2"))
+			got, err := KubernetesImages(generated(t, contract, machine.TypeControlPlane))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -95,7 +104,7 @@ func TestKubernetesImages(t *testing.T) {
 			}
 
 			// A worker runs a kubelet and nothing else of Kubernetes.
-			worker, err := KubernetesImages(generated(t, contract, machine.TypeWorker, "1.36.2"))
+			worker, err := KubernetesImages(generated(t, contract, machine.TypeWorker))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -115,7 +124,7 @@ func TestKubernetesImages(t *testing.T) {
 func TestWithKubernetesImage(t *testing.T) {
 	for name, contract := range contracts {
 		t.Run(name, func(t *testing.T) {
-			raw := generated(t, contract, machine.TypeControlPlane, "1.36.2")
+			raw := generated(t, contract, machine.TypeControlPlane)
 
 			before, err := KubernetesImages(raw)
 			if err != nil {
@@ -175,7 +184,7 @@ func TestWithKubernetesImage(t *testing.T) {
 		})
 	}
 
-	raw := generated(t, config.TalosVersion1_14, machine.TypeWorker, "1.36.2")
+	raw := generated(t, config.TalosVersion1_14, machine.TypeWorker)
 	if _, err := WithKubernetesImage(raw, "kube-proxy", "registry.k8s.io/kube-proxy:v1.37.1"); err == nil {
 		t.Fatal("only the components an upgrade takes in order are patched")
 	}
@@ -188,7 +197,7 @@ func TestWithKubernetesImage(t *testing.T) {
 }
 
 func TestKubernetesUpgradeProblem(t *testing.T) {
-	current := map[string]string{"cp-1": "v1.14.2", "w-1": "v1.14.1"}
+	current := map[string]string{apiControlPlane: "v1.14.2", apiWorker1: "v1.14.1"}
 
 	tests := []struct {
 		name     string
@@ -196,18 +205,18 @@ func TestKubernetesUpgradeProblem(t *testing.T) {
 		talos    map[string]string
 		why      string
 	}{
-		{"the next minor", "1.36.2", "1.37.1", current, ""},
-		{"a patch release", "1.37.0", "1.37.1", current, ""},
+		{"the next minor", kubeFrom, kubeTo, current, ""},
+		{"a patch release", "1.37.0", kubeTo, current, ""},
 		{"with a v", "v1.36.2", "v1.37.1", current, ""},
-		{"no nodes read", "1.36.2", "1.37.1", nil, ""},
-		{"a minor skipped", "1.35.4", "1.37.1", current, "one at a time"},
-		{"a downgrade", "1.37.1", "1.36.2", current, "never backwards"},
-		{"a version nobody knows a way to", "1.37.1", "1.99.0", current, "no upgrade"},
+		{"no nodes read", kubeFrom, kubeTo, nil, ""},
+		{"a minor skipped", "1.35.4", kubeTo, current, "one at a time"},
+		{"a downgrade", kubeTo, kubeFrom, current, "never backwards"},
+		{"a version nobody knows a way to", kubeTo, "1.99.0", current, "no upgrade"},
 		// The message names the node and says which side has to move.
-		{"a Talos too old for it", "1.36.2", "1.37.1", map[string]string{"cp-1": "v1.14.2", "w-1": "v1.13.4"}, "w-1 (v1.13.4)"},
-		{"a Talos too old for it, what to do", "1.36.2", "1.37.1", map[string]string{"w-1": "v1.13.4"}, "upgrade Talos first"},
-		{"garbage", "1.36.2", "latest", current, "no upgrade path"},
-		{"a Talos version that is none", "1.36.2", "1.37.1", map[string]string{"w-1": "dev"}, "unparsable Talos version"},
+		{"a Talos too old for it", kubeFrom, kubeTo, map[string]string{apiControlPlane: "v1.14.2", apiWorker1: "v1.13.4"}, "w-1 (v1.13.4)"},
+		{"a Talos too old for it, what to do", kubeFrom, kubeTo, map[string]string{apiWorker1: "v1.13.4"}, "upgrade Talos first"},
+		{garbage, kubeFrom, "latest", current, "no upgrade path"},
+		{"a Talos version that is none", kubeFrom, kubeTo, map[string]string{apiWorker1: "dev"}, "unparsable Talos version"},
 	}
 
 	for _, tt := range tests {
@@ -240,17 +249,21 @@ func (k *kubernetesAPI) serve(t *testing.T) *rest.Config {
 
 		w.Header().Set("Content-Type", "application/json")
 
+		var answer string
+
 		switch {
 		case k.status != 0:
 			w.WriteHeader(k.status)
-			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`)) //nolint:errcheck // a test server
+			answer = `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Forbidden","code":403}`
 		case !known:
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`)) //nolint:errcheck // a test server
+			answer = `{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`
 		default:
 			items := strings.TrimSuffix(strings.Repeat(`{"metadata":{"name":"x"}},`, count), ",")
-			_, _ = w.Write([]byte(`{"kind":"List","apiVersion":"v1","items":[` + items + `]}`)) //nolint:errcheck // a test server
+			answer = `{"kind":"List","apiVersion":"v1","items":[` + items + `]}`
 		}
+
+		_, _ = w.Write([]byte(answer)) //nolint:errcheck // a test server
 	}))
 	t.Cleanup(srv.Close)
 
@@ -290,7 +303,7 @@ func TestRemovedAPIObjects(t *testing.T) {
 	cfg := api.serve(t)
 	ctx := context.Background()
 
-	found, err := RemovedAPIObjects(ctx, cfg, "1.36.2", "1.37.1")
+	found, err := RemovedAPIObjects(ctx, cfg, kubeFrom, kubeTo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -307,18 +320,18 @@ func TestRemovedAPIObjects(t *testing.T) {
 	// A patch release removes nothing.
 	api.asked = nil
 
-	if found, err := RemovedAPIObjects(ctx, cfg, "1.37.0", "1.37.1"); err != nil || len(found) != 0 || len(api.asked) != 0 {
+	if found, err := RemovedAPIObjects(ctx, cfg, "1.37.0", kubeTo); err != nil || len(found) != 0 || len(api.asked) != 0 {
 		t.Fatalf("got %q, %v, asked %v", found, err, api.asked)
 	}
 
 	// What may not be read is not fine.
 	api.status = http.StatusForbidden
 
-	if _, err := RemovedAPIObjects(ctx, cfg, "1.36.2", "1.37.1"); err == nil {
+	if _, err := RemovedAPIObjects(ctx, cfg, kubeFrom, kubeTo); err == nil {
 		t.Fatal("a list that is refused must fail the check")
 	}
 
-	if _, err := RemovedAPIObjects(ctx, cfg, "1.36.2", "latest"); err == nil {
+	if _, err := RemovedAPIObjects(ctx, cfg, kubeFrom, "latest"); err == nil {
 		t.Fatal("a version that is none must fail the check")
 	}
 
@@ -358,7 +371,7 @@ func TestKubernetesUpgradeChecksReadTheNodes(t *testing.T) {
 	kubelet.TypedSpec().Args = []string{"--container-hints=/etc/hints.json", "--v=2"}
 	create(t, api, kubelet)
 
-	found, err := r.KubernetesUpgradeChecks(ctx, "1.36.2", "1.37.1", nodes)
+	found, err := r.KubernetesUpgradeChecks(ctx, kubeFrom, kubeTo, nodes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,15 +392,15 @@ func TestKubernetesUpgradeChecksReadTheNodes(t *testing.T) {
 	}
 
 	// The same flags are fine where nothing removes them.
-	if found, err := r.KubernetesUpgradeChecks(ctx, "1.35.4", "1.36.2", nodes); err != nil || len(found) != 0 {
+	if found, err := r.KubernetesUpgradeChecks(ctx, "1.35.4", kubeFrom, nodes); err != nil || len(found) != 0 {
 		t.Fatalf("got %q, %v", found, err)
 	}
 
-	if found, err := r.KubernetesUpgradeChecks(ctx, "1.36.2", "1.37.1", ClusterInfo{}); err != nil || len(found) != 0 {
+	if found, err := r.KubernetesUpgradeChecks(ctx, kubeFrom, kubeTo, ClusterInfo{}); err != nil || len(found) != 0 {
 		t.Fatalf("no nodes, nothing found: got %q, %v", found, err)
 	}
 
-	if _, err := r.KubernetesUpgradeChecks(ctx, "1.36.2", "latest", nodes); err == nil {
+	if _, err := r.KubernetesUpgradeChecks(ctx, kubeFrom, "latest", nodes); err == nil {
 		t.Fatal("a version that is none must fail the check")
 	}
 }
@@ -425,7 +438,8 @@ func TestUpgraderPullsKubernetesImagesToWhereTheyRun(t *testing.T) {
 		}
 	}
 
-	if err := u.PullKubernetesImage(ctx, apiNode, "kube-proxy", "registry.k8s.io/kube-proxy:v1.37.1"); err == nil || len(api.pulls) != len(KubernetesComponents) {
+	err := u.PullKubernetesImage(ctx, apiNode, "kube-proxy", "registry.k8s.io/kube-proxy:v1.37.1")
+	if err == nil || len(api.pulls) != len(KubernetesComponents) {
 		t.Fatal("what Talos does not run from a node's config is not pulled")
 	}
 }
@@ -464,9 +478,10 @@ func TestChartGrantsTheUpgradeChecks(t *testing.T) {
 		}
 	}
 
-	var asks []string
+	paths := removedAPIPaths(t)
+	asks := make([]string, 0, len(paths))
 
-	for _, path := range removedAPIPaths(t) {
+	for _, path := range paths {
 		// /apis/<group>/<version>/<resource>
 		parts := strings.Split(strings.TrimPrefix(path, "/apis/"), "/")
 		if len(parts) != 3 {

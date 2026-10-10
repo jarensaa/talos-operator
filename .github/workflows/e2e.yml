@@ -75,8 +75,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
-    # An upgrade reboots every node, and the larger shapes have four of them.
-    timeout-minutes: 120
+    # A Talos upgrade reboots every node and a Kubernetes upgrade restarts every component on each,
+    # and the larger shapes have four nodes.
+    timeout-minutes: 180
     # Cluster creation needs only QEMU and talosctl, so it starts first in the background; Go setup
     # and test compilation run while the VMs boot, install and bootstrap (~3 minutes).
     steps:

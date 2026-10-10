@@ -99,6 +99,14 @@ const (
 	editedLabel = "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  edited: \"true\"\n"
 )
 
+// What a hook's Job does in the specs that play the Job controller.
+const (
+	hookSucceeds = "succeed"
+	hookFails    = "fail"
+	// hookJob is the JobSpec of the specs' hooks.
+	hookJob = `{"template":{"spec":{"containers":[{"name":"hook","image":"registry.example.com/hook:1"}]}}}`
+)
+
 func labelConfig(value string) string {
 	return "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  rollout: " + value + "\n"
 }
@@ -1751,7 +1759,7 @@ var _ = Describe("Config rollout", func() {
 			hook := func(name string, timeout time.Duration) talosv1alpha1.Hook {
 				h := talosv1alpha1.Hook{
 					Name: name,
-					Job:  runtime.RawExtension{Raw: []byte(`{"template":{"spec":{"containers":[{"name":"hook","image":"registry.example.com/hook:1"}]}}}`)},
+					Job:  runtime.RawExtension{Raw: []byte(hookJob)},
 				}
 				if timeout > 0 {
 					h.Timeout = &metav1.Duration{Duration: timeout}
@@ -1792,14 +1800,14 @@ var _ = Describe("Config rollout", func() {
 
 			BeforeEach(func() {
 				seen, jobs = nil, map[string]string{}
-				outcome = func(string, string) string { return "succeed" }
+				outcome = func(string, string) string { return hookSucceeds }
 
 				// The Job controller, and the pods it would run: each hook's Job ends as the spec says.
 				kubelets = func() {
 					GinkgoHelper()
 
 					var list batchv1.JobList
-					Expect(k8sClient.List(ctx, &list, client.InNamespace(ns), client.HasLabels{LabelHook})).To(Succeed())
+					Expect(k8sClient.List(ctx, &list, client.InNamespace(ns), client.HasLabels{talosv1alpha1.LabelHook})).To(Succeed())
 
 					for i := range list.Items {
 						job := &list.Items[i]
@@ -1819,13 +1827,13 @@ var _ = Describe("Config rollout", func() {
 						now := metav1.NewTime(clock)
 
 						switch outcome(env["TALOS_HOOK"], env["TALOS_MACHINE"]) {
-						case "succeed":
+						case hookSucceeds:
 							job.Status.StartTime, job.Status.CompletionTime, job.Status.Succeeded = &now, &now, 1
 							job.Status.Conditions = []batchv1.JobCondition{
 								{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue, LastTransitionTime: now},
 								{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, LastTransitionTime: now},
 							}
-						case "fail":
+						case hookFails:
 							job.Status.StartTime, job.Status.Failed = &now, 1
 							job.Status.Conditions = []batchv1.JobCondition{
 								{Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, LastTransitionTime: now, Reason: "BackoffLimitExceeded"},
@@ -1850,13 +1858,13 @@ var _ = Describe("Config rollout", func() {
 						return ""
 					}
 
-					return "succeed"
+					return hookSucceeds
 				}
 
 				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
 				runUntil("the node's hook is started", func() bool { return len(seen) == 2 })
 				advance(time.Minute)
-				Expect(seen).To(Equal([]string{"preRollout", "preNode " + worker1}))
+				Expect(seen).To(Equal([]string{talosv1alpha1.HookPreRollout, "preNode " + worker1}))
 				Expect(applies()).To(BeEmpty(), "nothing is sent to a node before its preNode hooks are through")
 				Expect(inSync().Message).To(ContainSubstring("preNode hook prepare"))
 
@@ -1871,19 +1879,19 @@ var _ = Describe("Config rollout", func() {
 				Expect(metav1.IsControlledBy(job, tc)).To(BeTrue())
 				Expect(job.Name).To(HavePrefix(tc.Name + "-prepare-"))
 
-				outcome = func(string, string) string { return "succeed" }
+				outcome = func(string, string) string { return hookSucceeds }
 				runUntil("the rollout ends", idle)
 
 				Expect(seen).To(Equal([]string{
-					"preRollout",
+					talosv1alpha1.HookPreRollout,
 					"preNode " + worker1, "postNode " + worker1,
 					"preNode " + worker2, "postNode " + worker2,
-					"postRollout",
+					talosv1alpha1.HookPostRollout,
 				}))
 				Expect(applies()).To(Equal([]string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}))
 				Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
 				Expect(tc.Status.History[0].Completed).To(Equal([]string{worker1, worker2}))
-				Expect(envOf(getJob("postRollout"))).NotTo(HaveKey("TALOS_MACHINE"))
+				Expect(envOf(getJob(talosv1alpha1.HookPostRollout))).NotTo(HaveKey("TALOS_MACHINE"))
 			})
 
 			It("holds the lock until the postRollout hooks are through", func() {
@@ -1903,7 +1911,7 @@ var _ = Describe("Config rollout", func() {
 				advance(time.Minute)
 				Expect(applies()).To(HaveLen(4))
 
-				outcome = func(string, string) string { return "succeed" }
+				outcome = func(string, string) string { return hookSucceeds }
 				runUntil("both rollouts end", func() bool { return idle() && len(tc.Status.History) == 2 })
 				Expect(applies()).To(HaveLen(6))
 			})
@@ -1912,10 +1920,10 @@ var _ = Describe("Config rollout", func() {
 				setHooks(everyStage())
 				outcome = func(stage, machine string) string {
 					if stage == talosv1alpha1.HookPreNode && machine == worker1 {
-						return "fail"
+						return hookFails
 					}
 
-					return "succeed"
+					return hookSucceeds
 				}
 
 				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
@@ -1937,14 +1945,14 @@ var _ = Describe("Config rollout", func() {
 				Expect(applies()).To(BeEmpty(), "it stays halted, whatever time passes")
 
 				first := jobs["preNode "+worker1]
-				outcome = func(string, string) string { return "succeed" }
+				outcome = func(string, string) string { return hookSucceeds }
 				annotate(talosv1alpha1.AnnotationRetry, f.Token)
 				runUntil("the rollout ends", idle)
 
 				Expect(jobs["preNode "+worker1]).NotTo(Equal(first), "a retry is a Job of its own")
 				Expect(seen).To(Equal([]string{
-					"preRollout", "preNode " + worker1, "preNode " + worker1, "postNode " + worker1,
-					"preNode " + worker2, "postNode " + worker2, "postRollout",
+					talosv1alpha1.HookPreRollout, "preNode " + worker1, "preNode " + worker1, "postNode " + worker1,
+					"preNode " + worker2, "postNode " + worker2, talosv1alpha1.HookPostRollout,
 				}))
 				Expect(applies()).To(HaveLen(4))
 			})
@@ -1953,10 +1961,10 @@ var _ = Describe("Config rollout", func() {
 				setHooks(everyStage())
 				outcome = func(stage, machine string) string {
 					if stage == talosv1alpha1.HookPreNode && machine == worker1 {
-						return "fail"
+						return hookFails
 					}
 
-					return "succeed"
+					return hookSucceeds
 				}
 
 				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
@@ -1966,7 +1974,9 @@ var _ = Describe("Config rollout", func() {
 
 				Expect(applies()).To(Equal([]string{tried(worker2), confirmed(worker2)}))
 				Expect(tc.Status.History[0].Skipped).To(Equal([]string{worker1}))
-				Expect(seen).To(Equal([]string{"preRollout", "preNode " + worker1, "preNode " + worker2, "postNode " + worker2, "postRollout"}))
+				Expect(seen).To(Equal([]string{
+					talosv1alpha1.HookPreRollout, "preNode " + worker1, "preNode " + worker2, "postNode " + worker2, talosv1alpha1.HookPostRollout,
+				}))
 
 				advance(time.Hour)
 				Expect(operation()).To(BeNil(), "and the rollout does not come back for it")
@@ -1977,10 +1987,10 @@ var _ = Describe("Config rollout", func() {
 				setHooks(everyStage())
 				outcome = func(stage, _ string) string {
 					if stage == talosv1alpha1.HookPreNode {
-						return "fail"
+						return hookFails
 					}
 
-					return "succeed"
+					return hookSucceeds
 				}
 
 				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
@@ -1988,7 +1998,7 @@ var _ = Describe("Config rollout", func() {
 				annotate(talosv1alpha1.AnnotationAbort, operation().Failure.Token)
 				runUntil("the rollout ends", idle)
 
-				Expect(seen).To(Equal([]string{"preRollout", "preNode " + worker1, "postRollout"}))
+				Expect(seen).To(Equal([]string{talosv1alpha1.HookPreRollout, "preNode " + worker1, talosv1alpha1.HookPostRollout}))
 				Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
 				Expect(applies()).To(BeEmpty())
 				advance(time.Hour)
@@ -1996,7 +2006,7 @@ var _ = Describe("Config rollout", func() {
 
 				// Another change, whose very first hook fails: what was not set up is not taken down.
 				seen = nil
-				outcome = func(string, string) string { return "fail" }
+				outcome = func(string, string) string { return hookFails }
 
 				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("two"))
 				runUntil("the rollout halts", failed)
@@ -2005,7 +2015,7 @@ var _ = Describe("Config rollout", func() {
 
 				annotate(talosv1alpha1.AnnotationAbort, operation().Failure.Token)
 				runUntil("the rollout ends", idle)
-				Expect(seen).To(Equal([]string{"preRollout"}))
+				Expect(seen).To(Equal([]string{talosv1alpha1.HookPreRollout}))
 			})
 
 			It("halts on a hook that does not finish in its time", func() {
@@ -2045,7 +2055,7 @@ var _ = Describe("Config rollout", func() {
 						return ""
 					}
 
-					return "succeed"
+					return hookSucceeds
 				}
 
 				setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
@@ -2057,7 +2067,7 @@ var _ = Describe("Config rollout", func() {
 				advance(time.Minute)
 				Expect(seen).To(HaveLen(2), "the Job that runs is found, not started again")
 
-				outcome = func(string, string) string { return "succeed" }
+				outcome = func(string, string) string { return hookSucceeds }
 				runUntil("the rollout ends", idle)
 				Expect(seen).To(HaveLen(6))
 			})
@@ -2547,7 +2557,7 @@ var _ = Describe("Config rollout", func() {
 				inner()
 
 				var list batchv1.JobList
-				Expect(k8sClient.List(ctx, &list, client.InNamespace(ns), client.HasLabels{LabelHook})).To(Succeed())
+				Expect(k8sClient.List(ctx, &list, client.InNamespace(ns), client.HasLabels{talosv1alpha1.LabelHook})).To(Succeed())
 
 				for i := range list.Items {
 					job := &list.Items[i]
@@ -2555,7 +2565,7 @@ var _ = Describe("Config rollout", func() {
 						continue
 					}
 
-					hooks = append(hooks, job.Labels[LabelHook])
+					hooks = append(hooks, job.Labels[talosv1alpha1.LabelHook])
 
 					now := metav1.NewTime(clock)
 					job.Status.StartTime, job.Status.CompletionTime, job.Status.Succeeded = &now, &now, 1
@@ -2567,7 +2577,7 @@ var _ = Describe("Config rollout", func() {
 				}
 			}
 
-			job := runtime.RawExtension{Raw: []byte(`{"template":{"spec":{"containers":[{"name":"hook","image":"registry.example.com/hook:1"}]}}}`)}
+			job := runtime.RawExtension{Raw: []byte(hookJob)}
 			updateCluster(func(tc *talosv1alpha1.TalosCluster) {
 				tc.Spec.Rollout.Hooks = &talosv1alpha1.RolloutHooks{
 					PreRollout: []talosv1alpha1.Hook{{Name: "announce", Job: job}}, PostRollout: []talosv1alpha1.Hook{{Name: "all-clear", Job: job}},

@@ -24,6 +24,18 @@ import (
 	"time"
 )
 
+// Words and times the policy specs keep coming back to.
+const (
+	wordPaused      = "paused"
+	wordOutside     = "outside"
+	wordAborted     = "aborted"
+	nightlySchedule = "0 2 * * *"
+	nightlyCloses   = "2026-03-04T05:00:00Z"
+	beginW1         = "begin w1"
+	verifiedW1      = "verified w1"
+	lastHook        = "postRollout[0] "
+)
+
 func at(t *testing.T, value string) time.Time {
 	t.Helper()
 
@@ -36,8 +48,8 @@ func at(t *testing.T, value string) time.Time {
 }
 
 func TestWindows(t *testing.T) {
-	nightly := Window{Schedule: "0 2 * * *", Duration: 3 * time.Hour}
-	oslo := Window{Schedule: "0 2 * * *", Duration: 3 * time.Hour, TimeZone: "Europe/Oslo"}
+	nightly := Window{Schedule: nightlySchedule, Duration: 3 * time.Hour}
+	oslo := Window{Schedule: nightlySchedule, Duration: 3 * time.Hour, TimeZone: "Europe/Oslo"}
 	saturday := Window{Schedule: "30 22 * * 6", Duration: 4 * time.Hour}
 
 	tests := []struct {
@@ -50,9 +62,9 @@ func TestWindows(t *testing.T) {
 	}{
 		{"no windows: any time", nil, "2026-03-04T12:00:00Z", true, ""},
 		{"before it opens", []Window{nightly}, "2026-03-04T01:59:59Z", false, "2026-03-04T02:00:00Z"},
-		{"as it opens", []Window{nightly}, "2026-03-04T02:00:00Z", true, "2026-03-04T05:00:00Z"},
-		{"inside", []Window{nightly}, "2026-03-04T04:59:59Z", true, "2026-03-04T05:00:00Z"},
-		{"as it closes", []Window{nightly}, "2026-03-04T05:00:00Z", false, "2026-03-05T02:00:00Z"},
+		{"as it opens", []Window{nightly}, "2026-03-04T02:00:00Z", true, nightlyCloses},
+		{"inside", []Window{nightly}, "2026-03-04T04:59:59Z", true, nightlyCloses},
+		{"as it closes", []Window{nightly}, nightlyCloses, false, "2026-03-05T02:00:00Z"},
 		// 02:00 in Oslo is 01:00 UTC in winter and 00:00 UTC in summer.
 		{"a time zone, winter", []Window{oslo}, "2026-01-15T01:30:00Z", true, "2026-01-15T04:00:00Z"},
 		{"a time zone, summer", []Window{oslo}, "2026-07-15T00:30:00Z", true, "2026-07-15T03:00:00Z"},
@@ -60,7 +72,7 @@ func TestWindows(t *testing.T) {
 		// 2026-03-07 is a Saturday; the window runs into Sunday.
 		{"across midnight", []Window{saturday}, "2026-03-08T01:00:00Z", true, "2026-03-08T02:30:00Z"},
 		{"the wrong day", []Window{saturday}, "2026-03-04T23:00:00Z", false, "2026-03-07T22:30:00Z"},
-		{"any of several", []Window{saturday, nightly}, "2026-03-04T03:00:00Z", true, "2026-03-04T05:00:00Z"},
+		{"any of several", []Window{saturday, nightly}, "2026-03-04T03:00:00Z", true, nightlyCloses},
 		{"the next of several", []Window{saturday, nightly}, "2026-03-07T12:00:00Z", false, "2026-03-07T22:30:00Z"},
 		{"the longest of those open", []Window{nightly, {Schedule: "0 3 * * *", Duration: 5 * time.Hour}},
 			"2026-03-04T03:30:00Z", true, "2026-03-04T08:00:00Z"},
@@ -102,11 +114,11 @@ func TestWindowsThatCannotBeUnderstoodAreClosed(t *testing.T) {
 		"six fields":           {Schedule: "0 0 2 * * *", Duration: time.Hour},
 		"a day that is none":   {Schedule: "0 2 * * 9", Duration: time.Hour},
 		"a date never reached": {Schedule: "0 0 31 2 *", Duration: time.Hour},
-		"no such time zone":    {Schedule: "0 2 * * *", Duration: time.Hour, TimeZone: "Europe/Atlantis"},
+		"no such time zone":    {Schedule: nightlySchedule, Duration: time.Hour, TimeZone: "Europe/Atlantis"},
 		"a zone in the cron":   {Schedule: "CRON_TZ=Europe/Oslo 0 2 * * *", Duration: time.Hour},
-		"no duration":          {Schedule: "0 2 * * *"},
-		"a negative duration":  {Schedule: "0 2 * * *", Duration: -time.Hour},
-		"longer than a week":   {Schedule: "0 2 * * *", Duration: 8 * 24 * time.Hour},
+		"no duration":          {Schedule: nightlySchedule},
+		"a negative duration":  {Schedule: nightlySchedule, Duration: -time.Hour},
+		"longer than a week":   {Schedule: nightlySchedule, Duration: 8 * 24 * time.Hour},
 	} {
 		// Even next to a window that is open right now.
 		gate, _, err := Windows([]Window{good, w}, at(t, "2026-03-04T03:00:00Z"))
@@ -179,11 +191,11 @@ func TestPolicy(t *testing.T) {
 			reason string
 		}{
 			{Policy{}, ""},
-			{Policy{OutsideWindow: "outside"}, BlockOutsideWindow},
+			{Policy{OutsideWindow: wordOutside}, BlockOutsideWindow},
 			{Policy{OutsideWindow: "maintenanceWindows[0]: bad", WindowsInvalid: true}, BlockInvalid},
 			{Policy{GateClosed: "gate ceph: closed"}, BlockGateClosed},
 			// When it is, before whether it could.
-			{Policy{OutsideWindow: "outside", GateClosed: "gate ceph: closed"}, BlockOutsideWindow},
+			{Policy{OutsideWindow: wordOutside, GateClosed: "gate ceph: closed"}, BlockOutsideWindow},
 		} {
 			reason, message := plan(tt.policy)
 			if reason != tt.reason {
@@ -305,24 +317,24 @@ func (o *operation) run(t *testing.T, hold Gate) {
 }
 
 func TestAnOperationRunsItsHooksInOrder(t *testing.T) {
-	op := &operation{hooks: Hooks{PreRollout: 1, PostRollout: 1, PreNode: 2, PostNode: 1}, plan: []string{"w1", "cp1"}}
+	op := &operation{hooks: Hooks{PreRollout: 1, PostRollout: 1, PreNode: 2, PostNode: 1}, plan: []string{"w1", kubeCP1}}
 	op.run(t, Gate{Open: true})
 
 	want := []string{
 		"preRollout[0] ",
-		"preNode[0] w1", "preNode[1] w1", "begin w1", "verified w1", "postNode[0] w1",
+		"preNode[0] w1", "preNode[1] w1", beginW1, verifiedW1, "postNode[0] w1",
 		"preNode[0] cp1", "preNode[1] cp1", "begin cp1", "verified cp1", "postNode[0] cp1",
-		"postRollout[0] ",
+		lastHook,
 	}
 	if !slices.Equal(op.events, want) || !op.finished || op.outcome != "Succeeded" {
 		t.Fatalf("got %q (finished %v, %s)\nwant %q", op.events, op.finished, op.outcome, want)
 	}
 
 	// Without hooks an operation is its turns and nothing else.
-	plain := &operation{plan: []string{"w1", "cp1"}}
+	plain := &operation{plan: []string{"w1", kubeCP1}}
 	plain.run(t, Gate{Open: true})
 
-	if want := []string{"begin w1", "verified w1", "begin cp1", "verified cp1"}; !slices.Equal(plain.events, want) || !plain.finished {
+	if want := []string{beginW1, verifiedW1, "begin cp1", "verified cp1"}; !slices.Equal(plain.events, want) || !plain.finished {
 		t.Fatalf("got %q (finished %v)", plain.events, plain.finished)
 	}
 }
@@ -333,21 +345,21 @@ func TestAHoldLetsTheNodeInFlightFinish(t *testing.T) {
 	hooks := Hooks{PreRollout: 1, PostRollout: 1, PreNode: 1, PostNode: 1}
 	closed := Gate{Reason: "outside the maintenance windows"}
 
-	fresh := &operation{hooks: hooks, plan: []string{"w1", "cp1"}}
+	fresh := &operation{hooks: hooks, plan: []string{"w1", kubeCP1}}
 	fresh.run(t, closed)
 
 	if len(fresh.events) != 0 {
 		t.Fatalf("nothing starts while the hold is closed, not even a preRollout hook: %q", fresh.events)
 	}
 
-	op := &operation{hooks: hooks, plan: []string{"w1", "cp1"}}
-	for !slices.Contains(op.events, "begin w1") {
+	op := &operation{hooks: hooks, plan: []string{"w1", kubeCP1}}
+	for !slices.Contains(op.events, beginW1) {
 		op.advance(Gate{Open: true})
 	}
 
 	op.run(t, closed)
 
-	if want := []string{"preRollout[0] ", "preNode[0] w1", "begin w1", "verified w1", "postNode[0] w1"}; !slices.Equal(op.events, want) {
+	if want := []string{"preRollout[0] ", "preNode[0] w1", beginW1, verifiedW1, "postNode[0] w1"}; !slices.Equal(op.events, want) {
 		t.Fatalf("the node in flight is finished, hooks included, and no other begins:\n got %q\nwant %q", op.events, want)
 	}
 
@@ -363,7 +375,7 @@ func TestAHoldLetsTheNodeInFlightFinish(t *testing.T) {
 
 	// The last node's end is the operation's end, window or not: nothing new begins by it.
 	last := &operation{hooks: hooks, plan: []string{"w1"}}
-	for !slices.Contains(last.events, "begin w1") {
+	for !slices.Contains(last.events, beginW1) {
 		last.advance(Gate{Open: true})
 	}
 
@@ -380,9 +392,9 @@ func TestAnOperationThatEndsEarlyStillCleansUp(t *testing.T) {
 	hooks := Hooks{PreRollout: 1, PostRollout: 2}
 
 	announced := &operation{hooks: hooks, plan: []string{"w1"}, p: Progress{Announced: true, Ending: true}}
-	announced.run(t, Gate{Reason: "paused"})
+	announced.run(t, Gate{Reason: wordPaused})
 
-	if want := []string{"postRollout[0] ", "postRollout[1] "}; !slices.Equal(announced.events, want) || !announced.finished {
+	if want := []string{lastHook, "postRollout[1] "}; !slices.Equal(announced.events, want) || !announced.finished {
 		t.Fatalf("got %q (finished %v)", announced.events, announced.finished)
 	}
 
@@ -442,6 +454,15 @@ func TestNextTurnInvariants(t *testing.T) {
 }
 
 func turnRule(p Progress, hooks Hooks, hold Gate, turn Turn) string {
+	if broken := beginRule(p, hooks, hold, turn); broken != "" {
+		return broken
+	}
+
+	return endRule(p, hooks, turn)
+}
+
+// beginRule holds an answer against the rules for what an operation may begin.
+func beginRule(p Progress, hooks Hooks, hold Gate, turn Turn) string {
 	starts := func(stage string) bool { return turn.Kind == TurnStartHook && turn.Stage == stage && turn.Index == 0 }
 	busy := p.Hook != "" || p.Current != "" || p.Finishing != ""
 
@@ -452,6 +473,18 @@ func turnRule(p Progress, hooks Hooks, hold Gate, turn Turn) string {
 		return "a node began without its preNode hooks"
 	case turn.Kind == TurnBegin && (!p.Announced || p.Ending || busy):
 		return "a node began while the operation was not ready for one"
+	case turn.Kind == TurnStartHook && turn.Index >= hooks.count(turn.Stage):
+		return "a hook that does not exist was started"
+	}
+
+	return ""
+}
+
+// endRule holds an answer against the rules for what an operation may leave behind.
+func endRule(p Progress, hooks Hooks, turn Turn) string {
+	busy := p.Hook != "" || p.Current != "" || p.Finishing != ""
+
+	switch {
 	case turn.Kind == TurnComplete && hooks.PostNode > 0 && (p.Hook != HookPostNode || !p.HookDone || p.HookIndex+1 < hooks.PostNode):
 		return "a node was completed before its postNode hooks ran"
 	case turn.Kind == TurnFinish && p.Announced && hooks.PostRollout > 0 &&
@@ -465,8 +498,6 @@ func turnRule(p Progress, hooks Hooks, hold Gate, turn Turn) string {
 		return "a node that is being changed was left"
 	case turn.Kind == TurnEnd && (p.Next != "" || busy):
 		return "the operation ended with something left to do"
-	case turn.Kind == TurnStartHook && turn.Index >= hooks.count(turn.Stage):
-		return "a hook that does not exist was started"
 	}
 
 	return ""

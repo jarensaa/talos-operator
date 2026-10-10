@@ -263,23 +263,13 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 			continue
 		}
 
-		// A document of a Kubernetes component: its image is the Kubernetes upgrade's to change,
-		// everything else in it is classified as the document is.
 		if kubernetesKinds[kindOf(k)] && inLive && inDesired {
-			paths, err := changedPaths(a, b)
+			classified, err := classifyComponent(k, a, b, note)
 			if err != nil {
-				return Change{}, fmt.Errorf("compare %s: %w", k, err)
+				return Change{}, err
 			}
 
-			for _, p := range paths {
-				if p == componentImage {
-					note(Kubernetes, string(k)+": "+p)
-				} else {
-					note(kindClass(k), string(k)+": "+p)
-				}
-			}
-
-			if len(paths) > 0 {
+			if classified {
 				continue
 			}
 		}
@@ -313,6 +303,28 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 	slices.Sort(out.Reasons)
 
 	return out, nil
+}
+
+// classifyComponent classifies the change of a Kubernetes component's document field by field:
+// its image is the Kubernetes upgrade's to change, everything else in it is classified as the
+// document is. It reports false when the field comparison finds nothing, for the caller to
+// classify the document as a whole.
+func classifyComponent(k render.DocKey, live, desired []byte, note func(Class, string)) (bool, error) {
+	paths, err := changedPaths(live, desired)
+	if err != nil {
+		return false, fmt.Errorf("compare %s: %w", k, err)
+	}
+
+	for _, p := range paths {
+		class := kindClass(k)
+		if p == componentImage {
+			class = Kubernetes
+		}
+
+		note(class, string(k)+": "+p)
+	}
+
+	return len(paths) > 0, nil
 }
 
 func isKind(key render.DocKey, kind string) bool { return kindOf(key) == kind }

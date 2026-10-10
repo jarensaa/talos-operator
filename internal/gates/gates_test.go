@@ -24,17 +24,23 @@ import (
 	"github.com/jarensaa/talos-operator/internal/gates"
 )
 
+const (
+	statusField = "status"
+	notBoolean  = "not a boolean"
+	noCompile   = "does not compile"
+)
+
 func cephCluster(health string) map[string]any {
 	return map[string]any{
 		"apiVersion": "ceph.rook.io/v1",
 		"kind":       "CephCluster",
 		"metadata":   map[string]any{"name": "storage", "namespace": "storage", "generation": int64(3)},
-		"status": map[string]any{
+		statusField: map[string]any{
 			"ceph":               map[string]any{"health": health},
 			"observedGeneration": int64(3),
 			"conditions": []any{
-				map[string]any{"type": "Ready", "status": "True"},
-				map[string]any{"type": "Progressing", "status": "False"},
+				map[string]any{"type": "Ready", statusField: "True"},
+				map[string]any{"type": "Progressing", statusField: "False"},
 			},
 		},
 	}
@@ -53,18 +59,20 @@ func TestEvaluate(t *testing.T) {
 	}{
 		{"true", healthy, cephCluster("HEALTH_OK"), true, ""},
 		{"false", healthy, cephCluster("HEALTH_WARN"), false, ""},
-		{"a list of conditions", `object.status.conditions.exists(c, c.type == "Ready" && c.status == "True")`, cephCluster("HEALTH_OK"), true, ""},
+		{"a list of conditions", `object.status.conditions.exists(c, c.type == "Ready" && c.status == "True")`,
+			cephCluster("HEALTH_OK"), true, ""},
 		{"numbers", `object.status.observedGeneration == object.metadata.generation`, cephCluster("HEALTH_OK"), true, ""},
-		{"a field that may be absent, asked for", `has(object.status.phase) && object.status.phase == "Ready"`, cephCluster("HEALTH_OK"), false, ""},
+		{"a field that may be absent, asked for", `has(object.status.phase) && object.status.phase == "Ready"`,
+			cephCluster("HEALTH_OK"), false, ""},
 		{"a boolean field", `object.spec.ready`, map[string]any{"spec": map[string]any{"ready": true}}, true, ""},
 		// Everything below is not a plain true or false, and so an error: the gate stays closed.
-		{"a field that is not there", healthy, map[string]any{"status": map[string]any{}}, false, "no such key"},
+		{"a field that is not there", healthy, map[string]any{statusField: map[string]any{}}, false, "no such key"},
 		{"an object without a status", healthy, map[string]any{"metadata": map[string]any{}}, false, "no such key"},
 		{"no object", healthy, nil, false, "no object"},
-		{"not a boolean", `object.status.ceph.health`, cephCluster("HEALTH_OK"), false, "not a boolean"},
-		{"never a boolean", `"always"`, cephCluster("HEALTH_OK"), false, "not a boolean"},
-		{"does not compile", `object.status.ceph.health ==`, cephCluster("HEALTH_OK"), false, "does not compile"},
-		{"another variable", `cluster.status.healthy`, cephCluster("HEALTH_OK"), false, "does not compile"},
+		{notBoolean, `object.status.ceph.health`, cephCluster("HEALTH_OK"), false, notBoolean},
+		{"never a boolean", `"always"`, cephCluster("HEALTH_OK"), false, notBoolean},
+		{noCompile, `object.status.ceph.health ==`, cephCluster("HEALTH_OK"), false, noCompile},
+		{"another variable", `cluster.status.healthy`, cephCluster("HEALTH_OK"), false, noCompile},
 		{"compares what cannot be compared", `object.status.ceph.health > 3`, cephCluster("HEALTH_OK"), false, "could not be evaluated"},
 	}
 

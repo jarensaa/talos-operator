@@ -138,8 +138,6 @@ const (
 	ReasonAwaitingKubernetesUpgrade = "AwaitingKubernetesUpgrade"
 	// ReasonOutsideWindow: no maintenance window is open (docs/scope.md §6.4).
 	ReasonOutsideWindow = "OutsideWindow"
-	// ReasonClusterUnhealthy: a Kubernetes upgrade starts only on a cluster that is healthy.
-	ReasonClusterUnhealthy = "ClusterUnhealthy"
 	// Reasons of TalosUpToDate and KubernetesUpToDate.
 	ReasonUpgrading        = "Upgrading"
 	ReasonUpgradesDisabled = "UpgradesDisabled"
@@ -167,4 +165,6 @@ const (
 	AnnotationOrphan = "talos.jarensaa.github.io/orphan"
 	// LabelCluster names the TalosCluster an operator-created object belongs to.
 	LabelCluster = "talos.jarensaa.github.io/cluster"
+	// LabelHook marks the Job of a hook with the stage it ran at (docs/scope.md §6.4).
+	LabelHook = "talos.jarensaa.github.io/hook"
 )

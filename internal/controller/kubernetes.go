@@ -175,7 +175,8 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	// A version the nodes' Talos does not run may not even render. It is refused for what it is,
 	// before anything is asked of a rendered config.
 	if problem := unsupportedKubernetes(tc, obs); problem != "" {
-		setCondition(st, tc.Generation, talosv1alpha1.ConditionKubernetesUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonIncompatible, problem)
+		setCondition(st, tc.Generation, talosv1alpha1.ConditionKubernetesUpToDate, metav1.ConditionFalse,
+			talosv1alpha1.ReasonIncompatible, problem)
 
 		return false, &metav1.Condition{
 			Type: talosv1alpha1.ConditionRolloutBlocked, Status: metav1.ConditionTrue, Reason: talosv1alpha1.ReasonIncompatible,
@@ -307,10 +308,12 @@ func (r *TalosClusterReconciler) reportKubernetes(ctx context.Context, tc *talos
 
 	switch {
 	case st.Operation != nil && st.Operation.Type == talosv1alpha1.OperationKubernetesUpgrade:
-		upToDate(metav1.ConditionFalse, talosv1alpha1.ReasonUpgrading, "upgrading to %s: %s", result.Hop.Version, strings.Join(result.Pending, ", "))
+		upToDate(metav1.ConditionFalse, talosv1alpha1.ReasonUpgrading, "upgrading to %s: %s", result.Hop.Version,
+			strings.Join(result.Pending, ", "))
 	case len(result.Behind) > 0 && !enabled:
 		upToDate(metav1.ConditionFalse, talosv1alpha1.ReasonUpgradesDisabled,
-			"the config of %s names other Kubernetes versions than their spec asks for; set spec.management.upgrades to Enabled to upgrade them", behind)
+			"the config of %s names other Kubernetes versions than their spec asks for; "+
+				"set spec.management.upgrades to Enabled to upgrade them", behind)
 	case len(result.Pending) > 0:
 		upToDate(metav1.ConditionFalse, result.BlockReason, "%s to be upgraded to Kubernetes %s: %s", behind, result.Hop.To, result.BlockMessage)
 
@@ -455,7 +458,8 @@ func (r *TalosClusterReconciler) continueKubernetes(ctx context.Context, tc *tal
 			switch {
 			case asked(talosv1alpha1.AnnotationAbort):
 				r.abortKubernetes(ctx, tc, obs, pools, machines)
-				r.end(tc, talosv1alpha1.OperationAborted, fmt.Sprintf("aborted after failing at %s, %s (%s): %s", f.Machine, f.Step, f.Reason, f.Message))
+				r.end(tc, talosv1alpha1.OperationAborted,
+					fmt.Sprintf("aborted after failing at %s, %s (%s): %s", f.Machine, f.Step, f.Reason, f.Message))
 			case asked(talosv1alpha1.AnnotationRetry):
 				key, attempt := f.Machine, int32(1)
 				if op.Current != nil {
@@ -531,7 +535,8 @@ func (r *TalosClusterReconciler) beginKubernetes(tc *talosv1alpha1.TalosCluster,
 		step.Step, step.PreviousHash, step.DesiredHash = plan.StepVerifying, v.live.Hash, v.live.Hash
 		op.Current = step
 	case images != nil && current.Images[key] != target:
-		r.end(tc, talosv1alpha1.OperationSuperseded, fmt.Sprintf("%s on %s is to get another image than this upgrade planned", component, machine))
+		r.end(tc, talosv1alpha1.OperationSuperseded,
+			fmt.Sprintf("%s on %s is to get another image than this upgrade planned", component, machine))
 	default:
 		// With the node not read, the turn begins anyway: its first step waits for the node, and
 		// that wait is bounded.
@@ -572,7 +577,7 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 		pre = plan.Gate{Reason: "the TalosMachine no longer exists"}
 	}
 
-	checks := plan.Gate{Reason: "not verified yet"}
+	checks := plan.Gate{Reason: notVerifiedYet}
 
 	if cur.Step == plan.StepVerifying && node.Reachable {
 		var err error
@@ -623,7 +628,7 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 
 		// The planner only asks for a try while the node runs the config the step started from, so
 		// the patch gives the config that was recorded then. Anything else is not sent.
-		if hash, err := configHash(raw); err != nil || hash != cur.DesiredHash {
+		if hash, _ := configHash(raw); hash != cur.DesiredHash {
 			return "the node's config with the new image is not the config this step recorded", nil
 		}
 
@@ -745,7 +750,8 @@ func (r *TalosClusterReconciler) componentRuns(ctx context.Context, v machineVie
 	}
 
 	for _, pod := range pods.Items {
-		if pod.DeletionTimestamp != nil || !slices.ContainsFunc(pod.Spec.Containers, func(c corev1.Container) bool { return c.Image == cur.Image }) {
+		runs := slices.ContainsFunc(pod.Spec.Containers, func(c corev1.Container) bool { return c.Image == cur.Image })
+		if pod.DeletionTimestamp != nil || !runs {
 			continue
 		}
 

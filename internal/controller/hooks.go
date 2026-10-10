@@ -44,13 +44,9 @@ import (
 // The chart binds this in the release namespace, with the manager's other rules.
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create
 
-const (
-	// LabelHook marks a hook's Job with the stage it ran at.
-	LabelHook = "talos.jarensaa.github.io/hook"
-	// hookJobTTL is how long a finished hook Job is kept, where its spec does not say: long enough
-	// to read the log of one that failed.
-	hookJobTTL = 24 * time.Hour
-)
+// hookJobTTL is how long a finished hook Job is kept, where its spec does not say: long enough to
+// read the log of one that failed.
+const hookJobTTL = 24 * time.Hour
 
 // hooksAt is the list of hooks of a stage.
 func hooksAt(tc *talosv1alpha1.TalosCluster, stage string) []talosv1alpha1.Hook {
@@ -250,7 +246,7 @@ func (r *TalosClusterReconciler) createHookJob(ctx context.Context, tc *talosv1a
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: tc.Namespace,
 			Name:      h.Job,
-			Labels:    map[string]string{talosv1alpha1.LabelCluster: tc.Name, LabelHook: h.Stage},
+			Labels:    map[string]string{talosv1alpha1.LabelCluster: tc.Name, talosv1alpha1.LabelHook: h.Stage},
 		},
 		Spec: spec,
 	}

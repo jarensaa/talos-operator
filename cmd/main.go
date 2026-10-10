@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
 	// The time zones of maintenance windows, whatever the image the operator runs in has.
 	_ "time/tzdata"
 

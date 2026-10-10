@@ -526,7 +526,7 @@ func (r *TalosClusterReconciler) upgradeStep(ctx context.Context, tc *talosv1alp
 	}
 
 	pre := plan.RebootGate(passOf(obs), v.hostname()).And(obs.policy.Gates())
-	checks := plan.Gate{Reason: "not verified yet"}
+	checks := plan.Gate{Reason: notVerifiedYet}
 
 	if cur.Step == plan.StepVerifying && node.Reachable {
 		if checks, err = r.verifyNode(ctx, obs, machineView{tm: v.tm, pool: v.pool, node: v.node}, cur.Since.Time, now); err != nil {

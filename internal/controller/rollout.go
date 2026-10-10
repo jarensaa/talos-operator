@@ -494,9 +494,9 @@ func (r *TalosClusterReconciler) skipConfig(ctx context.Context, tc *talosv1alph
 		return err
 	}
 
-	target := tc.Status.Operation.Targets[machine]
+	hash := tc.Status.Operation.Targets[machine]
 
-	return r.patchMachineConfig(ctx, v.tm, func(cfg *talosv1alpha1.ConfigState) { cfg.SkippedHash = target })
+	return r.patchMachineConfig(ctx, v.tm, func(cfg *talosv1alpha1.ConfigState) { cfg.SkippedHash = hash })
 }
 
 // begin persists the first step of a machine's turn. Nothing is sent to Talos in the same
@@ -573,7 +573,7 @@ func (r *TalosClusterReconciler) step(ctx context.Context, tc *talosv1alpha1.Tal
 	}
 
 	pre := r.preGate(tc, obs, v)
-	checks := plan.Gate{Reason: "not verified yet"}
+	checks := plan.Gate{Reason: notVerifiedYet}
 
 	if cur.Step == plan.StepVerifying && node.Reachable {
 		var err error
@@ -707,7 +707,11 @@ func (r *TalosClusterReconciler) latest(ctx context.Context, tc *talosv1alpha1.T
 	return current.ResourceVersion == tc.ResourceVersion
 }
 
-const noteCatchingUp = "waiting for the operator's view of the TalosCluster to catch up"
+const (
+	noteCatchingUp = "waiting for the operator's view of the TalosCluster to catch up"
+	// notVerifiedYet is what a node's checks say before they were run.
+	notVerifiedYet = "not verified yet"
+)
 
 // try validates the node's rendered config with a dry run and applies it in try mode. The
 // planner only asks for this while the node still runs its previous config: Talos takes

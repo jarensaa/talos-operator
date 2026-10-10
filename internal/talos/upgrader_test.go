@@ -250,7 +250,7 @@ func TestUpgradeProblem(t *testing.T) {
 		{"older than supported", "v1.12.4", "v1.12.6", "1.34.0", "older than the minimum"},
 		{"a jump Talos does not allow", "v1.10.5", apiVersion, "1.34.0", "does not upgrade"},
 		{"a Kubernetes the target does not run", older, apiVersion, "1.20.0", "does not support Kubernetes"},
-		{"garbage", older, "latest", current, "unparsable"},
+		{garbage, older, "latest", current, "unparsable"},
 	}
 
 	for _, tt := range tests {

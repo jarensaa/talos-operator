@@ -23,6 +23,15 @@ import (
 	"time"
 )
 
+// Versions and names the Kubernetes specs keep coming back to.
+const (
+	kubeOld      = "1.36.2"
+	kubeHop      = "1.36.0"
+	kubeNewFirst = "1.37.0"
+	kubeNew      = "1.37.1"
+	kubeCP1      = "cp1"
+)
+
 // Images as Talos names them by default.
 var kubeRepos = map[string]string{
 	ComponentAPIServer:         "registry.k8s.io/kube-apiserver",
@@ -73,12 +82,12 @@ func (m KubernetesMachine) running(component, v string) KubernetesMachine {
 
 func TestImageVersion(t *testing.T) {
 	for image, want := range map[string]string{
-		"registry.k8s.io/kube-apiserver:v1.37.1":                     "1.37.1",
-		"ghcr.io/siderolabs/kubelet:v1.36.0":                         "1.36.0",
-		"registry.example.com:5000/mirror/kube-scheduler:v1.37.1":    "1.37.1",
-		"ghcr.io/siderolabs/kubelet:v1.37.1-fat":                     "1.37.1",
-		"registry.k8s.io/kube-apiserver:v1.37.1@sha256:0123456789ab": "1.37.1",
-		"registry.k8s.io/kube-apiserver:1.37.1":                      "1.37.1",
+		"registry.k8s.io/kube-apiserver:v1.37.1":                     kubeNew,
+		"ghcr.io/siderolabs/kubelet:v1.36.0":                         kubeHop,
+		"registry.example.com:5000/mirror/kube-scheduler:v1.37.1":    kubeNew,
+		"ghcr.io/siderolabs/kubelet:v1.37.1-fat":                     kubeNew,
+		"registry.k8s.io/kube-apiserver:v1.37.1@sha256:0123456789ab": kubeNew,
+		"registry.k8s.io/kube-apiserver:1.37.1":                      kubeNew,
 		// Nothing to compare: no tag, a tag that is no version, a digest alone.
 		"registry.k8s.io/kube-apiserver":                     "",
 		"registry.k8s.io/kube-apiserver:latest":              "",
@@ -98,9 +107,9 @@ func TestImageVersion(t *testing.T) {
 	}
 
 	for _, tt := range [][3]string{
-		{"registry.k8s.io/kube-apiserver:v1.38.1", "1.37.0", "registry.k8s.io/kube-apiserver:v1.37.0"},
-		{"ghcr.io/siderolabs/kubelet:v1.38.1-fat", "1.37.0", "ghcr.io/siderolabs/kubelet:v1.37.0-fat"},
-		{"registry.example.com:5000/v1.38.1/kubelet:v1.38.1", "1.37.0", "registry.example.com:5000/v1.38.1/kubelet:v1.37.0"},
+		{"registry.k8s.io/kube-apiserver:v1.38.1", kubeNewFirst, "registry.k8s.io/kube-apiserver:v1.37.0"},
+		{"ghcr.io/siderolabs/kubelet:v1.38.1-fat", kubeNewFirst, "ghcr.io/siderolabs/kubelet:v1.37.0-fat"},
+		{"registry.example.com:5000/v1.38.1/kubelet:v1.38.1", kubeNewFirst, "registry.example.com:5000/v1.38.1/kubelet:v1.37.0"},
 	} {
 		if got := withVersion(tt[0], tt[1]); got != tt[2] {
 			t.Errorf("withVersion(%q, %q): got %q, want %q", tt[0], tt[1], got, tt[2])
@@ -115,28 +124,32 @@ func TestHopOf(t *testing.T) {
 		from, hop, to string
 		problem       string
 	}{
-		{"nothing to do", []KubernetesMachine{kubeControlPlane("cp1", "1.37.1", "1.37.1"), kubeWorker("w1", "1.37.1", "1.37.1")}, "", "", "", ""},
-		{"a patch release", []KubernetesMachine{kubeControlPlane("cp1", "1.37.0", "1.37.1")}, "1.37.0", "1.37.1", "1.37.1", ""},
-		{"the next minor", []KubernetesMachine{kubeControlPlane("cp1", "1.36.2", "1.37.1"), kubeWorker("w1", "1.36.2", "1.37.1")},
-			"1.36.2", "1.37.1", "1.37.1", ""},
+		{"nothing to do", []KubernetesMachine{kubeControlPlane(kubeCP1, kubeNew, kubeNew), kubeWorker("w1", kubeNew, kubeNew)}, "", "", "", ""},
+		{"a patch release", []KubernetesMachine{kubeControlPlane(kubeCP1, kubeNewFirst, kubeNew)}, kubeNewFirst, kubeNew, kubeNew, ""},
+		{"a worker alone", []KubernetesMachine{kubeWorker("w1", kubeHop, kubeNewFirst)}, kubeHop, kubeNewFirst, kubeNewFirst, ""},
+		{"the next minor", []KubernetesMachine{kubeControlPlane(kubeCP1, kubeOld, kubeNew), kubeWorker("w1", kubeOld, kubeNew)},
+			kubeOld, kubeNew, kubeNew, ""},
 		// Kubernetes does not skip a minor: the way there is the first release of each one between.
-		{"two minors", []KubernetesMachine{kubeControlPlane("cp1", "1.35.4", "1.37.1")}, "1.35.4", "1.36.0", "1.37.1", ""},
-		{"three minors", []KubernetesMachine{kubeControlPlane("cp1", "1.34.9", "1.37.1")}, "1.34.9", "1.35.0", "1.37.1", ""},
+		{"two minors", []KubernetesMachine{kubeControlPlane(kubeCP1, "1.35.4", kubeNew)}, "1.35.4", kubeHop, kubeNew, ""},
+		{"three minors", []KubernetesMachine{kubeControlPlane(kubeCP1, "1.34.9", kubeNew)}, "1.34.9", "1.35.0", kubeNew, ""},
 		// A hop that was interrupted goes on from the component that is furthest behind.
 		{"half way", []KubernetesMachine{
-			kubeControlPlane("cp1", "1.36.2", "1.37.1").running(ComponentAPIServer, "1.37.1"), kubeWorker("w1", "1.36.2", "1.37.1"),
-		}, "1.36.2", "1.37.1", "1.37.1", ""},
+			kubeControlPlane(kubeCP1, kubeOld, kubeNew).running(ComponentAPIServer, kubeNew), kubeWorker("w1", kubeOld, kubeNew),
+		}, kubeOld, kubeNew, kubeNew, ""},
 		{"half way through the first of two hops", []KubernetesMachine{
-			kubeControlPlane("cp1", "1.35.4", "1.37.1").running(ComponentAPIServer, "1.36.0"),
-		}, "1.35.4", "1.36.0", "1.37.1", ""},
-		{"the second of two hops", []KubernetesMachine{kubeControlPlane("cp1", "1.36.0", "1.37.1")}, "1.36.0", "1.37.1", "1.37.1", ""},
+			kubeControlPlane(kubeCP1, "1.35.4", kubeNew).running(ComponentAPIServer, kubeHop),
+		}, "1.35.4", kubeHop, kubeNew, ""},
+		{"the second of two hops", []KubernetesMachine{kubeControlPlane(kubeCP1, kubeHop, kubeNew)}, kubeHop, kubeNew, kubeNew, ""},
 		// A machine that cannot be judged is left out here; the planner blocks on it.
-		{"a stale machine", []KubernetesMachine{kubeControlPlane("cp1", "1.36.2", "1.37.1"), {Name: "w1"}}, "1.36.2", "1.37.1", "1.37.1", ""},
+		{"a stale machine", []KubernetesMachine{kubeControlPlane(kubeCP1, kubeOld, kubeNew), {Name: "w1"}}, kubeOld, kubeNew, kubeNew, ""},
 		{"an image without a version", []KubernetesMachine{{
 			Name: "w1", Current: true,
-			Images: map[string]KubernetesImage{ComponentKubelet: {Live: "ghcr.io/siderolabs/kubelet:latest", Desired: kubeImage(ComponentKubelet, "1.37.1")}},
+			Images: map[string]KubernetesImage{
+				ComponentKubelet: {Live: "ghcr.io/siderolabs/kubelet:latest", Desired: kubeImage(ComponentKubelet, kubeNew)},
+			},
 		}}, "", "", "", "names no version"},
-		{"another major", []KubernetesMachine{kubeWorker("w1", "1.37.1", "2.0.0")}, "1.37.1", "", "2.0.0", "no upgrade from Kubernetes 1.37.1 to 2.0.0"},
+		{"another major", []KubernetesMachine{kubeControlPlane(kubeCP1, kubeNew, "2.0.0")}, kubeNew, "", "2.0.0",
+			"no upgrade from Kubernetes 1.37.1 to 2.0.0"},
 	}
 
 	for _, tt := range tests {
@@ -160,8 +173,8 @@ func TestHopOf(t *testing.T) {
 // Every API server before anything else: no other component may be newer than an API server.
 func TestPlanKubernetesOrder(t *testing.T) {
 	machines := []KubernetesMachine{
-		kubeWorker("w2", "1.36.2", "1.37.1"), kubeControlPlane("cp2", "1.36.2", "1.37.1"),
-		kubeControlPlane("cp1", "1.36.2", "1.37.1"), kubeWorker("w1", "1.36.2", "1.37.1"),
+		kubeWorker("w2", kubeOld, kubeNew), kubeControlPlane("cp2", kubeOld, kubeNew),
+		kubeControlPlane(kubeCP1, kubeOld, kubeNew), kubeWorker("w1", kubeOld, kubeNew),
 	}
 
 	got := PlanKubernetes(machines, KubernetesSettings{}, healthyPass())
@@ -176,12 +189,13 @@ func TestPlanKubernetesOrder(t *testing.T) {
 		t.Fatalf("got %v (%s: %s)\nwant %v", got.Pending, got.BlockReason, got.BlockMessage, want)
 	}
 
-	if got.Images["kube-apiserver/cp1"] != "registry.k8s.io/kube-apiserver:v1.37.1" || got.Images["kubelet/w2"] != "ghcr.io/siderolabs/kubelet:v1.37.1" ||
+	if got.Images["kube-apiserver/cp1"] != "registry.k8s.io/kube-apiserver:v1.37.1" ||
+		got.Images["kubelet/w2"] != "ghcr.io/siderolabs/kubelet:v1.37.1" ||
 		len(got.Images) != len(want) {
 		t.Fatalf("images: %v", got.Images)
 	}
 
-	if want := []string{"cp1", "cp2", "w1", "w2"}; !slices.Equal(got.Behind, want) {
+	if want := []string{kubeCP1, "cp2", "w1", "w2"}; !slices.Equal(got.Behind, want) {
 		t.Fatalf("behind: got %v, want %v", got.Behind, want)
 	}
 
@@ -197,8 +211,8 @@ func TestPlanKubernetesOrder(t *testing.T) {
 	}
 
 	// What already names the hop's version is left out, wherever the upgrade stopped.
-	machines[2] = machines[2].running(ComponentAPIServer, "1.37.1").running(ComponentControllerManager, "1.37.1")
-	machines[3] = kubeWorker("w1", "1.37.1", "1.37.1")
+	machines[2] = machines[2].running(ComponentAPIServer, kubeNew).running(ComponentControllerManager, kubeNew)
+	machines[3] = kubeWorker("w1", kubeNew, kubeNew)
 	resumed := PlanKubernetes(machines, KubernetesSettings{}, healthyPass())
 
 	want = []string{
@@ -215,13 +229,13 @@ func TestPlanKubernetesOrder(t *testing.T) {
 
 	// A hop on the way brings every component to the first release of the next minor, in the
 	// image its rendered config names.
-	far := PlanKubernetes([]KubernetesMachine{kubeControlPlane("cp1", "1.35.4", "1.37.1"), kubeWorker("w1", "1.35.4", "1.37.1")},
+	far := PlanKubernetes([]KubernetesMachine{kubeControlPlane(kubeCP1, "1.35.4", kubeNew), kubeWorker("w1", "1.35.4", kubeNew)},
 		KubernetesSettings{}, healthyPass())
 	if far.Hop.Version != "1.36.0" || far.Images["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.0" || len(far.Pending) != 5 {
 		t.Fatalf("far: %+v", far)
 	}
 
-	done := PlanKubernetes([]KubernetesMachine{kubeControlPlane("cp1", "1.37.1", "1.37.1")}, KubernetesSettings{}, healthyPass())
+	done := PlanKubernetes([]KubernetesMachine{kubeControlPlane(kubeCP1, kubeNew, kubeNew)}, KubernetesSettings{}, healthyPass())
 	if len(done.Pending) != 0 || done.BlockReason != "" || len(done.Behind) != 0 {
 		t.Fatalf("nothing is due: %+v", done)
 	}
@@ -230,7 +244,7 @@ func TestPlanKubernetesOrder(t *testing.T) {
 func TestPlanKubernetesBlocks(t *testing.T) {
 	cluster := func(mutate ...func([]KubernetesMachine)) []KubernetesMachine {
 		machines := []KubernetesMachine{
-			kubeControlPlane("cp1", "1.36.2", "1.37.1"), kubeControlPlane("cp2", "1.36.2", "1.37.1"), kubeWorker("w1", "1.36.2", "1.37.1"),
+			kubeControlPlane(kubeCP1, kubeOld, kubeNew), kubeControlPlane("cp2", kubeOld, kubeNew), kubeWorker("w1", kubeOld, kubeNew),
 		}
 		for _, m := range mutate {
 			m(machines)
@@ -250,12 +264,15 @@ func TestPlanKubernetesBlocks(t *testing.T) {
 		{"nothing in the way", cluster(), KubernetesSettings{}, healthyPass(), "", ""},
 		{"a check found something", cluster(), KubernetesSettings{Problems: []string{"cp1 runs Talos v1.13.0, which does not support it"}},
 			healthyPass(), BlockIncompatible, "v1.13.0"},
-		{"the checks did not run", cluster(), KubernetesSettings{Unchecked: "cp1 did not answer"}, healthyPass(), BlockNotCurrent, "cp1 did not answer"},
-		{"paused", cluster(), KubernetesSettings{Paused: true}, healthyPass(), BlockPaused, "paused"},
-		{"outside the windows", cluster(), KubernetesSettings{Policy: Policy{OutsideWindow: "outside"}}, healthyPass(), BlockOutsideWindow, "outside"},
-		{"a gate of the user's", cluster(), KubernetesSettings{Policy: Policy{GateClosed: "gate ceph"}}, healthyPass(), BlockGateClosed, "gate ceph"},
-		{"aborted", cluster(), KubernetesSettings{Aborted: "1.37.1"}, healthyPass(), BlockAborted, "aborted"},
-		{"another version was aborted", cluster(), KubernetesSettings{Aborted: "1.37.0"}, healthyPass(), "", ""},
+		{"the checks did not run", cluster(), KubernetesSettings{Unchecked: "cp1 did not answer"}, healthyPass(), BlockNotCurrent,
+			"cp1 did not answer"},
+		{wordPaused, cluster(), KubernetesSettings{Paused: true}, healthyPass(), BlockPaused, wordPaused},
+		{"outside the windows", cluster(), KubernetesSettings{Policy: Policy{OutsideWindow: wordOutside}}, healthyPass(), BlockOutsideWindow,
+			wordOutside},
+		{"a gate of the user's", cluster(), KubernetesSettings{Policy: Policy{GateClosed: "gate ceph"}}, healthyPass(), BlockGateClosed,
+			"gate ceph"},
+		{wordAborted, cluster(), KubernetesSettings{Aborted: kubeNew}, healthyPass(), BlockAborted, wordAborted},
+		{"another version was aborted", cluster(), KubernetesSettings{Aborted: kubeNewFirst}, healthyPass(), "", ""},
 		// An upgrade is no repair: it starts on a healthy cluster or not at all, whichever node ails.
 		{"an unhealthy node", cluster(), KubernetesSettings{}, ailing(nodeA), BlockGateClosed, nodeA},
 		{"a machine that cannot be judged", cluster(func(m []KubernetesMachine) { m[2] = KubernetesMachine{Name: "w1"} }),
@@ -263,10 +280,10 @@ func TestPlanKubernetesBlocks(t *testing.T) {
 		// A control plane left out would end up behind components that must not be newer than it.
 		{"a control plane on hold", cluster(func(m []KubernetesMachine) { m[1].Hold = true }), KubernetesSettings{}, healthyPass(),
 			BlockIncompatible, "cp2"},
-		{"a downgrade", cluster(func(m []KubernetesMachine) { m[0] = kubeControlPlane("cp1", "1.37.2", "1.37.1") }), KubernetesSettings{},
+		{"a downgrade", cluster(func(m []KubernetesMachine) { m[0] = kubeControlPlane(kubeCP1, "1.37.2", kubeNew) }), KubernetesSettings{},
 			healthyPass(), BlockIncompatible, "not downgraded"},
 		{"an image without a version", cluster(func(m []KubernetesMachine) {
-			m[2].Images[ComponentKubelet] = KubernetesImage{Live: "ghcr.io/siderolabs/kubelet:latest", Desired: kubeImage(ComponentKubelet, "1.37.1")}
+			m[2].Images[ComponentKubelet] = KubernetesImage{Live: "ghcr.io/siderolabs/kubelet:latest", Desired: kubeImage(ComponentKubelet, kubeNew)}
 		}), KubernetesSettings{}, healthyPass(), BlockIncompatible, "names no version"},
 		// What cannot work is said before what is merely not yet.
 		{"incompatible and paused", cluster(), KubernetesSettings{Paused: true, Problems: []string{"a removed flag"}}, healthyPass(),
@@ -297,12 +314,12 @@ func TestPlanKubernetesBlocks(t *testing.T) {
 	}
 
 	// An abort covers the version the spec asks for, through every hop on the way there.
-	far := []KubernetesMachine{kubeControlPlane("cp1", "1.35.4", "1.37.1")}
-	if got := PlanKubernetes(far, KubernetesSettings{Aborted: "1.37.1"}, healthyPass()); got.BlockReason != BlockAborted || !got.AbortStands {
+	far := []KubernetesMachine{kubeControlPlane(kubeCP1, "1.35.4", kubeNew)}
+	if got := PlanKubernetes(far, KubernetesSettings{Aborted: kubeNew}, healthyPass()); got.BlockReason != BlockAborted || !got.AbortStands {
 		t.Fatalf("an aborted upgrade does not go on with its next hop: %+v", got)
 	}
 
-	if got := PlanKubernetes(far, KubernetesSettings{Aborted: "1.36.0"}, healthyPass()); got.AbortStands {
+	if got := PlanKubernetes(far, KubernetesSettings{Aborted: kubeHop}, healthyPass()); got.AbortStands {
 		t.Fatal("an abort of another version is spent")
 	}
 }

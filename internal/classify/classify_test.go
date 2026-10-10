@@ -263,6 +263,8 @@ func TestClassifyKubernetesVersion(t *testing.T) {
 
 	install := func(version string) string { return fmt.Sprintf(installer, version) }
 
+	const kubeletImage = "v1alpha1/KubeletConfig: image"
+
 	controlPlane, worker := machine.TypeControlPlane, machine.TypeWorker
 
 	tests := []struct {
@@ -273,11 +275,11 @@ func TestClassifyKubernetesVersion(t *testing.T) {
 	}{
 		{"a control plane", renderedAt(t, bundle, controlPlane, "1.36.2"), renderedAt(t, bundle, controlPlane, "1.37.0"), classify.Kubernetes,
 			[]string{"v1alpha1/KubeAPIServerConfig: image", "v1alpha1/KubeControllerManagerConfig: image",
-				"v1alpha1/KubeSchedulerConfig: image", "v1alpha1/KubeletConfig: image"}},
+				"v1alpha1/KubeSchedulerConfig: image", kubeletImage}},
 		{"a worker", renderedAt(t, bundle, worker, "1.36.2"), renderedAt(t, bundle, worker, "1.37.0"), classify.Kubernetes,
-			[]string{"v1alpha1/KubeletConfig: image"}},
+			[]string{kubeletImage}},
 		{"a patch release", renderedAt(t, bundle, worker, "1.37.0"), renderedAt(t, bundle, worker, "1.37.1"), classify.Kubernetes,
-			[]string{"v1alpha1/KubeletConfig: image"}},
+			[]string{kubeletImage}},
 		// An argument of the same document does not take the image with it into a config rollout.
 		{"with an argument", renderedAt(t, bundle, controlPlane, "1.36.2"), renderedAt(t, bundle, controlPlane, "1.37.0", argument),
 			classify.Kubernetes, nil},
