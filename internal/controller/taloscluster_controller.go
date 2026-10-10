@@ -296,8 +296,12 @@ func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.
 		r.observeEtcd(nodesCtx, tgt, etcdVia, &obs)
 	}
 
-	if obs.kubernetes, err = lowestKubeletVersion(ctx, tgt.Kube); err != nil {
-		obs.kubeErr = err
+	var nodes corev1.NodeList
+	if err := tgt.Kube.List(ctx, &nodes); err != nil {
+		obs.kubeErr = fmt.Errorf("list nodes: %w", err)
+	} else {
+		obs.kubernetes = lowestKubeletVersion(nodes.Items)
+		obs.facts.observeKubeNodes(nodes.Items)
 	}
 
 	health, err := tgt.Talos.HealthCheck(ctx, endpoint,
@@ -452,15 +456,10 @@ func (r *TalosClusterReconciler) observeUnmatched(ctx context.Context, tc *talos
 
 // lowestKubeletVersion returns the lowest kubelet version across Kubernetes nodes, without the
 // leading "v"; empty when no node reports one.
-func lowestKubeletVersion(ctx context.Context, c client.Client) (string, error) {
-	var nodes corev1.NodeList
-	if err := c.List(ctx, &nodes); err != nil {
-		return "", fmt.Errorf("list nodes: %w", err)
-	}
-
+func lowestKubeletVersion(nodes []corev1.Node) string {
 	var lowest *version.Version
 
-	for _, n := range nodes.Items {
+	for _, n := range nodes {
 		v, err := version.ParseSemantic(n.Status.NodeInfo.KubeletVersion)
 		if err != nil {
 			continue
@@ -472,10 +471,10 @@ func lowestKubeletVersion(ctx context.Context, c client.Client) (string, error) 
 	}
 
 	if lowest == nil {
-		return "", nil
+		return ""
 	}
 
-	return lowest.String(), nil
+	return lowest.String()
 }
 
 // applyObservation updates tc.Status from obs. Fields that were not observed keep their

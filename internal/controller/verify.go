@@ -26,7 +26,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/plan"
 )
 
@@ -46,8 +45,9 @@ const (
 // (docs/scope.md §8.5.1). The node's Talos API has already answered through a different node by
 // the time this runs, which is what makes it reachable to the planner. On top of that:
 //
-//   - the rest of the cluster is whole: every member runs, etcd has exactly the control planes as
-//     healthy voters, and Talos's own health checks pass;
+//   - the cluster is whole, this node included: every member runs and is Ready to Kubernetes,
+//     etcd has exactly the control planes as healthy voters, and Talos's own health checks pass
+//     (plan.VerifyGate);
 //   - Kubernetes sees the node Ready, with a network;
 //   - the node's kubelet has renewed its Lease since verification began, and recently. The
 //     Ready condition alone is the control plane's last word on the node, which stays True for
@@ -55,14 +55,12 @@ const (
 //
 // The planner requires all of it to hold without interruption for the soak. Only API errors of
 // the management cluster are returned.
-func (r *TalosClusterReconciler) verifyNode(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, v machineView,
-	since, now time.Time,
-) (plan.Gate, error) {
+func (r *TalosClusterReconciler) verifyNode(ctx context.Context, obs observation, v machineView, since, now time.Time) (plan.Gate, error) {
 	closed := func(format string, args ...any) (plan.Gate, error) {
 		return plan.Gate{Reason: fmt.Sprintf(format, args...)}, nil
 	}
 
-	if gate := plan.ClusterGate(passOf(&tc.Status, obs), plan.VerifyPreconditions); !gate.Open {
+	if gate := plan.VerifyGate(passOf(obs)); !gate.Open {
 		return gate, nil
 	}
 
@@ -80,11 +78,11 @@ func (r *TalosClusterReconciler) verifyNode(ctx context.Context, tc *talosv1alph
 		return plan.Gate{}, fmt.Errorf("get node %s: %w", name, err)
 	}
 
-	if !nodeConditionIs(node, corev1.NodeReady, corev1.ConditionTrue) {
+	if !nodeConditionTrue(node, corev1.NodeReady) {
 		return closed("Kubernetes Node %s is not Ready", name)
 	}
 
-	if nodeConditionIs(node, corev1.NodeNetworkUnavailable, corev1.ConditionTrue) {
+	if nodeConditionTrue(node, corev1.NodeNetworkUnavailable) {
 		return closed("Kubernetes Node %s has no network", name)
 	}
 
@@ -109,10 +107,12 @@ func (r *TalosClusterReconciler) verifyNode(ctx context.Context, tc *talosv1alph
 	return plan.Gate{Open: true}, nil
 }
 
-func nodeConditionIs(node *corev1.Node, condType corev1.NodeConditionType, status corev1.ConditionStatus) bool {
+// nodeConditionTrue reports whether the Node has the condition, and it is True. A condition the
+// Node does not report is not True.
+func nodeConditionTrue(node *corev1.Node, condType corev1.NodeConditionType) bool {
 	for _, c := range node.Status.Conditions {
 		if c.Type == condType {
-			return c.Status == status
+			return c.Status == corev1.ConditionTrue
 		}
 	}
 

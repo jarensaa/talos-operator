@@ -19,6 +19,7 @@ limitations under the License.
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"net/netip"
 	"os"
@@ -28,6 +29,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -98,10 +100,30 @@ const (
 const (
 	rolloutLabel = "e2e.talos-operator/rollout"
 	tokenPatch   = "machine:\n  token: aaaaaa.bbbbbbbbbbbbbbbb\n"
+	// A flag no kubelet knows: it exits at once, every time Talos starts it.
+	unknownKubeletFlag = "no-such-flag"
+	brokenKubeletPatch = "apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  " + unknownKubeletFlag + ": \"true\"\n"
 )
 
 func labelDocument(value string) string {
 	return "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  " + rolloutLabel + ": " + value + "\n"
+}
+
+// withPatch returns a machine config with a strategic merge patch applied. The config is never
+// printed: it holds the cluster's secrets.
+func withPatch(raw []byte, patch string) []byte {
+	GinkgoHelper()
+
+	loaded, err := configpatcher.LoadPatch([]byte(patch))
+	Expect(err).NotTo(HaveOccurred())
+
+	out, err := configpatcher.Apply(configpatcher.WithBytes(raw), []configpatcher.Patch{loaded})
+	Expect(err).NotTo(HaveOccurred())
+
+	patched, err := out.Bytes()
+	Expect(err).NotTo(HaveOccurred())
+
+	return patched
 }
 
 // blackholeDocuments makes a node drop everything it would send to the given addresses. On a
@@ -386,6 +408,121 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		Expect(rejectedRPCs()).To(BeZero())
 	}, NodeTimeout(15*time.Minute))
+
+	// A rollout may touch a node that is unhealthy, as long as it is the only one: that is how a
+	// config that broke a node is taken back (docs/scope.md §6.3, §8.3). Here the admin breaks a
+	// worker's kubelet behind the operator's back, and enforcing the spec repairs the node.
+	It("repairs a worker whose kubelet a config broke, while the rest of the cluster is healthy", func(ctx context.Context) {
+		workers := addrsOf("E2E_WORKERS")
+		if len(workers) == 0 {
+			Skip("the harness cluster has no worker")
+		}
+
+		victim := workers[0]
+		before := snapshot(ctx, harness, nodes)
+		ended := rollouts(ctx)
+
+		// ready reports what Kubernetes says about the victim's Node.
+		ready := func(g Gomega) corev1.ConditionStatus {
+			var all corev1.NodeList
+			g.Expect(k8sClient.List(ctx, &all)).To(Succeed())
+
+			for _, n := range all.Items {
+				if !slices.ContainsFunc(n.Status.Addresses, func(a corev1.NodeAddress) bool { return a.Address == victim.String() }) {
+					continue
+				}
+
+				for _, c := range n.Status.Conditions {
+					if c.Type == corev1.NodeReady {
+						return c.Status
+					}
+				}
+			}
+
+			g.Expect(false).To(BeTrue(), "Kubernetes has no Node with address %s", victim)
+
+			return ""
+		}
+
+		By("breaking the worker's kubelet with a config applied outside the operator")
+		cfgs, err := harness.MachineConfig(ctx, victim)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(harnessWriter(ctx).ApplyConfig(ctx, victim, withPatch(cfgs.Active, brokenKubeletPatch), talos.ApplyNoReboot, 0)).
+			To(Succeed())
+
+		By("waiting until Talos and Kubernetes both call the node unhealthy, and the operator only reports it")
+		Eventually(func(g Gomega) {
+			g.Expect(ready(g)).NotTo(Equal(corev1.ConditionTrue), "Kubernetes still calls the node Ready")
+
+			status, err := harness.MachineStatus(ctx, victim)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(status.Ready).To(BeFalse(), "Talos still calls the node ready")
+
+			refresh(ctx, g)
+
+			healthy := meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionHealthy)
+			g.Expect(healthy).NotTo(BeNil())
+			g.Expect(healthy.Status).To(Equal(metav1.ConditionFalse), "Talos's cluster-wide checks still pass")
+
+			drift := meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionConfigInSync)
+			g.Expect(drift).NotTo(BeNil())
+			g.Expect(drift.Reason).To(Equal(talosv1alpha1.ReasonDrift), drift.Message)
+			g.Expect(tc.Status.Operation).To(BeNil(), "driftPolicy Report leaves the node alone")
+		}).WithContext(ctx).WithTimeout(5 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+		for _, n := range nodes {
+			if n != victim {
+				status, err := harness.MachineStatus(ctx, n)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(status.Ready).To(BeTrue(), "%s is not the node that was broken and must still be ready", n)
+			}
+		}
+
+		By("enforcing the spec: the unhealthy node is the one node the operator may touch")
+		var policy talosv1alpha1.DriftPolicy
+
+		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
+			policy = tc.Spec.Rollout.DriftPolicy
+			tc.Spec.Rollout.DriftPolicy = talosv1alpha1.DriftPolicyEnforce
+		})
+
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
+			g.Expect(tc.Status.History).To(HaveLen(ended+1), "no rollout ended: %+v",
+				meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionConfigInSync))
+		}).WithContext(ctx).WithTimeout(e2eTryTimeout + 5*time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+		record := tc.Status.History[0]
+		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		Expect(record.Completed).To(HaveLen(1), "only the broken node needed a change")
+		inSync(ctx, 2*time.Minute)
+
+		By("checking that the node is whole again, without a reboot, and nothing else changed")
+		Eventually(func(g Gomega) {
+			g.Expect(ready(g)).To(Equal(corev1.ConditionTrue))
+			conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionHealthy)(g)
+		}).WithContext(ctx).WithTimeout(2 * time.Minute).Should(Succeed())
+
+		repaired, err := harness.MachineConfig(ctx, victim)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(bytes.Contains(repaired.Active, []byte(unknownKubeletFlag))).To(BeFalse(), "the broken kubelet flag is gone")
+		Expect(repaired.PendingConfigChange()).To(BeFalse(), "the repair is confirmed, not left tried")
+
+		after := snapshot(ctx, harness, nodes)
+
+		for _, n := range nodes {
+			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
+
+			if n != victim {
+				Expect(after[n].ConfigHash).To(Equal(before[n].ConfigHash), "%s was healthy and must not change", n)
+			}
+		}
+
+		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Rollout.DriftPolicy = policy })
+		inSync(ctx, time.Minute)
+		Expect(rejectedRPCs()).To(BeZero())
+	}, NodeTimeout(e2eTryTimeout+15*time.Minute))
 
 	It("refuses to change a protected field", func(ctx context.Context) {
 		before := snapshot(ctx, harness, nodes)

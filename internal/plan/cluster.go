@@ -38,6 +38,10 @@ const (
 	PreconditionSchematicDetected        = "SchematicDetected"
 )
 
+// CheckAllNodesReady is a check of the rollout gates only (docs/scope.md §6.3): Kubernetes
+// reports every member's Node Ready. Adoption does not ask for it.
+const CheckAllNodesReady = "AllNodesReady"
+
 // StageRunning is the Talos machine stage of a booted, configured node.
 const StageRunning = "running"
 
@@ -63,6 +67,32 @@ type Member struct {
 	// EtcdStatusRead is set. Control planes only.
 	EtcdStatusRead bool
 	EtcdErrors     []string
+	// Node is the member's Node as the Kubernetes API reports it; nil when the Nodes were not read.
+	Node *KubernetesNode
+}
+
+// KubernetesNode is what the Kubernetes API says about a member, which is the control plane's
+// view of it and not the member's own.
+type KubernetesNode struct {
+	// Registered is false when Kubernetes has no Node for the member.
+	Registered bool
+	// Ready is true when the Node is Ready and has a network.
+	Ready bool
+}
+
+// ails reports whether the member is known to be unhealthy itself. A fact that was not read is
+// not known: it closes gates, and it never excuses anything.
+func (m Member) ails() bool {
+	switch {
+	case m.Status != nil && (m.Status.Stage != StageRunning || !m.Status.Ready):
+		return true
+	case m.ControlPlane && m.EtcdStatusRead && len(m.EtcdErrors) > 0:
+		return true
+	case m.Node != nil && (!m.Node.Registered || !m.Node.Ready):
+		return true
+	default:
+		return false
+	}
 }
 
 // MemberStatus is a node's position in its boot sequence.
@@ -87,12 +117,30 @@ type Cluster struct {
 	EtcdMembers []EtcdMember
 }
 
+// member returns the member with the given hostname. It answers only when exactly one member
+// carries the name: a name two nodes share identifies neither.
+func (c Cluster) member(hostname string) (Member, bool) {
+	var (
+		found Member
+		n     int
+	)
+
+	for _, m := range c.Members {
+		if hostname != "" && m.Hostname == hostname {
+			found = m
+			n++
+		}
+	}
+
+	return found, n == 1
+}
+
 // Preconditions judges the cluster. Unknown means that a fact it needs was not read.
 func Preconditions(c Cluster) []talosv1alpha1.Precondition {
 	return []talosv1alpha1.Precondition{
 		checkCredentialsAdmin(c),
-		checkAllMembersRunning(c),
-		checkEtcdHealthy(c),
+		checkAllMembersRunning(c, ""),
+		checkEtcdHealthy(c, ""),
 		checkEtcdMatchesControlPlanes(c),
 		checkNoPendingConfig(c),
 		checkTalosVersionSupported(c),
@@ -119,7 +167,13 @@ func checkCredentialsAdmin(c Cluster) talosv1alpha1.Precondition {
 	return precondition(PreconditionCredentialsAdmin, nil, nil)
 }
 
-func checkAllMembersRunning(c Cluster) talosv1alpha1.Precondition {
+// leftOut reports whether m is the member a check was told not to ask about. An empty name
+// leaves nobody out, a member without a hostname included.
+func leftOut(m Member, except string) bool { return except != "" && m.Hostname == except }
+
+// checkAllMembersRunning judges every member's own report of itself. except names a member
+// whose health is not asked about, or is empty; the same goes for the checks below that take it.
+func checkAllMembersRunning(c Cluster, except string) talosv1alpha1.Precondition {
 	var failures, unknown []string
 
 	if len(c.Members) == 0 {
@@ -128,6 +182,7 @@ func checkAllMembersRunning(c Cluster) talosv1alpha1.Precondition {
 
 	for _, m := range c.Members {
 		switch {
+		case leftOut(m, except):
 		case m.Status == nil:
 			unknown = append(unknown, m.Hostname+": "+m.ReadErr)
 		case m.Status.Stage != StageRunning || !m.Status.Ready:
@@ -138,7 +193,30 @@ func checkAllMembersRunning(c Cluster) talosv1alpha1.Precondition {
 	return precondition(PreconditionAllMembersRunning, failures, unknown)
 }
 
-func checkEtcdHealthy(c Cluster) talosv1alpha1.Precondition {
+// checkAllNodesReady judges every member by what the Kubernetes API says about its Node. A member
+// can call itself ready while the control plane has stopped hearing from it.
+func checkAllNodesReady(c Cluster, except string) talosv1alpha1.Precondition {
+	var failures, unknown []string
+
+	for _, m := range c.Members {
+		switch {
+		case leftOut(m, except):
+		case m.Node == nil:
+			unknown = append(unknown, m.Hostname+": Kubernetes Node not readable")
+		case !m.Node.Registered:
+			failures = append(failures, "Kubernetes has no Node for "+m.Hostname)
+		case !m.Node.Ready:
+			failures = append(failures, "Kubernetes reports "+m.Hostname+" not Ready")
+		}
+	}
+
+	return precondition(CheckAllNodesReady, failures, unknown)
+}
+
+// checkEtcdHealthy judges the member list as a whole, whoever is left out: a member that never
+// started or is still a learner is a membership in transition. Only what a control plane reports
+// about its own etcd member is that node's own health.
+func checkEtcdHealthy(c Cluster, except string) talosv1alpha1.Precondition {
 	if c.EtcdMembers == nil {
 		return precondition(PreconditionEtcdHealthy, nil, []string{"etcd member list not readable"})
 	}
@@ -156,7 +234,7 @@ func checkEtcdHealthy(c Cluster) talosv1alpha1.Precondition {
 
 	for _, m := range c.Members {
 		switch {
-		case !m.ControlPlane:
+		case !m.ControlPlane, leftOut(m, except):
 		case !m.EtcdStatusRead:
 			// A member that was not asked has not said it is fine.
 			unknown = append(unknown, m.Hostname+": etcd status not readable")
@@ -270,19 +348,7 @@ func PreconditionsMet(ps []talosv1alpha1.Precondition) (metav1.ConditionStatus, 
 	return status, "not met: " + strings.Join(notMet, ", ")
 }
 
-// Preconditions a cluster must meet before a rollout touches a node, and while a changed node is
-// verified. The second list leaves out NoPendingConfig: the node under verification runs a tried
-// config, which is exactly a config that is active and not persistent.
-var (
-	StartPreconditions = []string{
-		PreconditionAllMembersRunning, PreconditionEtcdHealthy, PreconditionEtcdMatchesControlPlanes, PreconditionNoPendingConfig,
-	}
-	VerifyPreconditions = []string{
-		PreconditionAllMembersRunning, PreconditionEtcdHealthy, PreconditionEtcdMatchesControlPlanes,
-	}
-)
-
-// Pass is how one pass over the cluster went, as far as the cluster gate cares.
+// Pass is how one pass over the cluster went, as far as the rollout gates care.
 type Pass struct {
 	// Reached is false when the Talos API did not answer at all.
 	Reached bool
@@ -294,8 +360,8 @@ type Pass struct {
 	// Unmatched then means nothing; otherwise it lists the hostnames of those that have none.
 	Matched   bool
 	Unmatched []string
-	// Preconditions are this pass's; nil when they were not evaluated.
-	Preconditions []talosv1alpha1.Precondition
+	// Cluster is what the pass read from the members; nil when the cluster was not reached.
+	Cluster *Cluster
 	// HealthChecked is false when Talos's own health checks did not run, and HealthMessage says
 	// why. Otherwise Healthy is their verdict and HealthMessage what failed.
 	HealthChecked bool
@@ -303,44 +369,120 @@ type Pass struct {
 	HealthMessage string
 }
 
-// ClusterGate is the cluster-wide gate of a rollout (docs/scope.md §6.3): every member was
-// read, every live member has a TalosMachine, the required preconditions hold, and Talos's own
-// health checks pass. It is open only when all of that is known to be so: anything that could
-// not be determined closes it.
-func ClusterGate(p Pass, required []string) Gate {
-	closed := func(format string, args ...any) Gate { return Gate{Reason: fmt.Sprintf(format, args...)} }
+func closedGate(format string, args ...any) Gate { return Gate{Reason: fmt.Sprintf(format, args...)} }
 
+// TouchGate is the gate before something is sent to a node (docs/scope.md §6.3). It is open only
+// when all of this is known to be so; anything that could not be determined closes it:
+//
+//   - every member was read and every live member has a TalosMachine;
+//   - etcd has exactly the control planes as started, voting members, and no node has a config
+//     pending, the node itself included: Talos falls back to whatever is active when a try
+//     arrives, so a try on top of a pending one would disarm it;
+//   - every other member is healthy by its own facts: it runs and calls itself ready, Kubernetes
+//     reports its Node Ready, and its etcd member reports no errors;
+//   - Talos's own health checks pass.
+//
+// The health of the node itself is left out of it. A node may be the one thing that is wrong:
+// touching it takes nothing from the cluster that the cluster still has, and a rollout is how a
+// config that broke a node is taken back. When the node is known to be unhealthy, Talos's checks
+// are not asked either: they judge the cluster as a whole, cannot leave a node out, and cannot
+// pass. The other members then stand on their own facts alone, and the gate says so in its Note.
+//
+// An unhealthy node is therefore only ever touched while it is the only one, which is invariant 2
+// of §8.1 for every node, not just for control planes.
+func TouchGate(p Pass, node string) Gate {
+	if gate := observed(p); !gate.Open {
+		return gate
+	}
+
+	c := *p.Cluster
+
+	// A name that does not identify exactly one member leaves nobody out.
+	target, known := c.member(node)
+	if !known {
+		node = ""
+	}
+
+	gate := holds(
+		checkAllMembersRunning(c, node),
+		checkAllNodesReady(c, node),
+		checkEtcdHealthy(c, node),
+		checkEtcdMatchesControlPlanes(c),
+		checkNoPendingConfig(c),
+	)
+	if !gate.Open {
+		return gate
+	}
+
+	if known && target.ails() {
+		return Gate{Open: true, Note: node + " is unhealthy itself, so Talos's cluster-wide health checks were not asked: " +
+			"every other member is healthy by its own report, by Kubernetes and by etcd"}
+	}
+
+	return talosHealth(p)
+}
+
+// VerifyGate is the cluster-wide part of verifying a node whose config was changed
+// (docs/scope.md §8.5.1): the whole cluster, that node included, is healthy. Nobody is left out
+// and Talos's own health checks must pass. A pending config is not asked about: the node under
+// verification runs a tried config, which is exactly a config that is active and not persistent.
+func VerifyGate(p Pass) Gate {
+	if gate := observed(p); !gate.Open {
+		return gate
+	}
+
+	c := *p.Cluster
+
+	gate := holds(
+		checkAllMembersRunning(c, ""),
+		checkAllNodesReady(c, ""),
+		checkEtcdHealthy(c, ""),
+		checkEtcdMatchesControlPlanes(c),
+	)
+	if !gate.Open {
+		return gate
+	}
+
+	return talosHealth(p)
+}
+
+// observed is open when the pass saw the whole cluster.
+func observed(p Pass) Gate {
 	switch {
 	case !p.Reached:
-		return closed("the cluster was not reached")
+		return closedGate("the cluster was not reached")
 	case p.Incomplete != "":
-		return closed("the cluster could not be observed completely: %s", p.Incomplete)
+		return closedGate("the cluster could not be observed completely: %s", p.Incomplete)
 	case p.KubernetesUnread != "":
-		return closed("the Kubernetes API could not be read: %s", p.KubernetesUnread)
+		return closedGate("the Kubernetes API could not be read: %s", p.KubernetesUnread)
 	case !p.Matched:
-		return closed("live members could not all be matched against TalosMachines")
+		return closedGate("live members could not all be matched against TalosMachines")
 	case len(p.Unmatched) > 0:
-		return closed("live members without a TalosMachine: %s", strings.Join(p.Unmatched, ", "))
-	case p.Preconditions == nil:
-		return closed("the cluster's preconditions were not evaluated")
+		return closedGate("live members without a TalosMachine: %s", strings.Join(p.Unmatched, ", "))
+	case p.Cluster == nil:
+		return closedGate("the cluster's members were not read")
 	}
 
-	for _, name := range required {
-		i := slices.IndexFunc(p.Preconditions, func(pc talosv1alpha1.Precondition) bool { return pc.Name == name })
-		if i < 0 {
-			return closed("%s was not evaluated", name)
-		}
+	return Gate{Open: true}
+}
 
-		if pc := p.Preconditions[i]; pc.Status != metav1.ConditionTrue {
-			return closed("%s is %s: %s", name, pc.Status, pc.Message)
+// holds is open when every check is known to hold.
+func holds(checks ...talosv1alpha1.Precondition) Gate {
+	for _, c := range checks {
+		if c.Status != metav1.ConditionTrue {
+			return closedGate("%s is %s: %s", c.Name, c.Status, c.Message)
 		}
 	}
 
+	return Gate{Open: true}
+}
+
+func talosHealth(p Pass) Gate {
 	switch {
 	case !p.HealthChecked:
-		return closed("Talos's health checks did not run: %s", p.HealthMessage)
+		return closedGate("Talos's health checks did not run: %s", p.HealthMessage)
 	case !p.Healthy:
-		return closed("Talos's health checks fail: %s", p.HealthMessage)
+		return closedGate("Talos's health checks fail: %s", p.HealthMessage)
 	}
 
 	return Gate{Open: true}

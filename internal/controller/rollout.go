@@ -169,6 +169,15 @@ func (r *TalosClusterReconciler) view(ctx context.Context, tc *talosv1alpha1.Tal
 	return v, nil
 }
 
+// hostname is the hostname of the machine's live node; empty if none answered.
+func (v machineView) hostname() string {
+	if v.node == nil {
+		return ""
+	}
+
+	return v.node.hostname
+}
+
 // nodeWithIdentity returns the observed node with the given SMBIOS UUID. A node whose identity
 // could not be read matches nothing: the operator only acts on hardware it has just identified
 // (docs/scope.md §8.1, invariant 8).
@@ -193,6 +202,7 @@ func planMachine(v machineView) plan.Machine {
 	st := v.tm.Status
 	m := plan.Machine{
 		Name: v.tm.Name,
+		Node: v.hostname(),
 		Hold: v.tm.Spec.Hold || v.tm.Spec.DesiredState == talosv1alpha1.DesiredStateRemoved,
 	}
 
@@ -252,7 +262,7 @@ func (r *TalosClusterReconciler) planRollout(ctx context.Context, tc *talosv1alp
 		Paused:         tc.Spec.Paused,
 		ApprovedChange: tc.Annotations[talosv1alpha1.AnnotationApproveDiff],
 		AbortedTargets: st.AbortedTargets,
-	}, plan.ClusterGate(passOf(st, obs), plan.StartPreconditions))
+	}, passOf(obs))
 
 	if !result.AbortStands {
 		st.AbortedTargets = nil
@@ -536,7 +546,7 @@ func (r *TalosClusterReconciler) step(ctx context.Context, tc *talosv1alpha1.Tal
 
 	if cur.Step == plan.StepVerifying && node.Reachable {
 		var err error
-		if checks, err = r.verifyNode(ctx, tc, obs, v, cur.Since.Time, now); err != nil {
+		if checks, err = r.verifyNode(ctx, obs, v, cur.Since.Time, now); err != nil {
 			return "", err
 		}
 	}
@@ -550,7 +560,7 @@ func (r *TalosClusterReconciler) step(ctx context.Context, tc *talosv1alpha1.Tal
 		logf.FromContext(ctx).Info("node step", "machine", cur.Machine, "step", cur.Step, "action", action.Kind.String(),
 			"next", action.Step, "reason", action.Reason, "detail", action.Message,
 			"reachable", node.Reachable, "activeHash", node.ActiveHash, "persistentHash", node.PersistentHash,
-			"previousHash", cur.PreviousHash, "desiredHash", cur.DesiredHash)
+			"previousHash", cur.PreviousHash, "desiredHash", cur.DesiredHash, "gate", pre.Note)
 	}
 
 	switch action.Kind {
@@ -631,7 +641,8 @@ func configHash(raw []byte) (string, error) {
 }
 
 // preGate is what must hold before a config is sent to the node: nothing pauses the rollout,
-// the config still renders, and the cluster is healthy.
+// the config still renders, and every other node is healthy (plan.TouchGate). The node's own
+// health is not asked about, so that a node a config broke can be given another.
 func (r *TalosClusterReconciler) preGate(tc *talosv1alpha1.TalosCluster, obs observation, v machineView) plan.Gate {
 	switch {
 	case tc.Spec.Paused:
@@ -642,7 +653,7 @@ func (r *TalosClusterReconciler) preGate(tc *talosv1alpha1.TalosCluster, obs obs
 		return plan.Gate{Reason: "the machine's config does not render: " + v.problem}
 	}
 
-	return plan.ClusterGate(passOf(&tc.Status, obs), plan.StartPreconditions)
+	return plan.TouchGate(passOf(obs), v.hostname())
 }
 
 // latest reports whether tc is the TalosCluster as the API server has it now. A side effect

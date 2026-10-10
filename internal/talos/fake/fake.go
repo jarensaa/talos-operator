@@ -63,6 +63,8 @@ const (
 // under ApplyConfiguration with DryRun set, which AssertNoMutations allows.
 var mutatingMethods = map[string]bool{MethodApplyConfiguration: true}
 
+func (n *Node) unhealthy() bool { return n.UnhealthyWhen != nil && n.UnhealthyWhen(n.Config.Active) }
+
 // Node is one simulated Talos node. Every field drives the answer of the matching Reader method.
 type Node struct {
 	Addr              netip.Addr
@@ -84,6 +86,10 @@ type Node struct {
 	// the node fails as unavailable, as when a config breaks its network. A reverted try brings
 	// it back.
 	UnreachableWhen func(active []byte) bool
+	// UnhealthyWhen makes the node unhealthy while it returns true for the active config: the
+	// node answers and reports itself not ready, and the cluster's health check fails on it, as
+	// when a config stops its kubelet.
+	UnhealthyWhen func(active []byte) bool
 	// tryPrevious is the config a pending try falls back to: whatever was active when the try
 	// was applied, exactly as Talos captures it.
 	tryPrevious []byte
@@ -373,7 +379,12 @@ func (r *reader) MachineStatus(ctx context.Context, node netip.Addr) (talos.Mach
 		return talos.MachineStatus{}, err
 	}
 
-	return n.MachineStatus, nil
+	ms := n.MachineStatus
+	if n.unhealthy() {
+		ms.Ready = false
+	}
+
+	return ms, nil
 }
 
 func (r *reader) BootID(ctx context.Context, node netip.Addr) (string, error) {
@@ -509,6 +520,13 @@ func (r *reader) HealthCheck(ctx context.Context, node netip.Addr, _ talos.Clust
 
 	r.s.mu.Lock()
 	defer r.s.mu.Unlock()
+
+	// Talos checks the cluster as a whole: one node that is not ready fails it.
+	for _, n := range r.s.sortedNodesLocked() {
+		if n.unhealthy() {
+			return talos.HealthResult{Messages: []string{n.Nodename + " is not ready"}}, nil
+		}
+	}
 
 	return talos.HealthResult{Healthy: r.s.health.Healthy, Messages: slices.Clone(r.s.health.Messages)}, nil
 }

@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -133,13 +134,30 @@ var _ = Describe("Config rollout", func() {
 		}
 	}
 
-	// heartbeat is the kubelets: every node that can reach the API server renews its Lease.
+	// heartbeat is the kubelets, and Kubernetes watching them: every node that can reach the API
+	// server renews its Lease, and a node whose kubelet is down (see sicken) is not Ready.
 	heartbeat := func() {
 		GinkgoHelper()
 
 		for _, n := range rolloutNodes {
 			live := scenario.Node(n.addr)
-			if silent[n.addr] || (live.UnreachableWhen != nil && live.UnreachableWhen(live.Config.Active)) {
+			sick := live.UnhealthyWhen != nil && live.UnhealthyWhen(live.Config.Active)
+
+			// Kubernetes notices a kubelet that stopped: the Node is no longer Ready.
+			kube := &corev1.Node{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: n.node}, kube)).To(Succeed())
+
+			ready := corev1.ConditionTrue
+			if sick {
+				ready = corev1.ConditionFalse
+			}
+
+			if kube.Status.Conditions[0].Status != ready {
+				kube.Status.Conditions[0].Status = ready
+				Expect(k8sClient.Status().Update(ctx, kube)).To(Succeed())
+			}
+
+			if sick || silent[n.addr] || (live.UnreachableWhen != nil && live.UnreachableWhen(live.Config.Active)) {
 				continue
 			}
 
@@ -330,6 +348,15 @@ var _ = Describe("Config rollout", func() {
 	cutOff := func(machine string) {
 		scenario.UpdateNode(node(machine).addr, func(n *fake.Node) {
 			n.UnreachableWhen = func(active []byte) bool { return bytes.Contains(active, []byte(deadResolver)) }
+		})
+	}
+
+	// sicken makes a node unhealthy for as long as its active config contains marker, or for good
+	// if marker is empty: the node answers, but its kubelet is down. Talos reports the node not
+	// ready and fails the cluster's health check on it, and Kubernetes reports it not Ready.
+	sicken := func(machine, marker string) {
+		scenario.UpdateNode(node(machine).addr, func(n *fake.Node) {
+			n.UnhealthyWhen = func(active []byte) bool { return bytes.Contains(active, []byte(marker)) }
 		})
 	}
 
@@ -838,6 +865,117 @@ var _ = Describe("Config rollout", func() {
 			cfg := getMachine(worker1).Status.Config
 			Expect(cfg.AppliedHash).To(Equal(cfg.LiveHash))
 		})
+	})
+
+	// A config can pass its soak, be confirmed, and break the node later. The rollout that takes
+	// it back has to touch a node that is unhealthy, which is the one case the gate allows.
+	Context("a config that breaks a node after it was confirmed", func() {
+		const bad = "bad"
+
+		rolledOut := []string{tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2)}
+
+		BeforeEach(func() {
+			setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig(bad))
+			runUntil("the config is rolled out", func() bool { return idle() && len(tc.Status.History) == 1 })
+			Expect(applies()).To(Equal(rolledOut))
+		})
+
+		// breaks is the config doing its damage on the given machines, some time after the rollout.
+		breaks := func(machines ...string) {
+			GinkgoHelper()
+
+			for _, m := range machines {
+				sicken(m, "rollout: "+bad)
+			}
+
+			advance(time.Hour)
+
+			Expect(condition(tc, talosv1alpha1.ConditionHealthy).Status).To(Equal(metav1.ConditionFalse))
+			Expect(operation()).To(BeNil())
+			Expect(applies()).To(Equal(rolledOut), "an unhealthy node alone is nothing the operator acts on")
+		}
+
+		It("is taken back by a rollout, which repairs the unhealthy node before it touches another", func() {
+			breaks(worker2)
+
+			setPoolConfig(talosv1alpha1.MachineRoleWorker)
+			settle(started)
+			Expect(operation()).NotTo(BeNil(), inSync().Message)
+			Expect(operation().Plan).To(Equal([]string{worker2, worker1}), "the node to repair goes first")
+
+			// The node is healthy again as soon as the config is gone, and is only then confirmed.
+			runUntil("worker-2 is verified", stepIs(worker2, plan.StepVerifying))
+			Expect(applies()).To(Equal(append(slices.Clone(rolledOut), tried(worker2))))
+			Expect(string(scenario.Node(worker2Addr).Config.Active)).NotTo(ContainSubstring(bad))
+
+			runUntil("the rollout ends", func() bool { return idle() && len(tc.Status.History) == 2 })
+			Expect(applies()).To(Equal(append(slices.Clone(rolledOut),
+				tried(worker2), confirmed(worker2), tried(worker1), confirmed(worker1))))
+			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+
+			settle(nil)
+			Expect(inSync().Status).To(Equal(metav1.ConditionTrue), inSync().Message)
+			Expect(condition(tc, talosv1alpha1.ConditionHealthy).Status).To(Equal(metav1.ConditionTrue))
+			Expect(blocked()).To(BeNil())
+		})
+
+		It("is not taken back while a second node is unhealthy", func() {
+			breaks(worker1, worker2)
+
+			setPoolConfig(talosv1alpha1.MachineRoleWorker)
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonGateClosed))
+			Expect(blocked().Message).To(ContainSubstring(node(worker2).node), "the gate names the node that is not the one to repair")
+			Expect(applies()).To(Equal(rolledOut))
+		})
+
+		It("keeps every healthy node untouched for as long as the broken one is not repaired", func() {
+			breaks(worker2)
+
+			// A change for the control plane only: the unhealthy worker is not part of it.
+			setPoolConfig(talosv1alpha1.MachineRoleControlPlane, labelConfig("one"))
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(blocked().Reason).To(Equal(talosv1alpha1.ReasonGateClosed))
+			Expect(blocked().Message).To(ContainSubstring(node(worker2).node))
+			Expect(applies()).To(Equal(rolledOut))
+
+			// With the workers' config taken back as well, the repair goes first and the rest follows.
+			setPoolConfig(talosv1alpha1.MachineRoleWorker)
+			runUntil("the rollout ends", func() bool { return idle() && len(tc.Status.History) == 2 })
+			Expect(applies()[len(rolledOut):]).To(Equal([]string{
+				tried(worker2), confirmed(worker2), tried(worker1), confirmed(worker1), tried(cp1Machine), confirmed(cp1Machine),
+			}))
+		})
+	})
+
+	It("does not keep a config that leaves an unhealthy node unhealthy, and halts before another node is touched", func() {
+		sicken(worker2, "")
+		advance(time.Minute)
+
+		setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+		runUntil("worker-2 is tried", stepIs(worker2, plan.StepVerifying))
+		Expect(operation().Plan).To(Equal([]string{worker2, worker1}))
+		Expect(applies()).To(Equal([]string{tried(worker2)}))
+
+		// Verification leaves nobody out: the node itself has to be healthy for the whole soak.
+		deadline := operation().Current.Deadline.Time
+		at(deadline.Add(-plan.ConfirmMargin))
+		Expect(operation().Current.Step).To(Equal(plan.StepRollingBack))
+
+		expireTry(worker2)
+		at(deadline.Add(plan.RollbackGrace))
+
+		Expect(failed()).To(BeTrue())
+		Expect(operation().Failure.Machine).To(Equal(worker2))
+		Expect(operation().Failure.Reason).To(Equal(plan.FailRolledBack))
+		Expect(applies()).To(Equal([]string{tried(worker2)}), "never confirmed, and worker-1 never touched")
+
+		advance(time.Hour)
+		Expect(applies()).To(Equal([]string{tried(worker2)}))
 	})
 
 	It("touches no node while paused, and goes on when the pause is lifted", func() {

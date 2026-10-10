@@ -96,29 +96,26 @@ func TestFactsReachTheGatesWithUnknownsIntact(t *testing.T) {
 }
 
 func TestPassOfReportsWhatThePassCouldNotDetermine(t *testing.T) {
-	st := &talosv1alpha1.TalosClusterStatus{}
-
-	blind := passOf(st, observation{healthErrorMsg: "deadline exceeded"})
-	if blind.Reached || blind.Matched || blind.HealthChecked || blind.Preconditions != nil || blind.HealthMessage != "deadline exceeded" {
+	blind := passOf(observation{healthErrorMsg: "deadline exceeded"})
+	if blind.Reached || blind.Matched || blind.HealthChecked || blind.Cluster != nil || blind.HealthMessage != "deadline exceeded" {
 		t.Fatalf("a pass that reached nothing: %+v", blind)
 	}
 
-	if plan.ClusterGate(blind, plan.StartPreconditions).Open {
-		t.Fatal("a pass that reached nothing must not open the gate")
+	if plan.TouchGate(blind, "").Open || plan.VerifyGate(blind).Open {
+		t.Fatal("a pass that reached nothing must not open a gate")
 	}
 
-	st.Adoption = &talosv1alpha1.AdoptionStatus{Preconditions: []talosv1alpha1.Precondition{{Name: plan.PreconditionEtcdHealthy}}}
-
-	full := passOf(st, observation{
-		facts:     &clusterFacts{},
+	full := passOf(observation{
+		facts:     &clusterFacts{nodes: []nodeFacts{{hostname: "cp-1"}}},
 		unmatched: []string{},
 		health:    &talos.HealthResult{Healthy: true, Messages: []string{"all checks passed"}},
 	})
-	if !full.Reached || !full.Matched || !full.HealthChecked || !full.Healthy || full.HealthMessage != "" || len(full.Preconditions) != 1 {
+	if !full.Reached || !full.Matched || !full.HealthChecked || !full.Healthy || full.HealthMessage != "" ||
+		full.Cluster == nil || len(full.Cluster.Members) != 1 {
 		t.Fatalf("a pass that read everything: %+v", full)
 	}
 
-	troubled := passOf(st, observation{
+	troubled := passOf(observation{
 		facts:     &clusterFacts{},
 		unmatched: []string{"stray"},
 		err:       errors.New("cp-2 (10.5.0.3): timeout"),
@@ -128,6 +125,60 @@ func TestPassOfReportsWhatThePassCouldNotDetermine(t *testing.T) {
 	if troubled.Incomplete == "" || troubled.KubernetesUnread == "" || len(troubled.Unmatched) != 1 || troubled.Healthy ||
 		troubled.HealthMessage != etcdUnhealthy {
 		t.Fatalf("a pass over a cluster in trouble: %+v", troubled)
+	}
+}
+
+// What Kubernetes says about a member is the control plane's view of it, found by the member's
+// address and only then by its name.
+func TestKubernetesNodesAreMatchedToMembers(t *testing.T) {
+	kube := func(name, address string, ready corev1.ConditionStatus, more ...corev1.NodeCondition) corev1.Node {
+		n := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		n.Status.Conditions = append([]corev1.NodeCondition{{Type: corev1.NodeReady, Status: ready}}, more...)
+
+		if address != "" {
+			n.Status.Addresses = []corev1.NodeAddress{
+				{Type: corev1.NodeHostName, Address: name}, {Type: corev1.NodeInternalIP, Address: address},
+			}
+		}
+
+		return n
+	}
+
+	facts := &clusterFacts{nodes: []nodeFacts{
+		{hostname: "by-address", address: netip.MustParseAddr("10.5.0.2")},
+		{hostname: "by-name"},
+		{hostname: "not-ready", address: netip.MustParseAddr("10.5.0.4")},
+		{hostname: "no-network", address: netip.MustParseAddr("10.5.0.5")},
+		{hostname: "unregistered", address: netip.MustParseAddr("10.5.0.6")},
+	}}
+
+	// Before the Nodes are read nothing is known, which no gate reads as fine.
+	if got := facts.judged().Members[0].Node; got != nil {
+		t.Fatalf("Nodes that were not read must stay unknown: %+v", got)
+	}
+
+	facts.observeKubeNodes([]corev1.Node{
+		// The address decides: this Node is named like another member.
+		kube("by-name-elsewhere", "10.5.0.2", corev1.ConditionTrue),
+		kube("by-name", "", corev1.ConditionTrue),
+		kube("not-ready", "10.5.0.4", corev1.ConditionFalse),
+		kube("no-network", "10.5.0.5", corev1.ConditionTrue,
+			corev1.NodeCondition{Type: corev1.NodeNetworkUnavailable, Status: corev1.ConditionTrue}),
+		kube("someone-else", "10.5.0.9", corev1.ConditionTrue),
+	})
+
+	want := map[string]plan.KubernetesNode{
+		"by-address":   {Registered: true, Ready: true},
+		"by-name":      {Registered: true, Ready: true},
+		"not-ready":    {Registered: true},
+		"no-network":   {Registered: true},
+		"unregistered": {},
+	}
+
+	for _, m := range facts.judged().Members {
+		if m.Node == nil || *m.Node != want[m.Hostname] {
+			t.Errorf("%s: got %+v, want %+v", m.Hostname, m.Node, want[m.Hostname])
+		}
 	}
 }
 

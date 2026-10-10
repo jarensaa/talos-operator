@@ -20,6 +20,7 @@ limitations under the License.
 package plan
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -31,7 +32,9 @@ import (
 
 // Machine is what the rollout planner needs to know about one machine.
 type Machine struct {
-	Name         string
+	Name string
+	// Node is the hostname of the live node the machine is matched to; empty if there is none.
+	Node         string
 	ControlPlane bool
 	// Hold excludes the machine from rollouts.
 	Hold bool
@@ -70,6 +73,8 @@ type Gate struct {
 	Open bool
 	// Reason says what is closed.
 	Reason string
+	// Note says what an open gate did not ask about, if anything.
+	Note string
 }
 
 // Block reasons of a rollout that may not start. They match the RolloutBlocked condition reasons.
@@ -85,8 +90,8 @@ const (
 
 // Rollout is the planner's answer to "is a config rollout due, and may it start?".
 type Rollout struct {
-	// Pending lists the machines whose config must change, in rollout order: workers before
-	// control planes, each group by name.
+	// Pending lists the machines whose config must change, in rollout order: a machine whose
+	// node is unhealthy first, then workers before control planes, each group by name.
 	Pending []string
 	// Targets maps each pending machine to the rendered config hash it is to reach, and Bases to
 	// the live config hash it is to leave. An operation applies exactly these pairs: they are what
@@ -115,9 +120,12 @@ type Rollout struct {
 // MayStart reports whether a rollout is due and nothing blocks it.
 func (r Rollout) MayStart() bool { return len(r.Pending) > 0 && r.BlockReason == "" }
 
-// PlanRollout decides whether a config rollout is due and whether it may start. gate is the
-// cluster-wide precondition for touching the first node (cluster healthy, etcd whole).
-func PlanRollout(machines []Machine, s Settings, gate Gate) Rollout {
+// PlanRollout decides whether a config rollout is due and whether it may start. p is this pass
+// over the cluster: a rollout starts when the first node of its plan may be touched (TouchGate).
+//
+// A machine whose node is unhealthy goes first. The gate lets nothing else be touched while a
+// node is unhealthy, so any other order would wait for the node the rollout is there to repair.
+func PlanRollout(machines []Machine, s Settings, p Pass) Rollout {
 	var (
 		out     = Rollout{Targets: map[string]string{}, Bases: map[string]string{}}
 		pending []Machine
@@ -160,15 +168,11 @@ func PlanRollout(machines []Machine, s Settings, gate Gate) Rollout {
 	}
 
 	slices.SortFunc(pending, func(a, b Machine) int {
-		if a.ControlPlane != b.ControlPlane {
-			if a.ControlPlane {
-				return 1
-			}
-
-			return -1
-		}
-
-		return strings.Compare(a.Name, b.Name)
+		return cmp.Or(
+			-cmp.Compare(rank(ails(p, a)), rank(ails(p, b))),
+			cmp.Compare(rank(a.ControlPlane), rank(b.ControlPlane)),
+			strings.Compare(a.Name, b.Name),
+		)
 	})
 
 	for _, m := range pending {
@@ -182,9 +186,28 @@ func PlanRollout(machines []Machine, s Settings, gate Gate) Rollout {
 	}
 
 	out.ChangeHash = changeHash(pending)
-	out.BlockReason, out.BlockMessage = rolloutBlock(pending, stale, s, gate, out)
+	out.BlockReason, out.BlockMessage = rolloutBlock(pending, stale, s, TouchGate(p, pending[0].Node), out)
 
 	return out
+}
+
+// ails reports whether the machine's node is known to be unhealthy.
+func ails(p Pass, m Machine) bool {
+	if p.Cluster == nil {
+		return false
+	}
+
+	member, known := p.Cluster.member(m.Node)
+
+	return known && member.ails()
+}
+
+func rank(b bool) int {
+	if b {
+		return 1
+	}
+
+	return 0
 }
 
 // abortStands reports whether an abort still covers what is pending. It does while any machine

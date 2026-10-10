@@ -115,7 +115,7 @@ internal/gates              built-in gates (etcd, Talos health, node Ready) + CE
 - never fewer than 3 etcd voters without an override;
 - never two disruptive operations at once.
 
-What is in `internal/plan` today: the cluster preconditions and the cluster gate of a rollout (`Preconditions`, `ClusterGate`), whether a rollout is due and may start (`PlanRollout`), and what a node step does next (`NextStep`). The controllers hand them plain facts: what a pass read from each node, with everything that was not read marked as unknown, never as fine. The adoption proof's gate (`proofGate`) is the one exception: it is pure and table-tested, but it judges TalosMachine objects directly and so sits with the controller that reads them.
+What is in `internal/plan` today: the cluster preconditions (`Preconditions`), the gates of a rollout (`TouchGate` before a node is touched, `VerifyGate` while a changed node is verified), whether a rollout is due and may start (`PlanRollout`), and what a node step does next (`NextStep`). The controllers hand them plain facts: what a pass read from each node, with everything that was not read marked as unknown, never as fine. The adoption proof's gate (`proofGate`) is the one exception: it is pure and table-tested, but it judges TalosMachine objects directly and so sits with the controller that reads them.
 
 **A failure is reported as what it is.** A node that does not answer makes its own facts unknown. A failure of the Kubernetes API the operator runs against is not a fact about Talos at all: the pass fails and is retried, and no condition claims the Talos cluster is unreachable. Every read that fails is logged with the node and what was asked; conditions carry the names of what was not read, which do not change from pass to pass.
 
@@ -436,13 +436,22 @@ One blocked machine blocks the rollout for every machine: a rollout either appli
 
 **Approval flow.** For changes that require approval, the operator sets `RolloutBlocked=AwaitingApproval` and `status.approval`: the machines concerned, with the reasons, and the hash of the change. The hash covers every machine of the rollout with the config it runs and the config it is to get. The diff to review is each machine's `status.config.diff`, the operator's own redacted per-document diff. (Talos's dry-run diff is not used for this: it is an unredacted text diff of the whole config.) A human approves by annotating the cluster with `talos.jarensaa.github.io/approve-diff=<hash>`. The approval matches only that exact change: a node that drifts, or a spec that renders anything else, changes the hash.
 
-**Planning.** A rollout is due when a machine's rendered config differs from its live config and from what was last applied (or the drift policy is `Enforce`). The planner (`plan.PlanRollout`) answers with the machines in order, workers before control planes and by name within each group, or with the reason nothing starts, most fundamental first: a protected or boot-time change, `paused`, a TalosMachine whose status has not caught up, an earlier abort (§8.3), a missing approval, the cluster gate. The cluster gate is open when every member was read, every live member has a TalosMachine, all members run, etcd has exactly the control planes as healthy voters, no node has a staged config pending, and Talos's own health checks pass. Anything that could not be determined closes it.
+**Planning.** A rollout is due when a machine's rendered config differs from its live config and from what was last applied (or the drift policy is `Enforce`). The planner (`plan.PlanRollout`) answers with the machines in order, or with the reason nothing starts, most fundamental first: a protected or boot-time change, `paused`, a TalosMachine whose status has not caught up, an earlier abort (§8.3), a missing approval, the gate for the first node. The order is a machine whose node is unhealthy first, then workers before control planes, by name within each group.
+
+**The gate before a node is touched** (`plan.TouchGate`) is asked for one node. It is open when all of this is known to be so, and anything that could not be determined closes it:
+- every member was read, and every live member has a TalosMachine;
+- etcd has exactly the control planes as started, voting members;
+- no node has a config pending, staged or tried, the node itself included;
+- every *other* member is healthy by its own facts: it runs and reports itself ready, Kubernetes reports its Node Ready with a network, and its etcd member reports no errors;
+- Talos's own health checks pass.
+
+The node's own health is not asked about. Touching a node that is already unhealthy takes nothing from the cluster that it still has, and a rollout is how a config that broke a node is taken back (§8.3). When the node is known to be unhealthy, Talos's health checks are not asked either: they judge the cluster as a whole, cannot leave a node out (`T/pkg/cluster/check/kubernetes.go:32-85` fails on a Node that is not in the list it was given), and so cannot pass. The other members then stand on their own facts alone. Not knowing whether the node is healthy excuses nothing: only a node that was read and found unhealthy sets Talos's checks aside. So an unhealthy node is only ever touched while it is the only one, and a healthy node is never touched while any other is unhealthy.
 
 Starting a rollout only takes the lock: `status.operation` records the plan, and for each machine the config it is to leave (`bases`) and the one it is to reach (`targets`). **An operation applies exactly those pairs**, which are what was classified and approved. When a machine's turn comes and it renders, or runs, something else, the operation ends as `Superseded` and the rest is planned afresh.
 
 **Per-node sequence** (§8.5.1 for the protocol and its failure handling):
 1. Persist the step: `Trying`, with the previous and desired hashes and the deadline.
-2. Wait for the cluster gate; while it is closed nothing is sent. A gate that stays closed for `stepTimeout` is a failure.
+2. Wait for the node's gate (above); while it is closed nothing is sent. A gate that stays closed for `stepTimeout` is a failure.
 3. Render again. Only the planned config is ever sent; a dry run validates it on the node first.
 4. Apply with `TRY`.
 5. Verify from outside and soak.
@@ -680,7 +689,7 @@ This only makes sense from a management cluster (or a CLI), since the cluster do
 These are enforced in `internal/plan` and exhaustively table-tested.
 
 1. At most **one disruptive operation** per cluster: `status.operation` is the lock.
-2. At most **one CP** is not Ready or not a healthy etcd member at any time.
+2. At most **one CP** is not Ready or not a healthy etcd member at any time. The gate of a config rollout holds every node to this, workers included: a node is touched only while every other node is healthy (§6.3).
 3. etcd membership never goes 3→2 without an override. There is never more than one learner, and never two membership changes at once.
 4. No disruptive step starts outside a maintenance window. An in-flight node step started inside a window finishes, but the next node waits.
 5. No disruptive step starts while `paused`, while `operation.failure` is set, or while any gate is false.
@@ -708,7 +717,12 @@ This avoids the CACPPT #262 permablock.
   - `talos.jarensaa.github.io/abort=<token>`: end the operation and leave nodes as they are. What was left of it is recorded in `status.abortedTargets` and is **not started again**; otherwise the same rollout would begin anew a moment later. A spec that renders anything else for a machine, a revert included, is a new change: it rolls out and clears the record.
 - Gates that can never become true are reported along with what is false. They are never silently bypassed.
 
-**Known gap: repairing an unhealthy node.** The cluster gate requires a healthy cluster before any node is touched, the node about to be changed included. A config that passes its soak and breaks the node later therefore cannot be taken back by a rollout: the revert is planned, and waits for the health the revert would restore. Until the gate learns to leave the target node's own health out of the question (bead `talos-rlw.9`, with the built-in gates of M4), that node has to be repaired by hand.
+**Repairing an unhealthy node.** A config can pass its soak, be confirmed, and break the node later. Reverting the spec takes it back: the gate does not ask about the health of the node it is asked for (§6.3), and the planner puts that node first. The repair is a rollout like any other. The config is tried, the whole cluster, that node included, must then be healthy for the soak, and a config that does not make the node healthy is reverted by Talos and halts the rollout.
+
+What this does not reach:
+- **Two unhealthy nodes.** Neither is touched while the other is unhealthy, and verification would not pass anyway. A config that breaks every node it was confirmed on, some time later, is beyond a rollout; the soak is what stands against it.
+- **A node whose Talos API does not answer.** Nothing can be sent to it.
+- **A fault no node reports as its own.** If every node calls itself ready and Kubernetes agrees, but Talos's cluster-wide checks fail, the gate stays closed for every node: nothing says that the node to be touched is the cause.
 
 ### 8.4 Self-eviction
 Covered in §4.2: 2 replicas, steps persisted before side effects, resume keyed on observed facts.
@@ -734,7 +748,7 @@ The operator applies **every** config change this way (§6.3). The protocol for 
 3. **Observe** the config active (`activeHash == desiredHash`), then persist `Verifying`. A try whose answer was lost is recognised here and never sent again.
 4. **Verify from outside.** All of these must hold:
    - The node's Talos API answers when reached through the endpoint of a **different** control plane (`WithNode`), and its hardware identity is the pinned one. The node being changed is never an endpoint. (A cluster with a single control plane has no other way in for that node.)
-   - Every member runs, etcd has exactly the control planes as healthy voters, and Talos's own health checks pass.
+   - Every member runs and is Ready to Kubernetes, etcd has exactly the control planes as healthy voters, and Talos's own health checks pass (`plan.VerifyGate`). Nobody is left out here: the node that was changed has to be healthy too.
    - Kubernetes reports the Node `Ready`, with a network.
    - The node's kubelet has renewed its Lease in `kube-node-lease` since verification began, and within the last 40s. `Ready` alone is the control plane's last word on a node and stays True for most of a minute after it went dark.
    - Custom gates (M4).
@@ -749,7 +763,7 @@ If the node is not verified in time, the operator does **not** confirm.
 - A confirm that did land, but whose answer was lost, is recognised by the read-back even after the deadline.
 - If the node does not come back on `previousHash` within `stepTimeout`, the failure is `NodeUnreachableAfterRollback`. This needs a human, because Talos's revert is only logged if it fails (`config rollback failed`).
 
-Other failures of a node step: `Timeout` (the cluster gate stayed closed, or a node that needed no change was not verified, for `stepTimeout`), `ConfigChangedUnderneath` (the node runs neither the previous nor the desired config), `Rejected` (Talos refused the config; nothing was applied if the dry run caught it). What Talos says about a config is withheld when a config source is a Secret, because validation errors can quote values.
+Other failures of a node step: `Timeout` (the node's gate stayed closed, or a node that needed no change was not verified, for `stepTimeout`), `ConfigChangedUnderneath` (the node runs neither the previous nor the desired config), `Rejected` (Talos refused the config; nothing was applied if the dry run caught it). What Talos says about a config is withheld when a config source is a Secret, because validation errors can quote values.
 
 Waiting for a closed gate never lets a persisted deadline lapse into a rollback: while the node is still on its previous config before the deadline, the deadline is moved (`Rearm`). Past the deadline the same observation could be a try that was reverted, so it is treated as one.
 
@@ -838,7 +852,7 @@ Not a milestone, and not blocked on one: adopting a real cluster, switching it t
 
 Three slices, in this order.
 
-**M4a: run as deployed.** So far the e2e runs the controllers inside the test process. After this slice the chart's image runs in the test cluster with two replicas, and a rollout that takes down the node its leader runs on is finished by the other replica. That is the clause of M3's acceptance not yet shown. It also closes the known gap of §8.3: a rollout can change a node that is already unhealthy, so a bad config that was confirmed can be taken back.
+**M4a: run as deployed.** So far the e2e runs the controllers inside the test process. After this slice the chart's image runs in the test cluster with two replicas, and a rollout that takes down the node its leader runs on is finished by the other replica. That is the clause of M3's acceptance not yet shown.
 
 **M4b: upgrades.** Changing the Talos version in the spec, or the installer a machine is built from, takes every node there one at a time, draining it first. A node that does not come back as expected halts the rollout, and Talos's own fallback to the previous boot is recognised for what it is. Config changes that only take effect through a reinstall, refused today (`RequiresReinstall`), roll out the same way.
 - In: refusing up front what cannot work (a jump Talos does not allow, a version this operator does not support, an installer that does not exist); workers before control planes, control planes one at a time with etcd never at risk; drains that respect disruption budgets and time out; retry, skip and abort as in M3.
@@ -946,7 +960,7 @@ R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
 | machinery requires go 1.26.5 plus `replace` directives | Pin the toolchain in go.mod. Verify the build in M0. |
 | Network change that breaks a node is confirmed anyway | Verification goes through a different node's apid and needs a fresh kubelet heartbeat, plus a soak period inside the TRY window. Read back active and persistent hashes after confirming (§8.5.1). |
 | A change of a "safe" class breaks a node | Every change is tried, whatever its class, so the node reverts by itself (§6.3). |
-| A confirmed change breaks a node later, and the health gate refuses the rollout that would revert it | Known gap (§8.3); the node is repaired by hand until the gate leaves the target's own health out. |
+| A confirmed change breaks a node later, and the health gate refuses the rollout that would revert it | The gate leaves out the health of the node it is asked for, so reverting the spec repairs the node, as long as it is the only unhealthy one (§6.3, §8.3). |
 | Failure that appears after a confirmed change (e.g. DHCP renewal hours later) | Not covered by TRY; needs console or maintenance-mode recovery. Longer soak; last-known-good watchdog re-evaluated in M9 (§8.5.5). |
 | Early-boot hang after an OS upgrade (before machined starts) | No automatic A/B fallback in that case. One node at a time keeps quorum; manual recovery via console (§8.5.2). |
 
