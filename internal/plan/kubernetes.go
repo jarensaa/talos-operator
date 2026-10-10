@@ -107,6 +107,16 @@ func ImageVersion(image string) (*version.Version, bool) {
 	return v, true
 }
 
+// VersionOf is the version an image's tag names, as "major.minor.patch".
+func VersionOf(image string) (string, bool) {
+	v, ok := ImageVersion(image)
+	if !ok {
+		return "", false
+	}
+
+	return core(v), true
+}
+
 // imageTag is the tag of an image reference; empty if it has none.
 func imageTag(image string) string {
 	name, _, _ := strings.Cut(image, "@")

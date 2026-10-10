@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -80,6 +81,8 @@ type TalosClusterReconciler struct {
 	APIReader client.Reader
 	// Evictor evicts the pods of a node an upgrade is about to reboot.
 	Evictor PodEvictor
+	// KubernetesChecks asks the Kubernetes API what stands in the way of a Kubernetes upgrade.
+	KubernetesChecks KubernetesChecker
 	// NodeName is the Kubernetes node this replica runs on, if it knows. An upgrade takes that
 	// node last in its group, so the operator moves house as rarely as it can.
 	NodeName string
@@ -143,6 +146,7 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	if adoptErr == nil && managing(tc) {
+		obs.policy, obs.policyChanges = r.policy(ctx, tc)
 		adoptErr = r.manage(ctx, tc, obs)
 	}
 
@@ -180,10 +184,20 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// A node step in flight is driven by time (the try window, the soak), so it is re-evaluated
 	// often rather than on the observe interval.
 	if op := tc.Status.Operation; op != nil && op.Failure == nil {
-		return ctrl.Result{RequeueAfter: min(r.interval(), rolloutInterval)}, nil
+		return ctrl.Result{RequeueAfter: r.untilWindow(obs, min(r.interval(), rolloutInterval))}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: r.interval()}, nil
+	return ctrl.Result{RequeueAfter: r.untilWindow(obs, r.interval())}, nil
+}
+
+// untilWindow shortens a wait so that it ends when the maintenance windows open or close.
+func (r *TalosClusterReconciler) untilWindow(obs observation, wait time.Duration) time.Duration {
+	if obs.policyChanges.IsZero() {
+		return wait
+	}
+
+	// A moment later, so that the pass it brings finds the window changed.
+	return max(min(wait, obs.policyChanges.Sub(r.now())+time.Second), time.Second)
 }
 
 // proving reports whether the adoption proof is evaluated: the cluster is observed only and was
@@ -233,6 +247,11 @@ type observation struct {
 	endpoints      talos.SelectOptions
 	health         *talos.HealthResult
 	healthErrorMsg string
+
+	// policy is what the user's rollout policy says in this pass, and policyChanges when its
+	// maintenance windows say something else next; zero if they never do (docs/scope.md §6.4).
+	policy        plan.Policy
+	policyChanges time.Time
 }
 
 func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions) observation {
@@ -838,6 +857,8 @@ func (r *TalosClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(target.ClustersForSecret(mgr.GetClient()))).
 		Watches(&talosv1alpha1.TalosMachine{}, handler.EnqueueRequestsFromMapFunc(clusterOfMachine(mgr.GetClient()))).
 		Watches(&talosv1alpha1.TalosMachinePool{}, handler.EnqueueRequestsFromMapFunc(clusterOfPool)).
+		// A hook's Job that finishes moves its operation on.
+		Owns(&batchv1.Job{}).
 		Named("taloscluster").
 		Complete(r)
 }

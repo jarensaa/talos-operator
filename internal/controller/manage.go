@@ -90,14 +90,28 @@ func (r *TalosClusterReconciler) manage(ctx context.Context, tc *talosv1alpha1.T
 }
 
 // operate carries the one disruptive operation of the cluster a step further, or plans the next
-// (docs/scope.md §8.1, invariant 1). A Talos upgrade comes before a config rollout: it brings a
-// node to the system its config names, and the rollout then applies that config.
+// (docs/scope.md §8.1, invariant 1). The upgrades come before a config rollout: a Talos upgrade
+// brings a node to the system its config names, a Kubernetes upgrade changes the images of the
+// Kubernetes components in its own order, and the rollout then applies what is left.
+//
+// An upgrade that is due but may not start does not keep the other from starting. They wait for
+// each other where they must: a Talos version that does not run the cluster's Kubernetes waits
+// for the Kubernetes upgrade, and the other way round (docs/scope.md §7.3, §7.4).
 func (r *TalosClusterReconciler) operate(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation,
 	pools map[string]*talosv1alpha1.TalosMachinePool, machines []talosv1alpha1.TalosMachine,
 ) error {
 	upgrading, held, err := r.upgrade(ctx, tc, obs, pools, machines)
 	if err != nil || upgrading {
 		return err
+	}
+
+	upgrading, heldKubernetes, err := r.kubernetes(ctx, tc, obs, pools, machines)
+	if err != nil || upgrading {
+		return err
+	}
+
+	if held == nil {
+		held = heldKubernetes
 	}
 
 	if err := r.rollout(ctx, tc, obs, pools, machines); err != nil {
