@@ -89,8 +89,8 @@ type KubernetesMachine struct {
 // KubernetesHop is one step of a Kubernetes upgrade: at most one minor version further.
 type KubernetesHop struct {
 	// From is the lowest version any component runs, To the highest version the spec asks for,
-	// and Version what this hop brings every component to: To, or the first release of the minor
-	// after From when To is further away than that.
+	// and Version what this hop brings every component to: To, or a release of the minor after
+	// From when To is further away than that.
 	From, To, Version string
 	// Problem says why the versions cannot be told, or why there is no way from From to To.
 	Problem string
@@ -156,10 +156,12 @@ func withVersion(image, v string) string {
 }
 
 // HopOf works out the next hop from what the machines' configs name. Machines that are not
-// current are left out: the caller blocks on them.
-func HopOf(machines []KubernetesMachine) KubernetesHop {
+// current are left out: the caller blocks on them. releases chooses the release of a minor on
+// the way; a hop that some component has begun is finished at the release it was begun with.
+func HopOf(machines []KubernetesMachine, releases Releases) KubernetesHop {
 	var (
 		from, to *version.Version
+		lives    []*version.Version
 		hop      KubernetesHop
 		due      bool
 	)
@@ -187,6 +189,8 @@ func HopOf(machines []KubernetesMachine) KubernetesHop {
 				return hop
 			}
 
+			lives = append(lives, live)
+
 			if from == nil || live.LessThan(from) {
 				from = live
 			}
@@ -209,7 +213,15 @@ func HopOf(machines []KubernetesMachine) KubernetesHop {
 	case to.Major() != from.Major():
 		hop.Problem = fmt.Sprintf("there is no upgrade from Kubernetes %s to %s", hop.From, hop.To)
 	case to.Minor() > from.Minor()+1:
-		hop.Version = fmt.Sprintf("%d.%d.0", from.Major(), from.Minor()+1)
+		hop.Version = releases.intermediate(from.Major(), from.Minor()+1)
+
+		// A component that is in the next minor already was put there by this hop, begun earlier
+		// and perhaps with another release than is the newest now. The rest follows it.
+		for _, live := range lives {
+			if live.Major() == from.Major() && live.Minor() == from.Minor()+1 {
+				hop.Version = core(live)
+			}
+		}
 	default:
 		hop.Version = hop.To
 	}
@@ -242,6 +254,8 @@ type KubernetesSettings struct {
 	Unchecked string
 	// Policy is the user's rollout policy as it stands now (docs/scope.md §6.4).
 	Policy Policy
+	// Releases chooses the release of a minor on the way to the version asked for (§7.5).
+	Releases Releases
 }
 
 // KubernetesUpgrade is the planner's answer to "is a Kubernetes upgrade due, and may it start?".
@@ -273,7 +287,7 @@ func (u KubernetesUpgrade) MayStart() bool { return len(u.Pending) > 0 && u.Bloc
 // pass over the cluster: unlike a rollout that may be there to repair a node, an upgrade starts
 // only when every node is healthy.
 func PlanKubernetes(machines []KubernetesMachine, s KubernetesSettings, p Pass) KubernetesUpgrade {
-	out := KubernetesUpgrade{Hop: HopOf(machines), Images: map[string]string{}}
+	out := KubernetesUpgrade{Hop: HopOf(machines, s.Releases), Images: map[string]string{}}
 
 	var stale, heldControlPlanes, downgrades, lines []string
 

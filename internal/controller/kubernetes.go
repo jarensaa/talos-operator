@@ -233,7 +233,7 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	holds := upgradeHolds(tc)
 	settings := plan.KubernetesSettings{Paused: tc.Spec.Paused, Aborted: holds.Kubernetes, Policy: obs.policy}
 
-	if hop := plan.HopOf(planned); hop.Due() {
+	if hop := plan.HopOf(planned, nil); hop.Due() {
 		settings.Problems, settings.Unchecked = r.checkKubernetes(ctx, obs, hop)
 	}
 
@@ -534,7 +534,7 @@ func (r *TalosClusterReconciler) abortKubernetes(ctx context.Context, tc *talosv
 	version := tc.Status.Operation.Target
 
 	if planned, err := r.kubernetesMachines(ctx, tc, obs, pools, machines); err == nil {
-		if hop := plan.HopOf(planned); hop.To != "" {
+		if hop := plan.HopOf(planned, nil); hop.To != "" {
 			version = hop.To
 		}
 	}
