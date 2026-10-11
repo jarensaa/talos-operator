@@ -37,6 +37,7 @@ All code references are to Talos source in the Go module cache:
 ### Non-goals (v1)
 - **Hardware provisioning** (PXE, IPMI, cloud VMs, Terraform). Machines are assumed to exist and to boot Talos, either into maintenance mode or already configured.
 - **Disaster recovery from total quorum loss.** The operator cannot fix the cluster it runs in once that cluster's API is gone. Rebuilding the cluster from its owner's own runbook remains the DR path. The operator's job is to never cause quorum loss and to keep DR inputs fresh (§9).
+- **Backups.** Snapshots of etcd, and backups of what runs on the cluster, are its owner's to take, store, and above all to restore, with tools made for that. The operator takes none, on a schedule or before an operation (§8.5.4, §12.23).
 - **Managing workloads or CNI.** A CNI, a storage system and so on stay with whatever installs them.
 - **Replacing Omni.** No SideroLink or multi-tenant SaaS features in v1. These are listed as stretch goals.
 - **Supporting Talos older than 1.13.** The new `LifecycleService` and `ImageService` APIs, and the multi-document config, are the baseline. 1.12 nodes are only supported as the *source* of an upgrade.
@@ -896,9 +897,9 @@ What this does not cover:
 - Safety therefore comes from strict prechecks (§7.4) and moving one component on one node at a time.
 - If a step fails, the operator reverts **only that node's** image overlay to the previous patch version of the same minor, then halts. Nodes already upgraded stay on the new version, which is within the supported version skew.
 
-#### 8.5.4 Last resort: etcd snapshot
+#### 8.5.4 Last resort: an etcd snapshot, which is the owner's
 
-Before every control-plane operation, take an etcd snapshot and ship it off-cluster (M11, §14.6; manual until then). This is the only recovery from quorum loss. Recovery itself is out-of-band (`talosctl bootstrap --recover-from`).
+A snapshot of etcd is the only recovery from quorum loss, and recovery is out-of-band (`talosctl bootstrap --recover-from`). The operator takes no snapshot (§12.23): what it does about quorum is to never be the cause of losing it. An owner who wants one taken before every operation runs their own snapshot Job as a `preRollout` hook (§6.4): no node is touched until the Job has succeeded, and the operation halts with nothing changed if it fails.
 
 #### 8.5.5 Rejected alternative: node-local rollback agent (DaemonSet)
 
@@ -996,7 +997,7 @@ Marking a machine as removed takes it out of the cluster cleanly. A control plan
 - In: draining; keeping etcd whole and refusing a removal that would not; cleaning up what Kubernetes still holds of the node; a stated rule for what is wiped on the machine.
 - Out: taking storage out of service. What runs on the node (Ceph OSDs) stays with the user and the hooks of M4c. Disks other than Talos's own are never wiped unless named.
 - **Done when:** a control plane is replaced on QEMU with etcd healthy throughout; a removal below three voters is refused; a dead worker is removed after confirmation.
-- Needs M7 for replacement, M4 for draining, and the snapshots of M11a.
+- Needs M7 for replacement and M4 for draining.
 
 ### M10 Observability
 
@@ -1009,11 +1010,10 @@ Marking a machine as removed takes it out of the cluster cleanly. A control plan
 
 ### M11 Maintenance
 
-**M11a: etcd snapshots.** Taken on a schedule, stored off the cluster, and taken before any operation that touches a control plane. This is the safety net under M4, M5 and M8, so it comes before those run on the real cluster. It is the first thing that needs a secret from outside the cluster (§12.6).
+Defragmenting etcd and handling its alarms; a support bundle attached to a failed rollout; keeping human credentials fresh.
 
-**M11b: the rest.** Defragmenting etcd and handling its alarms; a support bundle attached to a failed rollout; keeping human credentials fresh.
-
-- **Done when:** a snapshot restores a QEMU cluster; a fragmented etcd is defragmented with the cluster healthy between members; a failed rollout has a bundle.
+- Out: snapshots of etcd and every other backup (§12.23).
+- **Done when:** a fragmented etcd is defragmented with the cluster healthy between members; a failed rollout has a bundle.
 
 ### M9 Later, unscheduled
 
@@ -1029,9 +1029,9 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 ### Suggested order
 
 1. The real cluster, when its owner decides the API has settled enough to depend on.
-2. M10a and M11a: small, independent, and wanted before upgrades touch a real control plane.
+2. M10a: small, independent, and wanted before upgrades touch a real control plane.
 3. M7, then M8.
-4. M10b, M11b, and whatever of M9 has earned it.
+4. M10b, M11, and whatever of M9 has earned it.
 
 R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
 
@@ -1039,7 +1039,7 @@ R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
 - **Pure unit tests** for planners (invariant tables), render/diff/patch derivation (golden files from real-shaped multi-doc configs with throwaway secrets), and compatibility ordering.
 - **envtest** controller tests against the fake Talos client: step persistence, resume after restart, fail-closed behaviour.
 - **e2e on QEMU** (`make e2e-cluster-up`, see `docs/dev/e2e.md`). The Docker provisioner is unusable for Talos 1.14 on Docker Desktop: container mode needs a host kernel ≥ 6.15 and Docker Desktop ships 6.12. It also cannot exercise upgrades, because `LifecycleService` refuses container mode. QEMU on macOS needs root, so the harness runs only `talosctl cluster create/destroy` under sudo. The `maintenance` preset lets the harness apply configs built with `gen config` and patches, and leaves spare nodes for expansion tests.
-- **Staged rollout to a real cluster:** each milestone's last check runs there (§10), with a fresh off-cluster etcd snapshot beforehand, taken by hand until M11a takes it.
+- **Staged rollout to a real cluster:** each milestone's last check runs there (§10), with a fresh off-cluster etcd snapshot beforehand, which is its owner's to take (§8.5.4).
 
 ---
 
@@ -1049,7 +1049,7 @@ R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
 |------|------------|
 | Talos API churn: 1.13 and 1.14 both reshaped upgrade and config; legacy Upgrade is removed in 1.18 | Access layer isolates machinery. Supported-range gate per operator release. Track Talos minors. |
 | Rendering parity with talosctl defaults; Omni's import broke on exactly this with 1.14 (#3424) | The adoption exactness proof is mandatory. Golden tests against `talosctl gen config` output per contract. |
-| Quorum loss on a 3-CP cluster during an operation | Strict CP serialisation, etcd gates, never `force`. Off-cluster etcd snapshot before CP ops (M11; manual until then). DR stays out-of-band. |
+| Quorum loss on a 3-CP cluster during an operation | Strict CP serialisation, etcd gates, never `force`. A snapshot before control-plane operations is the owner's to take (§8.5.4). DR stays out-of-band. |
 | Operator evicting itself mid-step | Persist before side effect, resume by observation, 2 replicas. |
 | TOFU secret disclosure on node add | Mandatory UUID pin. Pull-config / SideroLink later. |
 | Ceph data loss or unavailability | Ceph CEL gate, noout hooks, never wipe user disks, one node at a time. |
@@ -1079,7 +1079,7 @@ Decided 2026-10-08:
    - API group `talos.jarensaa.github.io`, version `v1alpha1`;
    - `TalosCluster` and `TalosMachine` are **namespaced**: `credentials.secretRef` and `secretsRef` are same-namespace Secret references.
    - Annotation keys use the same prefix, e.g. `talos.jarensaa.github.io/orphan`.
-6. **Secrets from outside the cluster are the owner's to deliver** (decided 2026-10-09). The operator reads them from Secrets and does not care how they got there. Since 7, no Talos credential or PKI is among them; the first one needed is the storage credential for etcd snapshots (M11).
+6. **Secrets from outside the cluster are the owner's to deliver** (decided 2026-10-09). The operator reads them from Secrets and does not care how they got there. Since 7, no Talos credential or PKI is among them, and since 23 no storage credential either: so far the operator needs none.
 7. **Talos credentials are issued in-cluster** (decided 2026-10-10). Recovery from cluster loss is a rebuild with fresh PKI, so any talosconfig or bundle kept outside the cluster would be stale. The operator requests its certificate from Talos through a `talos.dev` ServiceAccount (§9). This replaces the user-supplied, SOPS-delivered talosconfig and the operator-minted certificate.
 8. **Admission policies, not a webhook** (decided 2026-10-10). The gates that need the stored object or a DELETE are ValidatingAdmissionPolicies (GA since Kubernetes 1.30). A webhook served by the operator, with `failurePolicy: Fail`, would block every TalosCluster/TalosMachine write whenever the operator's pods are down, which in a self-hosted cluster includes the drains it orchestrates. It would also need cert-manager for its serving certificate. Uniqueness across machines, which admission cannot see, stays a fail-closed controller check.
 9. **Delivery-agnostic** (decided 2026-10-10). The operator acts on the TalosCluster and TalosMachine objects as they are, however they were created or edited: Flux, kubectl, or anything else. It never inspects field managers, GitOps labels or the source of an object, and its gates (preconditions, proof, admission) depend only on the objects and the live cluster. Keeping the config in Git is the user's workflow, not something the operator enforces.
@@ -1109,6 +1109,7 @@ Decided 2026-10-08:
 20. **The manifests Talos applies at bootstrap are nobody's** (decided 2026-10-10, with M5). Talos applies kube-proxy, CoreDNS and their RBAC when a cluster is bootstrapped and never again (`T/internal/app/machined/pkg/controllers/k8s/manifest_apply.go`); `talosctl upgrade-k8s` re-applies them, with force as an option. On an adopted cluster they have often been edited, replaced by a CNI's own proxy, or put under GitOps since, and applying them would take cluster-admin rights and make the operator a second owner of objects in `kube-system`. So a Kubernetes upgrade changes a node's config and nothing else. That includes the kube-proxy image a control plane's config names: it belongs to the version, and a config that named another would have Talos apply the wrong kube-proxy wherever it does apply that manifest. Nothing runs from it. A kube-proxy DaemonSet that a Kubernetes upgrade left behind is named in `KubernetesUpToDate`: kube-proxy may be older than the API server, not newer, so being left behind is safe for a while and never silent.
 21. **A Kubernetes upgrade applies its own configs, and a larger jump goes through `.0`** (decided 2026-10-10, with M5). `talosctl upgrade-k8s` patches each node's config component by component; an operator that owns the config has to do the same itself, or the two would fight (§3.8). The patch is taken from the node's live config, not from the rendered one, so that the upgrade changes one image and leaves every other difference to the config rollout that owns it. The config rollout in turn leaves the images alone: it applies the rendered config with the images the node has. An earlier cut blocked a rollout whenever an image differed, and so a refused upgrade blocked the removal of the very flag it was refused for. Each patched config is tried and confirmed like any other change, which upstream does not do: a component that does not come up goes back to its previous image without anyone reaching the node. Kubernetes does not skip minors, so a spec that is further away is reached through the first release of each minor in between. The operator knows no newer release of those minors without asking the network, which is M6's business; until then, `.0` is the one version of a minor that is sure to exist.
 22. **The operator may ask upstream what exists, only that, and only when told to** (decided 2026-10-11, with M6). Knowing which releases exist is what turns "the image could not be pulled" on the first node into a refusal before any node, and what lets a hop over several Kubernetes minors use a release with its fixes. The price is that the operator talks to something other than its cluster, and to services that are not this project's. How others do it: Omni lists the releases of Image Factory and scans a registry for Kubernetes tags every fifteen minutes, by default, and filters them with the compiled-in compatibility rules; OpenShift's version operator and the k3s upgrade controller ask an update service or a channel server; kubeadm asks the Kubernetes release site. Each of them asks a service its own project runs. tuppr, the one that like this operator is a third party to Talos, asks nothing: the version is what the resource says, a bot proposes it, and a release that does not exist fails at the pull. So asking is **off by default** (`versionSources.enabled`), and switching it on is the cluster owner's decision to use those services. Where it is on it is kept small: reads only, HTTPS only, a handful of requests every six hours, identified by a User-Agent, never during an operation. What it learns can refuse an upgrade and can choose a release on the way to the version asked for; it can never choose the version. The services asked are Image Factory, the Kubernetes release site and the registries the cluster's nodes pull from anyway. Image Factory's API reference documents the routes used as public; neither it nor the Kubernetes release site publishes terms for its use that were found, `registry.k8s.io` is a volunteer-run service that asks heavy users to mirror, and GitHub's acceptable use policy forbids burdening its servers by automation without naming a limit. Nothing was found that forbids these requests, and nothing that grants them either. The `validate` check asks the same services by default: it runs once for a pull request, beside the bot that proposed the change by asking them too. It is a subcommand of the operator's own binary, so that the image a cluster runs is the image that checks its manifests. **Not kept: a compatibility matrix of this project's own.** The rules (what runs what, which steps are allowed, what a release removed) are machinery's and go-kubernetes's, compiled in, and the removed kubelet flag the e2e uses is found by them. A table of the newest release of each minor, built in and refreshed by a bot, would let an operator that asks nothing go through a better release than `.0`; it is not built.
+23. **Backups are the owner's** (decided 2026-10-11). The earlier plan had the operator take etcd snapshots on a schedule and before every control-plane operation, encrypt them and ship them to object storage. That is a backup product inside an upgrade operator: storage, credentials from outside the cluster, encryption keys that must outlive the cluster, retention, and a restore that has to be rehearsed to be worth anything, which the operator cannot perform on the cluster it runs in. Whoever runs a cluster already answers for backing up what is on it, and has tools for it; a second, partial answer in the operator would be the one nobody tests. So the operator takes no snapshot and no other backup. What it owes the owner is not to cause the loss (§8), and a place to hang their own snapshot before an operation: a `preRollout` hook (§6.4).
 
 ## 13. Prior art summary
 
@@ -1229,7 +1230,6 @@ These are recurring tasks the operator runs through the Talos API. Disruptive on
 
 | Task | Mechanism | Policy |
 |------|-----------|--------|
-| **Scheduled etcd snapshots** | `EtcdSnapshot` streams from one healthy member, using a dedicated `os:etcd:backup` certificate from a second Talos ServiceAccount (least privilege; the access config must allow that role). | Cron schedule plus retention, shipped **off-cluster** (S3-compatible; not rook RGW on the same cluster). Also taken before every CP operation (§8.5.4). Moved out of M9. |
 | **etcd defragmentation** | `EtcdStatus` ratio `db_size_in_use/db_size`; `EtcdDefragment` defragments the **local** member only (`v1alpha1_server.go:2172`), so it is targeted per node | When ratio < 0.5 and the DB is above a size floor. One member at a time, followers first, then `EtcdForfeitLeadership` and the old leader last. Health check between members. |
 | **etcd alarms** | `EtcdAlarmList` / `EtcdAlarmDisarm` | NOSPACE: defrag, then disarm. **CORRUPT: alert only, never auto-disarm.** Optional `quota-backend-bytes` via the metrics/etcd profile (default 2 GiB). |
 | **Support bundle on failure** | `github.com/siderolabs/go-talos-support` (MPL-2.0, depends only on machinery): service and kernel logs, kube-system logs, non-secret COSI resources, controller graph | Captured automatically when a rollout fails. Stored on a PVC or object store and referenced from `status.operation.failure`. No Sidero age recipients. |
@@ -1238,6 +1238,7 @@ These are recurring tasks the operator runs through the Talos API. Disruptive on
 | **Contract-bump hygiene** | Documents that new clusters get by default but upgraded ones lack (`FilesystemTrimConfig`, `SecurityProfileConfig`, scrub, …) | Handled by the version-contract bump workflow: preview diff, then approval. Not silent. |
 
 **Not in v1:**
+- etcd snapshots, scheduled or before an operation: out of scope altogether (§12.23);
 - CA rotation (M9);
 - `ImageVerificationConfig` signature policy (low value for a small cluster; CRI enforcement unverified);
 - automated disk wipes for Rook OSD recycling;
@@ -1249,6 +1250,6 @@ Image GC needs nothing: Talos already runs it every 15 minutes (`T/internal/app/
 
 Decided 2026-10-09:
 1. **Log shipping goes to a collector on the node.** Which backend is behind it is the owner's choice. The operator renders Talos service and kernel log shipping to the collector (§14.3).
-2. **Snapshot target: S3-compatible object storage**, off-site. Its credentials are a Secret in the operator's namespace. Snapshots are encrypted client-side before upload, because they contain every Kubernetes Secret.
+2. **Superseded 2026-10-11:** there is no snapshot target, because the operator takes no snapshots (§12.23).
 3. **How the bot that proposes bumps is run is the owner's choice.** The repository ships an example configuration, nothing more.
 4. **The `validate` check is meant to be required only for changes touching the Talos CRs,** so that it does not stand in the way of unrelated automation.
