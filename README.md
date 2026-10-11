@@ -280,13 +280,15 @@ It fails when the Talos and Kubernetes versions do not go together, when the ins
 | Kubernetes upgrades: the components Talos runs, a minor at a time | Implemented |
 | Maintenance windows, gates on objects in the cluster, hook Jobs | Implemented |
 | Version awareness: releases that exist, the planned upgrades, a `validate` check for CI | Implemented |
-| The operator choosing versions by itself | Not planned for now |
+| The cluster's own health in Prometheus and Grafana: Talos's view of each node, a Talos dashboard | Planned |
+| Rotating the cluster's PKI | Later |
+| Bootstrapping a new cluster, managing clusters from a management cluster, discovering machines | Not planned |
+| The operator choosing versions by itself | Not planned |
 | The manifests Talos applies at bootstrap (kube-proxy, CoreDNS) | Not planned |
 | Config changes that only an install can make (kernel arguments, install disk) | Not planned |
 | Adding, removing and replacing machines | Implemented |
 | Shrinking the control plane below three, wiping disks other than Talos's own | Not planned |
 | Metrics, alerts and a dashboard for what the operator knows | Implemented |
-| Metrics and logs of the cluster's own components | Planned |
 | Backups, etcd snapshots included | Not planned: they are the cluster owner's |
 
 The API is `v1alpha1` and may change incompatibly between releases.

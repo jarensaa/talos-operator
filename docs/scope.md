@@ -13,7 +13,7 @@ The four headline requirements:
 | R3 | Safe adoption of an existing talosctl-created cluster | §7.1 |
 | R4 | Expanding an existing cluster with new nodes | §7.6 |
 
-Removing and replacing nodes (§7.7) and greenfield bootstrap (§7.8) fall out of R1/R4 and are scoped too, at lower priority. Day-2 operations — observability, upgrade-path awareness, version-bump automation and maintenance — are scoped in §14.
+Removing and replacing nodes (§7.7) falls out of R1/R4 and is scoped too. Bootstrapping a cluster from nothing is not (§12.26): the operator manages a cluster that exists. Day-2 operations — observability, upgrade-path awareness, version-bump automation and maintenance — are scoped in §14.
 
 All code references are to Talos source in the Go module cache:
 - `T` = `github.com/siderolabs/talos@v1.14.0`
@@ -38,8 +38,9 @@ All code references are to Talos source in the Go module cache:
 - **Hardware provisioning** (PXE, IPMI, cloud VMs, Terraform). Machines are assumed to exist and to boot Talos, either into maintenance mode or already configured.
 - **Disaster recovery from total quorum loss.** The operator cannot fix the cluster it runs in once that cluster's API is gone. Rebuilding the cluster from its owner's own runbook remains the DR path. The operator's job is to never cause quorum loss and to keep DR inputs fresh (§9).
 - **Backups.** Snapshots of etcd, and backups of what runs on the cluster, are its owner's to take, store, and above all to restore, with tools made for that. The operator takes none, on a schedule or before an operation (§8.5.4, §12.23).
+- **Bootstrapping a cluster.** The operator runs in the cluster it manages, so there is none to run in before there is a cluster. A cluster is built with `talosctl`, or whatever its owner builds clusters with, and then adopted (§7.1).
 - **Managing workloads or CNI.** A CNI, a storage system and so on stay with whatever installs them.
-- **Replacing Omni.** No SideroLink or multi-tenant SaaS features in v1. These are listed as stretch goals.
+- **Replacing Omni.** No SideroLink, no management of many clusters from one place, no multi-tenant SaaS features.
 - **Supporting Talos older than 1.13.** The new `LifecycleService` and `ImageService` APIs, and the multi-document config, are the baseline. 1.12 nodes are only supported as the *source* of an upgrade.
 
 ---
@@ -123,7 +124,7 @@ What is in `internal/plan` today: the cluster preconditions (`Preconditions`), t
 
 **Recommendation:** run self-hosted first, but code against a target-cluster abstraction:
 - endpoints + credentials, where "self" is just one target;
-- a management-cluster mode becomes configuration, not a rewrite.
+- a management-cluster mode would be configuration, not a rewrite. It is not planned (§12.26).
 
 Self-hosted on a 3-CP-only cluster means the operator will drain and reboot its own node. That is handled by design:
 - **2 replicas**, leader election, required pod anti-affinity, PDB `maxUnavailable: 1`.
@@ -259,7 +260,7 @@ status:
     provenAt: …
   operation:                          # THE disruption lock; at most one at a time
     id: 3f1c…
-    type: TalosUpgrade                # ConfigRollout | TalosUpgrade | KubernetesUpgrade | AddControlPlane | RemoveMachine | Bootstrap
+    type: TalosUpgrade                # ConfigRollout | TalosUpgrade | KubernetesUpgrade | AddMachine | RemoveMachine
     target: 9c1e…                     # the hash of the change: which machines go from what to what (§6.3, §7.3)
     plan: [talos-cp-2, talos-cp-3, talos-cp-1]   # KubernetesUpgrade: one component on one machine each, "kube-apiserver/talos-cp-1"
     targets: { talos-cp-2: sha256:… } # ConfigRollout: the rendered config each machine is to reach,
@@ -621,7 +622,7 @@ Admission refuses `config: Manage` unless the stored status shows `ConfigProven=
 2. **`upgrades: Enabled`.** The first real exercise should be a Talos patch release (1.14.0 → 1.14.2).
 3. **`membership: Enabled`.** Enable this last, when a node actually needs to be added or replaced.
 
-> Like Omni, the cluster's PKI remains known to whoever held the old talosconfig and secrets. PKI rotation is a later workflow (§10, M9).
+> Like Omni, the cluster's PKI remains known to whoever held the old talosconfig and secrets. Rotating the PKI is the one workflow left for later (§10).
 
 ### 7.2 Config change (R1)
 
@@ -735,7 +736,7 @@ Implemented in `internal/plan/versions.go` (the way), `internal/catalog` (what e
 These are other people's services, run for everyone, so they are asked as rarely as is of use: an answer is kept for six hours, a "no" and a failure for ten minutes, and every request says who is asking (`catalog.UserAgent`). A request that fails on the way, or that a server answers by saying it is unwell, is sent again, three times at most and with a pause: one connection that was not made is not what is known about upstream, and the check would fail on it. An answer about what was asked for is final, and so is one that says to ask less often. All of it is the documented public API of Image Factory and of a registry. None of the services publishes terms that forbid it, and two publish none at all; §12.22 has what was looked for. Upstream is never asked while an operation is in flight, and the planners take what is known from status, not from the network: every replica plans with the same releases, and an operation is not replanned because a release came out.
 
 What is found out is used for exactly three things:
-1. `status.versions.available` lists the newest release of each Talos minor this operator supports, and of each Kubernetes minor those run. It is information. Nothing is upgraded because of it; the operator changing the version it is asked for is not built (M9).
+1. `status.versions.available` lists the newest release of each Talos minor this operator supports, and of each Kubernetes minor those run. It is information. Nothing is upgraded because of it; the operator changing the version it is asked for is not planned (§12.2, §12.26).
 2. A Kubernetes upgrade over several minors goes through the newest release known of each minor in between; where none is known it goes through `.0` (§12.21). A hop that was begun is finished at the release it was begun with.
 3. An upgrade to something that certainly does not exist is refused before a node is asked to pull it (`Incompatible`): an installer Image Factory does not build, an image of a Kubernetes component that its registry does not have. The images are asked about, not the release: the kubelet image Talos runs is published a while after the Kubernetes release it is of.
 
@@ -779,9 +780,7 @@ A machine that was handed its config is never handed one again: a resumed step s
 
 **Not built:** adding several workers at once (the earlier plan; one at a time is the rule for every operation, §12.19); finding machines instead of declaring them; reporting what was found at an address whose identity is not pinned (`identity` is required).
 
-**Stretch alternatives** that remove trust on first use:
-- serving configs via `talos.config=` URLs keyed by UUID (pull model);
-- SideroLink.
+Two ways to do without trust on first use were considered and are not planned (§12.26): serving configs from `talos.config=` URLs keyed by UUID, and SideroLink.
 
 ### 7.7 Removing and replacing machines
 
@@ -811,14 +810,9 @@ The cluster's discovery goes on listing a machine for a while after it left. One
 
 **Not built:** shrinking the control plane below three; a reset that is not graceful, for a control plane that answers and cannot leave etcd by itself; wiping user disks.
 
-### 7.8 Greenfield bootstrap (lower priority, M9)
+### 7.8 Bootstrapping a cluster
 
-1. Machines are pinned as in §7.6. The bundle is generated once with `secrets.NewBundle(clock, contract)` and stored with no ownerRef.
-2. Apply configs to all CPs.
-3. Bootstrap **one** CP, chosen deterministically. Persist `status.bootstrapped=true` **before** the call, and treat `AlreadyExists` as success.
-4. Wait for etcd and the API server, then hand over to normal reconciliation.
-
-This only makes sense from a management cluster (or a CLI), since the cluster does not exist yet.
+Out of scope (§12.26). The operator manages a cluster that exists: one is built with `talosctl` or its owner's own tooling, and adopted (§7.1).
 
 ---
 
@@ -939,7 +933,7 @@ We considered running a DaemonSet that watches local connectivity and reverts th
 - **It depends on what just broke.** In-cluster Talos API access goes through the `talos.default` Service, i.e. over the CNI. A host-network pod calling localhost avoids that, but still needs kubelet and containerd to be healthy. machined's TRY timer needs none of this.
 - **Partition ambiguity.** From inside, a node cannot tell "my network is broken" from "the rest of the cluster is down". Acting on a local view risks reverting good changes during a partition, and flapping. Reachability has to be judged from outside, with "no answer" defaulting to rollback, which is what TRY provides.
 
-**Residual gap:** a failure that appears *after* confirmation, e.g. a DHCP renewal failing hours later. At that point the bad config is persisted, and recovery needs a console or a maintenance-mode reboot. A longer soak narrows this gap but cannot close it. A narrowly scoped last-known-good watchdog is listed under M9 for re-evaluation, not built.
+**Residual gap:** a failure that appears *after* confirmation, e.g. a DHCP renewal failing hours later. At that point the bad config is persisted, and recovery needs a console or a maintenance-mode reboot. A longer soak narrows this gap but cannot close it. A watchdog that reverts to a last known good config was considered for this gap and is not planned (§12.26): it would be a second thing on every node that changes its config, and the alert on a node that stops answering (§14.2) is what tells its owner.
 
 ---
 
@@ -1027,9 +1021,12 @@ It is postponed on purpose (decided 2026-10-10). While no cluster depends on the
 **M10a: the operator's own state** is delivered (§14.2): metrics for what the operator already knows, alerts on them, and a dashboard, installed by the chart where there is a Prometheus to read them.
 - **Shown for M10a:** the alert rules are tested by promtool on the series the exporter really exports, a halted rollout among them, each rule broken once to see its test fail; on QEMU the halted rollout is found in the metrics of both replicas, with the labels the alert carries, and is gone from them once it is aborted. The QEMU cluster has no Prometheus, so no alert was seen to fire there. Off any cluster, a Prometheus loaded with the chart's rules and scraping the exporter's output for a halted rollout fired `TalosOperationHalted`, and a Grafana showed the dashboard filled from it; neither has been seen on a cluster yet.
 
-**M10b: the cluster's own metrics and logs.** Exposing etcd and control-plane metrics, and shipping Talos's logs, are config changes that a user can declare since M3.
-- **To decide:** whether this is an operator feature at all (the earlier plan was a `spec.observability` profile) or documented config that the e2e proves. The second is less to own.
-- Also here if wanted: metrics only the Talos API can give and the operator does not read today (time sync, links and bonds, volumes, Talos's own diagnostics), listed in §14.2.
+**M10b: the cluster's own health, beside the operator's.** The operator already integrates with a Prometheus and a Grafana where there are any (M10a). This puts the cluster itself there too:
+- what only the Talos API can say about a node, exported like the operator's own state: its services, Talos's own diagnostics, time sync, links and bonds, volumes, the size of the etcd database (§14.2 lists them);
+- the metrics of etcd and of the control-plane components, made scrapable, which is a config change a user could declare since M3 and the operator can offer as a switch;
+- a Talos dashboard, and alerts on what it shows.
+- **To decide:** whether shipping Talos's logs belongs here. It needs a log backend, which a cluster often does not have.
+- **Done when:** the dashboard shows the nodes of a QEMU cluster, and a node whose clock is off, or whose link is down, raises an alert in the rule test.
 
 ### M11 Maintenance
 
@@ -1038,11 +1035,19 @@ Defragmenting etcd and handling its alarms; a support bundle attached to a faile
 - Out: snapshots of etcd and every other backup (§12.23).
 - **Done when:** a fragmented etcd is defragmented with the cluster healthy between members; a failed rollout has a bundle.
 
-### M9 Later, unscheduled
+### Later, unscheduled
 
-Bootstrapping a cluster from nothing; rotating the cluster's PKI; a management-cluster mode; discovering machines instead of declaring them; the operator choosing versions; a command-line tool that runs the same planners; a watchdog for failures that appear after a change was confirmed.
+**Rotating the cluster's PKI.** Adoption leaves the old PKI with whoever held it before: the talosconfig and the secrets the cluster was built with still open it. Until the operator can take a cluster through a rotation, its owner does it with `talosctl`, and the operator then has a secrets bundle that no longer matches. That it says so (`SecretsMatchLive`) is all it does about it today.
 
-Two of these have a reason to be promoted: PKI rotation, because adoption leaves the old PKI with whoever held it before, and the command-line tool, because an operator cannot repair the cluster it lives in.
+### Descoped
+
+What the earlier plan kept under "M9, later" and is no longer planned (§12.26):
+- **Bootstrapping a cluster from nothing** (§7.8).
+- **A management-cluster mode.** Without bootstrapping there is little left for one to do that the operator inside the cluster does not.
+- **Discovering machines instead of declaring them** (SideroLink, configs pulled by UUID).
+- **The operator choosing versions.** A bot proposes them in the repository that holds the spec, and `validate` checks them (§7.5, §12.2).
+- **A command-line tool that runs the same planners.** What an operator cannot do for the cluster it lives in is a recovery, and recovery is `talosctl` and the owner's runbook (§1); the `render` command went the same way (§14.5).
+- **A watchdog for failures that appear after a change was confirmed** (§8.5).
 
 ### Owned by no milestone, and needing a decision
 
@@ -1052,7 +1057,7 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 ### Suggested order
 
 1. The real cluster, when its owner decides the API has settled enough to depend on.
-2. M10b, M11, and whatever of M9 has earned it.
+2. M10b, then M11.
 
 R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7 and M8.
 
@@ -1072,16 +1077,16 @@ R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7 and M8.
 | Rendering parity with talosctl defaults; Omni's import broke on exactly this with 1.14 (#3424) | The adoption exactness proof is mandatory. Golden tests against `talosctl gen config` output per contract. |
 | Quorum loss on a 3-CP cluster during an operation | Strict CP serialisation, etcd gates, never `force`. A snapshot before control-plane operations is the owner's to take (§8.5.4). DR stays out-of-band. |
 | Operator evicting itself mid-step | Persist before side effect, resume by observation, 2 replicas. |
-| TOFU secret disclosure on node add | Mandatory UUID pin. Pull-config / SideroLink later. |
+| TOFU secret disclosure on node add | Mandatory UUID pin. Keep the network machines boot on one that is trusted. |
 | Ceph data loss or unavailability | Ceph CEL gate, noout hooks, never wipe user disks, one node at a time. |
 | A PDB-blocked drain hangs | Bounded `drainTimeout` leads to fail-closed. |
 | Bootstrap manifests applied over objects someone else owns | The operator applies none of them (§12.20). |
-| PKI known to previous credential holders after adoption | Documented. Rotation workflow in M9. |
+| PKI known to previous credential holders after adoption | Documented. Rotating it is the one thing left for later (§10). |
 | machinery requires go 1.26.5 plus `replace` directives | Pin the toolchain in go.mod. Verify the build in M0. |
 | Network change that breaks a node is confirmed anyway | Verification goes through a different node's apid and needs a fresh kubelet heartbeat, plus a soak period inside the TRY window. Read back active and persistent hashes after confirming (§8.5.1). |
 | A change of a "safe" class breaks a node | Every change is tried, whatever its class, so the node reverts by itself (§6.3). |
 | A confirmed change breaks a node later, and the health gate refuses the rollout that would revert it | The gate leaves out the health of the node it is asked for, so reverting the spec repairs the node, as long as it is the only unhealthy one (§6.3, §8.3). |
-| Failure that appears after a confirmed change (e.g. DHCP renewal hours later) | Not covered by TRY; needs console or maintenance-mode recovery. Longer soak; last-known-good watchdog re-evaluated in M9 (§8.5.5). |
+| Failure that appears after a confirmed change (e.g. DHCP renewal hours later) | Not covered by TRY; needs console or maintenance-mode recovery. A longer soak narrows it; the alerts of §14.2 say when it happened. |
 | Early-boot hang after an OS upgrade (before machined starts) | No automatic A/B fallback in that case. One node at a time keeps quorum; manual recovery via console (§8.5.2). |
 
 ---
@@ -1090,8 +1095,8 @@ R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7 and M8.
 
 Decided 2026-10-08:
 
-1. **Topology: self-hosted first.** The operator runs inside the cluster it manages. The core is written against a target-cluster abstraction so that management-cluster mode can be added later (M9).
-2. **Automatic upgrades = Renovate bumps Git.** The operator rolls out spec version changes automatically, within maintenance windows and behind gates. Operator-side version tracking (§7.5 layer 2) moves to M9 stretch, and `autoUpgrade` is dropped from the v1alpha1 API.
+1. **Topology: self-hosted first.** The operator runs inside the cluster it manages. The core is written against a target-cluster abstraction so that a management-cluster mode could be added. None is planned (26).
+2. **Automatic upgrades = Renovate bumps Git.** The operator rolls out spec version changes automatically, within maintenance windows and behind gates. The operator choosing versions by itself is not planned (26), and `autoUpgrade` is dropped from the v1alpha1 API.
 3. **New-node trust: mandatory UUID pin** in `TalosMachine.spec.identity`.
 4. **Config ownership: full render.** The operator owns the complete config, and everything human-authored is config documents layered onto the generated defaults (§6.1).
 
@@ -1133,6 +1138,7 @@ Decided 2026-10-08:
 23. **Backups are the owner's** (decided 2026-10-11). The earlier plan had the operator take etcd snapshots on a schedule and before every control-plane operation, encrypt them and ship them to object storage. That is a backup product inside an upgrade operator: storage, credentials from outside the cluster, encryption keys that must outlive the cluster, retention, and a restore that has to be rehearsed to be worth anything, which the operator cannot perform on the cluster it runs in. Whoever runs a cluster already answers for backing up what is on it, and has tools for it; a second, partial answer in the operator would be the one nobody tests. So the operator takes no snapshot and no other backup. What it owes the owner is not to cause the loss (§8), and a place to hang their own snapshot before an operation: a `preRollout` hook (§6.4).
 24. **Metrics are the status, read when scraped, and monitoring is installed where there is a Prometheus** (decided 2026-10-11, with M10a). The operator keeps no metric of the cluster's state beside the status it writes: a collector reads the resources at every scrape. Gauges set by the controllers would be the leader's alone, would outlive the resource they describe, and could drift from the status. The price is that nothing is exported that is not in status. The chart cannot ask whether a Prometheus is running, but it can see whether the cluster has the Prometheus Operator's API, and installs its ServiceMonitor, rules and dashboard exactly then (`auto`); a cluster without it gets none of the three, and a value forces either way. A chart finds this out when it is installed or upgraded, so a Prometheus that arrives later is picked up by the next upgrade. Grafana has no API to be told by, so the dashboard goes by the same sign: it is a ConfigMap, which does no harm unread. A Prometheus only reads what its selectors match, which the chart cannot know: `monitoring.labels` is where the owner says it.
 25. **Machines are added and removed like everything else is done, and a machine that left has to be seen to have left** (decided 2026-10-11, with M7 and M8). The earlier plan let workers join in parallel, outside the lock; one machine at a time through the one driver is the rule (§12.19), and a second way of doing things would have been a second set of invariants. The identity pin remains what a new machine is trusted by (3): a machine in maintenance mode can prove nothing, so what can be had is that the pinned identity is read in the very pass, and over the very connection and key, that the config then goes out on. A removal resets with a reboot and is done when the machine answers in maintenance mode again: a machine that was only asked to wipe itself may not have, and it holds the cluster's CA keys. For the same reason a machine that does not answer is never guessed about; a human says it is dead, with the token of that one failure. A control plane leaves only while three voters remain and there is no override: shrinking a control plane is rare, and an annotation that makes a quorum loss a typo away is not worth having for it. A TalosMachine is kept from deletion by the API server until `removedAt`, where the plan had a finalizer: a finalizer needs the operator to be there to let go. Only Talos's own two partitions are wiped.
+26. **The operator manages a cluster that exists, and what was parked as "later" is mostly not coming** (decided 2026-10-11). With R1 to R4 delivered, the list of things for some later milestone was looked at again. Bootstrapping is out: an operator that runs inside its cluster has nowhere to run before there is one, and building a cluster is a solved problem that is not this project's. A management-cluster mode, machine discovery, the operator choosing versions, a planner CLI and a last-known-good watchdog go with it; each either served bootstrapping, duplicates what a tool beside the operator already does, or would be a second mechanism on every node. Monitoring stays and grows (M10b), because the operator already speaks to a Prometheus and a Grafana, and a cluster's own health belongs on the same page. Rotating the PKI is the one thing kept for later: adoption leaves the old keys with whoever built the cluster, and nothing else in the list answers that.
 
 ## 13. Prior art summary
 
@@ -1280,7 +1286,7 @@ These are recurring tasks the operator runs through the Talos API. Disruptive on
 
 **Not in v1:**
 - etcd snapshots, scheduled or before an operation: out of scope altogether (§12.23);
-- CA rotation (M9);
+- CA rotation (later, §10);
 - `ImageVerificationConfig` signature policy (low value for a small cluster; CRI enforcement unverified);
 - automated disk wipes for Rook OSD recycling;
 - containerd metrics via `CRICustomizationConfig`.
