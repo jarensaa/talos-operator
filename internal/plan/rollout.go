@@ -77,6 +77,9 @@ type Gate struct {
 	Reason string
 	// Note says what an open gate did not ask about, if anything.
 	Note string
+	// block is the reason a plan gives for not starting when this gate is what closes it, where
+	// that is something more particular than a closed gate: a quorum at risk, a name in use.
+	block string
 }
 
 // Block reasons of a rollout that may not start. They match the RolloutBlocked condition reasons.
