@@ -1043,6 +1043,67 @@ spec:
                       failed.'
                     type: object
                 type: object
+              versions:
+                description: Versions is what the cluster runs, what exists, and the
+                  way to what the spec asks for.
+                properties:
+                  available:
+                    description: Available is what exists upstream.
+                    properties:
+                      kubernetes:
+                        description: |-
+                          Kubernetes lists the newest release of each Kubernetes minor from the one the cluster runs
+                          to the newest that one of the Talos releases above runs.
+                        items:
+                          type: string
+                        type: array
+                      problem:
+                        description: 'Problem says why a list is missing or may be
+                          out of date: a source that was not reached.'
+                        type: string
+                      talos:
+                        description: |-
+                          Talos lists the newest release of each Talos minor that this operator supports and that is
+                          not older than what the cluster runs, as Image Factory offers them.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  kubernetes:
+                    type: string
+                  plan:
+                    description: |-
+                      Plan is the sequence of upgrades that leads from those to the versions the spec asks for.
+                      Empty when the cluster runs them, and cut short where the condition VersionsReachable says
+                      there is no way further.
+                    items:
+                      description: |-
+                        VersionStep is one upgrade on the way from the versions a cluster runs to the versions its spec
+                        asks for.
+                      properties:
+                        from:
+                          description: From and To are the versions the step leaves
+                            and reaches.
+                          type: string
+                        kind:
+                          description: Kind is Talos or Kubernetes.
+                          enum:
+                          - Talos
+                          - Kubernetes
+                          type: string
+                        to:
+                          type: string
+                      required:
+                      - from
+                      - kind
+                      - to
+                      type: object
+                    type: array
+                  talos:
+                    description: 'Talos and Kubernetes are the versions the cluster
+                      runs: the lowest among its nodes.'
+                    type: string
+                type: object
             type: object
         required:
         - spec

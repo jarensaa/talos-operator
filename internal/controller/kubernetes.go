@@ -213,7 +213,7 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	}
 
 	if !enabled {
-		r.reportKubernetes(ctx, tc, plan.PlanKubernetes(planned, plan.KubernetesSettings{}, passOf(obs)), planned, false)
+		r.reportKubernetes(ctx, tc, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), planned, false)
 
 		return false, nil, nil
 	}
@@ -231,9 +231,9 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	}
 
 	holds := upgradeHolds(tc)
-	settings := plan.KubernetesSettings{Paused: tc.Spec.Paused, Aborted: holds.Kubernetes, Policy: obs.policy}
+	settings := plan.KubernetesSettings{Paused: tc.Spec.Paused, Aborted: holds.Kubernetes, Policy: obs.policy, Releases: releasesOf(tc)}
 
-	if hop := plan.HopOf(planned, nil); hop.Due() {
+	if hop := plan.HopOf(planned, settings.Releases); hop.Due() {
 		settings.Problems, settings.Unchecked = r.checkKubernetes(ctx, obs, hop)
 	}
 
@@ -306,6 +306,10 @@ func (r *TalosClusterReconciler) checkKubernetes(ctx context.Context, obs observ
 	}
 
 	if problem := talos.KubernetesUpgradeProblem(hop.From, hop.Version, versions); problem != "" {
+		return []string{problem}, ""
+	}
+
+	if problem := r.releaseProblem(ctx, hop.Version); problem != "" {
 		return []string{problem}, ""
 	}
 
@@ -482,7 +486,7 @@ func (r *TalosClusterReconciler) continueKubernetes(ctx context.Context, tc *tal
 			return err
 		}
 
-		r.beginKubernetes(tc, key, v, plan.PlanKubernetes(planned, plan.KubernetesSettings{}, passOf(obs)), attempt)
+		r.beginKubernetes(tc, key, v, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), attempt)
 
 		return nil
 	}
@@ -534,7 +538,7 @@ func (r *TalosClusterReconciler) abortKubernetes(ctx context.Context, tc *talosv
 	version := tc.Status.Operation.Target
 
 	if planned, err := r.kubernetesMachines(ctx, tc, obs, pools, machines); err == nil {
-		if hop := plan.HopOf(planned, nil); hop.To != "" {
+		if hop := plan.HopOf(planned, releasesOf(tc)); hop.To != "" {
 			version = hop.To
 		}
 	}
