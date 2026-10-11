@@ -473,6 +473,50 @@ type UpgradeHolds struct {
 	Kubernetes string `json:"kubernetes,omitempty"`
 }
 
+// VersionStep is one upgrade on the way from the versions a cluster runs to the versions its spec
+// asks for.
+type VersionStep struct {
+	// Kind is Talos or Kubernetes.
+	// +kubebuilder:validation:Enum=Talos;Kubernetes
+	Kind string `json:"kind"`
+	// From and To are the versions the step leaves and reaches.
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+// AvailableVersions is what exists upstream, as far as the operator could find out. It is
+// information: nothing is upgraded to a version because it is listed here.
+type AvailableVersions struct {
+	// Talos lists the newest release of each Talos minor that this operator supports and that is
+	// not older than what the cluster runs, as Image Factory offers them.
+	// +optional
+	Talos []string `json:"talos,omitempty"`
+	// Kubernetes lists the newest release of each Kubernetes minor from the one the cluster runs
+	// to the newest that one of the Talos releases above runs.
+	// +optional
+	Kubernetes []string `json:"kubernetes,omitempty"`
+	// Problem says why a list is missing or may be out of date: a source that was not reached.
+	// +optional
+	Problem string `json:"problem,omitempty"`
+}
+
+// VersionsStatus is what the operator knows about versions (docs/scope.md §7.5).
+type VersionsStatus struct {
+	// Talos and Kubernetes are the versions the cluster runs: the lowest among its nodes.
+	// +optional
+	Talos string `json:"talos,omitempty"`
+	// +optional
+	Kubernetes string `json:"kubernetes,omitempty"`
+	// Plan is the sequence of upgrades that leads from those to the versions the spec asks for.
+	// Empty when the cluster runs them, and cut short where the condition VersionsReachable says
+	// there is no way further.
+	// +optional
+	Plan []VersionStep `json:"plan,omitempty"`
+	// Available is what exists upstream.
+	// +optional
+	Available *AvailableVersions `json:"available,omitempty"`
+}
+
 // OperationType is the kind of disruptive operation holding the cluster lock.
 // +kubebuilder:validation:Enum=ConfigRollout;TalosUpgrade;KubernetesUpgrade;AddControlPlane;RemoveMachine;Bootstrap
 type OperationType string
@@ -725,6 +769,9 @@ type TalosClusterStatus struct {
 	// Upgrades records what a human decided about Talos upgrades that were due.
 	// +optional
 	Upgrades *UpgradeHolds `json:"upgrades,omitempty"`
+	// Versions is what the cluster runs, what exists, and the way to what the spec asks for.
+	// +optional
+	Versions *VersionsStatus `json:"versions,omitempty"`
 
 	// History holds the most recent finished operations, newest first.
 	// +kubebuilder:validation:MaxItems=10

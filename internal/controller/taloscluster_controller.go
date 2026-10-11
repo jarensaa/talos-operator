@@ -45,6 +45,7 @@ import (
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/role"
 
+	"github.com/jarensaa/talos-operator/internal/catalog"
 	"github.com/jarensaa/talos-operator/internal/plan"
 	"github.com/jarensaa/talos-operator/internal/talos"
 	"github.com/jarensaa/talos-operator/internal/talos/creds"
@@ -85,6 +86,9 @@ type TalosClusterReconciler struct {
 	Evictor PodEvictor
 	// KubernetesChecks asks the Kubernetes API what stands in the way of a Kubernetes upgrade.
 	KubernetesChecks KubernetesChecker
+	// Catalog answers what exists upstream (docs/scope.md §7.5). Nil means nobody is asked:
+	// nothing is reported as available, and nothing is refused for not existing.
+	Catalog catalog.Source
 	// NodeName is the Kubernetes node this replica runs on, if it knows. An upgrade takes that
 	// node last in its group, so the operator moves house as rarely as it can.
 	NodeName string
@@ -131,6 +135,7 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	r.applyObservation(tc, obs)
+	r.observeVersions(ctx, tc, obs)
 
 	var adoptErr error
 

@@ -64,4 +64,17 @@ grep -qx talos-operator-gates <<<"$gated" || fail "gates.rules must be bound to 
 [ "$(rules talos-operator-gates --set "$gate")" = '[{"apiGroups":["ceph.rook.io"],"resources":["cephclusters"],"verbs":["get"]}]' ] ||
   fail "gates.rules must become the rules of the gates ClusterRole"
 
-echo "chart check: $want CRDs rendered, kept on uninstall, identical to $generated; permissions bound"
+# The chart as it comes asks nothing outside the cluster: asking upstream is switched on, never off.
+args() {
+  helm template talos-operator "$chart" --namespace talos-operator "$@" |
+    yq -r 'select(.kind == "Deployment") | .spec.template.spec.containers[0].args[]'
+}
+
+quiet=$(args)
+asking=$(args --set versionSources.enabled=true --set versionSources.kubernetesReleases=https://releases.example.com)
+grep -qx -- '--version-sources=false' <<<"$quiet" || fail "the operator must not ask upstream by default"
+grep -qx -- '--version-sources=true' <<<"$asking" || fail "versionSources.enabled must switch asking upstream on"
+grep -qx -- '--kubernetes-releases=https://releases.example.com' <<<"$asking" ||
+  fail "versionSources.kubernetesReleases must reach the operator"
+
+echo "chart check: $want CRDs rendered, kept on uninstall, identical to $generated; permissions bound; nothing asked upstream by default"

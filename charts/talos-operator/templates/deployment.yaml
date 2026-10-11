@@ -46,6 +46,10 @@ spec:
             {{- else }}
             - --metrics-bind-address=0
             {{- end }}
+            - --version-sources={{ .Values.versionSources.enabled }}
+            {{- with .Values.versionSources.kubernetesReleases }}
+            - --kubernetes-releases={{ . }}
+            {{- end }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

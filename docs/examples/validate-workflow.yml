@@ -1,0 +1,34 @@
+# An example GitHub Actions workflow for a repository that holds a cluster's manifests: the check
+# that turns down a change before it reaches the cluster. Make it a required check, and a version
+# bump that cannot work is never merged.
+#
+# It runs the operator's own image, so the check and the operator agree on what works. Use the
+# tag of the operator release the cluster runs.
+name: Validate cluster manifests
+
+on:
+  pull_request:
+    paths:
+      - clusters/**
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # What the manifests say on the branch the change goes into: with it, the step from the one
+      # to the other is checked as well, such as a downgrade.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.base_ref }}
+          path: .base
+
+      - name: Validate
+        run: |
+          docker run --rm --env GITHUB_ACTIONS --volume "$PWD:/work:ro" --workdir /work \
+            ghcr.io/jarensaa/talos-operator:v0.9.0 \
+            validate --base .base/clusters/my-cluster clusters/my-cluster

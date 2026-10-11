@@ -213,7 +213,7 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	}
 
 	if !enabled {
-		r.reportKubernetes(ctx, tc, plan.PlanKubernetes(planned, plan.KubernetesSettings{}, passOf(obs)), planned, false)
+		r.reportKubernetes(ctx, tc, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), planned, false)
 
 		return false, nil, nil
 	}
@@ -231,9 +231,9 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	}
 
 	holds := upgradeHolds(tc)
-	settings := plan.KubernetesSettings{Paused: tc.Spec.Paused, Aborted: holds.Kubernetes, Policy: obs.policy}
+	settings := plan.KubernetesSettings{Paused: tc.Spec.Paused, Aborted: holds.Kubernetes, Policy: obs.policy, Releases: releasesOf(tc)}
 
-	if hop := plan.HopOf(planned); hop.Due() {
+	if hop := plan.HopOf(planned, settings.Releases); hop.Due() {
 		settings.Problems, settings.Unchecked = r.checkKubernetes(ctx, obs, hop)
 	}
 
@@ -249,6 +249,14 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 	if result.MayStart() {
 		if err := timing.Validate(); err != nil {
 			result.BlockReason, result.BlockMessage = talosv1alpha1.ReasonInvalidRollout, "spec.rollout: "+err.Error()
+		}
+	}
+
+	// Last, because it asks upstream: an image that certainly does not exist is refused before a
+	// node is asked to pull it.
+	if result.MayStart() {
+		if problem := r.imagesProblem(ctx, result.Images); problem != "" {
+			result.BlockReason, result.BlockMessage = plan.BlockIncompatible, problem
 		}
 	}
 
@@ -482,7 +490,7 @@ func (r *TalosClusterReconciler) continueKubernetes(ctx context.Context, tc *tal
 			return err
 		}
 
-		r.beginKubernetes(tc, key, v, plan.PlanKubernetes(planned, plan.KubernetesSettings{}, passOf(obs)), attempt)
+		r.beginKubernetes(tc, key, v, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), attempt)
 
 		return nil
 	}
@@ -534,7 +542,7 @@ func (r *TalosClusterReconciler) abortKubernetes(ctx context.Context, tc *talosv
 	version := tc.Status.Operation.Target
 
 	if planned, err := r.kubernetesMachines(ctx, tc, obs, pools, machines); err == nil {
-		if hop := plan.HopOf(planned); hop.To != "" {
+		if hop := plan.HopOf(planned, releasesOf(tc)); hop.To != "" {
 			version = hop.To
 		}
 	}

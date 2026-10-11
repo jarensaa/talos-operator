@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -40,11 +41,15 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/version"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	"github.com/jarensaa/talos-operator/internal/catalog"
 	"github.com/jarensaa/talos-operator/internal/plan"
 	"github.com/jarensaa/talos-operator/internal/talos"
+	"github.com/jarensaa/talos-operator/internal/validate"
 )
 
 // nodeState is what must not change on a node the operator is not meant to change.
@@ -438,6 +443,116 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 	// and rebooted, and comes back on it, one at a time. The operator runs on these very nodes, one
 	// replica on each, so it upgrades the ground it stands on: whichever replica leads loses its
 	// node at some point, and the other finishes what it began.
+	// Version awareness (docs/scope.md §7.5), against what really exists upstream: the operator
+	// asks from inside the cluster, and the check a repository would run asks from here.
+	It("says which versions exist, and passes the check a repository would run on its resources", func(ctx context.Context) {
+		By("reading what the operator found out upstream")
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(tc.Status.Versions).NotTo(BeNil())
+			g.Expect(tc.Status.Versions.Talos).To(Equal(os.Getenv("E2E_TALOS_VERSION")))
+			g.Expect(tc.Status.Versions.Kubernetes).To(Equal(os.Getenv("E2E_KUBERNETES_VERSION")))
+			g.Expect(tc.Status.Versions.Available).NotTo(BeNil())
+			g.Expect(tc.Status.Versions.Available.Problem).To(BeEmpty())
+			g.Expect(tc.Status.Versions.Available.Talos).NotTo(BeEmpty())
+			g.Expect(tc.Status.Versions.Available.Kubernetes).NotTo(BeEmpty())
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
+
+		// The newest release of the minor the cluster runs is at least the one it is upgraded to.
+		if target := os.Getenv("E2E_UPGRADE_TO"); target != "" {
+			newest := tc.Status.Versions.Available.Talos[0]
+			listed := version.MustParseSemantic(newest).AtLeast(version.MustParseSemantic(target))
+			Expect(listed).To(BeTrue(), "%s is listed, %s exists", newest, target)
+		}
+
+		conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionVersionsReachable)(Default)
+		Expect(tc.Status.Versions.Plan).To(BeEmpty(), "the cluster runs what its spec asks for")
+
+		By("exporting the resources, as someone would who puts them in Git")
+		export := func(dir string, mutate func(*talosv1alpha1.TalosCluster)) {
+			GinkgoHelper()
+
+			documents := make([][]byte, 0, 1+len(nodes))
+
+			cluster := &talosv1alpha1.TalosCluster{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tc), cluster)).To(Succeed())
+			cluster.TypeMeta = metav1.TypeMeta{APIVersion: talosv1alpha1.GroupVersion.String(), Kind: "TalosCluster"}
+
+			if mutate != nil {
+				mutate(cluster)
+			}
+
+			raw, err := yaml.Marshal(cluster)
+			Expect(err).NotTo(HaveOccurred())
+
+			documents = append(documents, raw)
+
+			var poolList talosv1alpha1.TalosMachinePoolList
+			Expect(k8sClient.List(ctx, &poolList, client.InNamespace(testNamespace))).To(Succeed())
+
+			for i := range poolList.Items {
+				poolList.Items[i].TypeMeta = metav1.TypeMeta{APIVersion: talosv1alpha1.GroupVersion.String(), Kind: "TalosMachinePool"}
+
+				raw, err := yaml.Marshal(&poolList.Items[i])
+				Expect(err).NotTo(HaveOccurred())
+
+				documents = append(documents, raw)
+			}
+
+			var machineList talosv1alpha1.TalosMachineList
+			Expect(k8sClient.List(ctx, &machineList, client.InNamespace(testNamespace))).To(Succeed())
+
+			for i := range machineList.Items {
+				machineList.Items[i].TypeMeta = metav1.TypeMeta{APIVersion: talosv1alpha1.GroupVersion.String(), Kind: "TalosMachine"}
+
+				raw, err := yaml.Marshal(&machineList.Items[i])
+				Expect(err).NotTo(HaveOccurred())
+
+				documents = append(documents, raw)
+			}
+
+			var configList talosv1alpha1.TalosMachineConfigList
+			Expect(k8sClient.List(ctx, &configList, client.InNamespace(testNamespace))).To(Succeed())
+
+			for i := range configList.Items {
+				configList.Items[i].TypeMeta = metav1.TypeMeta{APIVersion: talosv1alpha1.GroupVersion.String(), Kind: "TalosMachineConfig"}
+
+				raw, err := yaml.Marshal(&configList.Items[i])
+				Expect(err).NotTo(HaveOccurred())
+
+				documents = append(documents, raw)
+			}
+
+			Expect(os.WriteFile(filepath.Join(dir, "cluster.yaml"), bytes.Join(documents, []byte("---\n")), 0o600)).To(Succeed())
+		}
+
+		check := func(dir string) (problems []string) {
+			GinkgoHelper()
+
+			findings, err := validate.Run(ctx, validate.Options{Paths: []string{dir}, Source: &catalog.HTTP{}})
+			Expect(err).NotTo(HaveOccurred())
+
+			for _, f := range findings {
+				if !f.Skipped {
+					problems = append(problems, f.String())
+				}
+			}
+
+			return problems
+		}
+
+		asAdopted := GinkgoT().TempDir()
+		export(asAdopted, nil)
+		Expect(check(asAdopted)).To(BeEmpty(), "what adoption wrote names versions that go together, an installer that exists, and renders")
+
+		By("bumping to an installer that does not exist, as a mistaken pull request would")
+		mistaken := GinkgoT().TempDir()
+		export(mistaken, func(cluster *talosv1alpha1.TalosCluster) {
+			cluster.Spec.ConfigGeneration.Installer.SchematicID = strings.Repeat("0", 64)
+		})
+		Expect(check(mistaken)).To(ContainElement(ContainSubstring("Image Factory has no schematic")))
+	}, NodeTimeout(10*time.Minute))
+
 	It("upgrades Talos on every node, the ones the operator itself runs on included, with a workload kept up", func(ctx context.Context) {
 		target := os.Getenv("E2E_UPGRADE_TO")
 		if target == "" || target == os.Getenv("E2E_TALOS_VERSION") {
@@ -499,11 +614,37 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			g.Expect(workload.Status.AvailableReplicas).To(BeEquivalentTo(len(nodes)))
 		}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
 
-		By("asking for the next Talos release")
+		By("asking for the next Talos release, outside the cluster's maintenance window")
+		opens := time.Now().UTC().Add(12 * time.Hour)
 		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
 			tc.Spec.Versions.Talos = target
 			tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled
+			tc.Spec.Rollout.MaintenanceWindows = []talosv1alpha1.MaintenanceWindow{{
+				Schedule: fmt.Sprintf("%d %d * * *", opens.Minute(), opens.Hour()), Duration: metav1.Duration{Duration: time.Hour},
+			}}
 		})
+
+		// The bump is planned, and waits: a version change is held to the window like any other.
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(tc.Status.Versions).NotTo(BeNil())
+			g.Expect(tc.Status.Versions.Plan).To(Equal([]talosv1alpha1.VersionStep{
+				{Kind: plan.StepTalos, From: os.Getenv("E2E_TALOS_VERSION"), To: target},
+			}))
+
+			upToDate := meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionTalosUpToDate)
+			g.Expect(upToDate).NotTo(BeNil())
+			g.Expect(upToDate.Reason).To(Equal(talosv1alpha1.ReasonOutsideWindow), upToDate.Message)
+		}).WithContext(ctx).WithTimeout(2 * time.Minute).Should(Succeed())
+
+		Consistently(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(tc.Status.Operation).To(BeNil())
+		}).WithContext(ctx).WithTimeout(30 * time.Second).WithPolling(5 * time.Second).Should(Succeed())
+		Expect(snapshot(ctx, harness, nodes)).To(Equal(before), "nothing is installed, pulled or drained outside the window")
+
+		By("opening the window")
+		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Rollout.MaintenanceWindows = nil })
 
 		// upgraded finds the record of the upgrade once it has ended.
 		upgraded := func() *talosv1alpha1.OperationRecord {

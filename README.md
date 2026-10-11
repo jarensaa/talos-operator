@@ -14,6 +14,7 @@ It is built for clusters that already exist. The operator derives its resources 
 - **Talos upgrades, one node at a time.** A new version or installer is installed to a node's inactive boot slot while it keeps working. Only then is the node drained, with disruption budgets respected, and rebooted. A node that does not come back on the new system, or does not get healthy, halts the upgrade with that node still cordoned. The operator runs two replicas and upgrades the nodes it runs on.
 - **Kubernetes upgrades, one component at a time.** A new version reaches the API servers first, then the other control-plane components, then the kubelets, one minor at a time. Each change is tried and kept only once the component runs the new version. An upgrade is refused up front when a node's Talos does not run the version, or when it would strand a flag or an object of a removed API.
 - **Windows, gates and hooks.** Changes can be held to maintenance windows, made to wait on a CEL expression over any object in the cluster, such as a storage cluster's health, and wrapped in Jobs that run around an operation and around each node.
+- **Version awareness.** Status lists the Talos and Kubernetes releases that exist and the upgrades that lead to what the spec asks for. An upgrade to an installer or image that does not exist is refused before a node is asked to pull it. A `validate` command checks the manifests in a repository before they are merged.
 - **Classified changes.** Changes to CAs, tokens and other cluster identity are refused. Changes to storage, and anything the operator has no rule for, wait for approval of that exact change.
 - **Machine pools and shared config.** Config is layered: cluster, then pool, then machine. Reusable `TalosMachineConfig` resources can be referenced from any layer, and report how many machines use them.
 - **Config comparison and drift.** Each machine reports whether its rendered config equals the node's live config, per document, with a diff in which secrets are redacted. A node changed by hand is reported, and put back only if the drift policy says so.
@@ -250,6 +251,19 @@ spec:
 
 No node is begun outside a window; a node that is being changed when the window closes is finished. A gate must be true before a node is touched and stay true while the node is verified afterwards. A hook is a Job the operator runs and waits for, around the whole operation or around each node. The operator needs permission to read a gate's object, which the chart grants through `gates.rules`. The [guide](docs/guide.md#windows-gates-and-hooks) has the rest.
 
+### 11. Check a change before it merges
+
+If the resources live in Git, the operator's own image checks them, with no cluster and no secret:
+
+```bash
+docker run --rm -v "$PWD:/work:ro" -w /work ghcr.io/jarensaa/talos-operator:v0.9.0 \
+  validate --base ../main/clusters/my-cluster clusters/my-cluster
+```
+
+It fails when the Talos and Kubernetes versions do not go together, when the installer or a Kubernetes image does not exist, when the step from `--base` is a downgrade, when a machine's config does not render, or when a maintenance window or a gate cannot be understood. [`docs/examples`](docs/examples) has a GitHub Actions workflow that runs it on pull requests, and a Renovate configuration that proposes version bumps. With both, a new release becomes a pull request, the check decides whether it can work, and the operator rolls out what is merged inside your windows.
+
+`status.versions` on the TalosCluster says the same from the cluster's side: what it runs, which releases exist, and the upgrades to what the spec asks for. Which releases exist is only listed with `versionSources.enabled: true` in the chart: the operator then asks Image Factory, the Kubernetes release site and the image registries a few times a day. Without it, it talks to nothing but its cluster.
+
 ## Project status
 
 | Area | State |
@@ -263,6 +277,8 @@ No node is begun outside a window; a node that is being changed when the window 
 | Talos upgrades: version or installer, drained and rebooted node by node | Implemented |
 | Kubernetes upgrades: the components Talos runs, a minor at a time | Implemented |
 | Maintenance windows, gates on objects in the cluster, hook Jobs | Implemented |
+| Version awareness: releases that exist, the planned upgrades, a `validate` check for CI | Implemented |
+| The operator choosing versions by itself | Not planned for now |
 | The manifests Talos applies at bootstrap (kube-proxy, CoreDNS) | Not planned |
 | Config changes that only an install can make (kernel arguments, install disk) | Not planned |
 | Adding and removing machines | Planned |
@@ -270,7 +286,7 @@ No node is begun outside a window; a node that is being changed when the window 
 
 The API is `v1alpha1` and may change incompatibly between releases.
 
-Adoption, rollouts and upgrades are tested in CI against Talos clusters running in QEMU. The operator under test is the chart's image, installed with two replicas. The tests assert that adoption needs nothing applied by hand and leaves boot IDs and config hashes unchanged, that every node is upgraded to the next Talos release while a workload stays up, that a rollout finishes when the leader is killed in the middle of it, that a label reaches a node without a reboot, that a config which cuts a node off is reverted and never confirmed, that a rollout waits for its window and its gate and runs its hooks, and that Kubernetes is upgraded by a minor after being refused while a kubelet was started with a flag the new version removed.
+Adoption, rollouts and upgrades are tested in CI against Talos clusters running in QEMU. The operator under test is the chart's image, installed with two replicas. The tests assert that adoption needs nothing applied by hand and leaves boot IDs and config hashes unchanged, that every node is upgraded to the next Talos release while a workload stays up, that a rollout finishes when the leader is killed in the middle of it, that a label reaches a node without a reboot, that a config which cuts a node off is reverted and never confirmed, that the adopted resources pass the `validate` check against the real Image Factory and fail it for an installer that does not exist, that a rollout waits for its window and its gate and runs its hooks, and that Kubernetes is upgraded by a minor after being refused while a kubelet was started with a flag the new version removed.
 
 No cluster other than those depends on the operator yet. That is on purpose: until one does, the API changes without migrations.
 

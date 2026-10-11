@@ -44,6 +44,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	"github.com/jarensaa/talos-operator/internal/catalog"
 	"github.com/jarensaa/talos-operator/internal/controller"
 	"github.com/jarensaa/talos-operator/internal/talos"
 	"github.com/jarensaa/talos-operator/internal/target"
@@ -74,7 +75,11 @@ type options struct {
 	leaderElection  bool
 	watchNamespace  string
 	observeInterval time.Duration
-	zap             zap.Options
+	// versionSources says whether upstream is asked what exists, and kubernetesReleases where
+	// Kubernetes publishes its releases.
+	versionSources     bool
+	kubernetesReleases string
+	zap                zap.Options
 }
 
 func parseFlags() *options {
@@ -100,6 +105,13 @@ func parseFlags() *options {
 
 	flag.DurationVar(&o.observeInterval, "observe-interval", controller.DefaultObserveInterval,
 		"How often a cluster and its machines are observed when nothing else brings a reconcile.")
+
+	flag.BoolVar(&o.versionSources, "version-sources", false,
+		"Ask Image Factory, the Kubernetes release site and the registries of the Kubernetes images what exists: "+
+			"status then says which releases are available, and an upgrade to something that does not exist is refused "+
+			"before a node is asked to pull it. Without it the operator talks to nothing but the cluster it manages.")
+	flag.StringVar(&o.kubernetesReleases, "kubernetes-releases", catalog.DefaultKubernetesReleases,
+		"Where Kubernetes publishes its releases. Image Factory is the one a TalosCluster's installer names.")
 
 	// Production logging (JSON, info level, no stack traces on warnings) unless --zap-devel asks
 	// for the development format; `make run` does.
@@ -159,6 +171,12 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) e
 		return err
 	}
 
+	// One source for every cluster, so that what was asked a moment ago is not asked again.
+	var upstream catalog.Source
+	if o.versionSources {
+		upstream = &catalog.Cached{Source: &catalog.HTTP{KubernetesReleases: o.kubernetesReleases}}
+	}
+
 	if err := (&controller.TalosClusterReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -172,6 +190,7 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) e
 		// The chart passes the node's name down; without it the operator simply does not know
 		// which node an upgrade should leave for last.
 		NodeName: os.Getenv("NODE_NAME"),
+		Catalog:  upstream,
 		// The cluster the operator runs in is the cluster it manages (docs/scope.md §4.2).
 		KubernetesChecks: controller.KubernetesCheckerFunc(func(ctx context.Context, from, to string) ([]string, error) {
 			return talos.RemovedAPIObjects(ctx, mgr.GetConfig(), from, to)
@@ -268,6 +287,12 @@ func run(o *options) error {
 }
 
 func main() {
+	// The one subcommand: the check a repository runs before a spec reaches a cluster. It is in
+	// this binary so that the image a cluster runs is the image that checks its manifests.
+	if len(os.Args) > 1 && os.Args[1] == "validate" {
+		os.Exit(validateCommand(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
+	}
+
 	o := parseFlags()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&o.zap)))

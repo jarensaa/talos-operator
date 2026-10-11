@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	"github.com/jarensaa/talos-operator/internal/catalog"
 	"github.com/jarensaa/talos-operator/internal/plan"
 	"github.com/jarensaa/talos-operator/internal/talos"
 	"github.com/jarensaa/talos-operator/internal/talos/creds"
@@ -107,6 +108,19 @@ const (
 	// hookJob is the JobSpec of the specs' hooks.
 	hookJob = `{"template":{"spec":{"containers":[{"name":"hook","image":"registry.example.com/hook:1"}]}}}`
 )
+
+// upstream is what exists upstream in the specs that ask: a newer Talos patch release and its
+// installer, a Talos minor this operator does not support, and the newest Kubernetes releases.
+func upstream() *catalog.Fake {
+	return &catalog.Fake{
+		Talos: []string{"v1.13.9", talosVersion, newerTalosVersion, "v1.15.0"},
+		Installers: map[string]bool{
+			schematic + " " + talosVersion: true, schematic + " " + newerTalosVersion: true,
+		},
+		Latest: map[string]string{"1.36": "1.36.5", "1.37": "1.37.1"},
+		Tags:   map[string]bool{"v" + kubernetesVersion: true, "v1.37.2": true},
+	}
+}
 
 func labelConfig(value string) string {
 	return "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  rollout: " + value + "\n"
@@ -1377,6 +1391,26 @@ var _ = Describe("Config rollout", func() {
 			Expect(blocked()).To(BeNil())
 		})
 
+		It("refuses an installer that does not exist before a node is asked to pull it, and only when that is certain", func() {
+			source := upstream()
+			reconciler.Catalog = source
+
+			upgradeTo("v1.14.9")
+			advance(time.Hour)
+
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(And(ContainSubstring("no installer of Talos v1.14.9"), ContainSubstring(schematic)))
+			Expect(scenario.CallsFor(fake.MethodImagePull)).To(BeEmpty())
+
+			// A source that cannot be reached makes nothing false: the node is where the answer is.
+			source.Err = errors.New("no route to host")
+			reconciler.Catalog = source
+			upgradeTo("v1.14.8")
+			runUntil("a node is asked to pull", func() bool { return len(scenario.CallsFor(fake.MethodImagePull)) > 0 })
+			Expect(operation().Type).To(Equal(talosv1alpha1.OperationTalosUpgrade))
+		})
+
 		It("leaves the node the operator runs on for last", func() {
 			reconciler.NodeName = node(worker1).node
 
@@ -2560,6 +2594,41 @@ var _ = Describe("Config rollout", func() {
 			Expect(pulled()).To(HaveLen(12))
 		})
 
+		It("goes through the newest release it knows of a minor on the way, and refuses a release that does not exist", func() {
+			reconciler.Catalog = upstream()
+
+			upgradeKubernetes("1.37.9")
+			advance(time.Hour)
+			Expect(operation()).To(BeNil())
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(And(ContainSubstring("these images do not exist"),
+				ContainSubstring("registry.k8s.io/kube-apiserver:v1.37.9"), ContainSubstring("ghcr.io/siderolabs/kubelet:v1.37.9")))
+			Expect(pulled()).To(BeEmpty())
+
+			// Two minors behind what the spec asks for now.
+			for _, n := range rolloutNodes {
+				scenario.UpdateNode(n.addr, func(fn *fake.Node) {
+					images, err := talos.KubernetesImages(fn.Config.Active)
+					Expect(err).NotTo(HaveOccurred())
+
+					for component, image := range images {
+						fn.Config.Active, err = talos.WithKubernetesImage(fn.Config.Active, component, strings.Replace(image, kubernetesVersion, "1.35.4", 1))
+						Expect(err).NotTo(HaveOccurred())
+					}
+				})
+			}
+
+			upgradeKubernetes(kubernetesVersion)
+			settle(started)
+			Expect(operation().Target).To(Equal("1.36.5"), "not the first release of the minor in between, but the newest")
+			Expect(tc.Status.Versions.Plan).To(Equal([]talosv1alpha1.VersionStep{
+				{Kind: plan.StepKubernetes, From: "1.35.4", To: "1.36.5"}, {Kind: plan.StepKubernetes, From: "1.36.5", To: kubernetesVersion},
+			}))
+
+			runUntil("both hops end", func() bool { return len(kubernetesOperations()) == 2 })
+			Expect(imagesOf(worker1)[plan.ComponentKubelet]).To(HaveSuffix(":v" + kubernetesVersion))
+		})
+
 		It("is carried on by another replica from what is persisted, without a second try", func() {
 			upgradeKubernetes(patch)
 			runUntil("the API server is tried", turnIs(plan.ComponentAPIServer, cp1Machine, plan.StepVerifying))
@@ -2689,6 +2758,131 @@ var _ = Describe("Config rollout", func() {
 			upgradeKubernetes(patch)
 			runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
 			Expect(hooks).To(Equal([]string{talosv1alpha1.HookPreRollout, talosv1alpha1.HookPostRollout}))
+		})
+	})
+
+	Context("version awareness", func() {
+		var source *catalog.Fake
+
+		versions := func() *talosv1alpha1.VersionsStatus {
+			GinkgoHelper()
+			Expect(tc.Status.Versions).NotTo(BeNil())
+
+			return tc.Status.Versions
+		}
+
+		reachable := func() *metav1.Condition {
+			GinkgoHelper()
+
+			c := condition(tc, talosv1alpha1.ConditionVersionsReachable)
+			Expect(c).NotTo(BeNil())
+
+			return c
+		}
+
+		BeforeEach(func() {
+			source = upstream()
+			reconciler.Catalog = &catalog.Cached{Source: source, Now: func() time.Time { return clock }}
+			settle(nil)
+		})
+
+		It("says what the cluster runs and what exists, and that there is nothing to do", func() {
+			Expect(versions().Talos).To(Equal(talosVersion))
+			Expect(versions().Kubernetes).To(Equal(kubernetesVersion))
+			Expect(versions().Plan).To(BeEmpty())
+			Expect(reachable().Status).To(Equal(metav1.ConditionTrue))
+			Expect(reachable().Reason).To(Equal(talosv1alpha1.ReasonUpToDate))
+
+			// Of Talos: the newest release of each minor this operator supports, nothing older than
+			// what runs. Of Kubernetes: up to the newest minor one of those runs.
+			Expect(versions().Available.Talos).To(Equal([]string{newerTalosVersion}))
+			Expect(versions().Available.Kubernetes).To(Equal([]string{"1.37.1"}))
+			Expect(versions().Available.Problem).To(BeEmpty())
+
+			// What exists is information. Nothing is upgraded because of it.
+			advance(time.Hour)
+			Expect(operation()).To(BeNil())
+			Expect(tc.Status.History).To(BeEmpty())
+			Expect(scenario.CallsFor(fake.MethodImagePull)).To(BeEmpty())
+		})
+
+		It("asks upstream rarely, and not at all while an operation is in flight", func() {
+			asked := source.Asked
+			for range 20 {
+				round()
+			}
+
+			Expect(source.Asked).To(Equal(asked), "an answer is kept for a while")
+
+			setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+			settle(started)
+
+			asked = source.Asked
+			clock = clock.Add(catalog.DefaultKeep)
+			settle(nil)
+			Expect(started()).To(BeTrue())
+			Expect(source.Asked).To(Equal(asked), "an operation in flight has deadlines to keep")
+		})
+
+		It("plans the way to what the spec asks for, and goes it in that order", func() {
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) {
+				tc.Spec.Versions.Talos, tc.Spec.Versions.Kubernetes = newerTalosVersion, "1.37.1"
+				tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled
+			})
+			settle(started)
+
+			Expect(versions().Plan).To(Equal([]talosv1alpha1.VersionStep{
+				{Kind: plan.StepTalos, From: talosVersion, To: newerTalosVersion},
+				{Kind: plan.StepKubernetes, From: kubernetesVersion, To: "1.37.1"},
+			}))
+			Expect(reachable().Reason).To(Equal(talosv1alpha1.ReasonPlanned))
+			Expect(reachable().Message).To(ContainSubstring("2 upgrade(s)"))
+			Expect(operation().Type).To(Equal(talosv1alpha1.OperationTalosUpgrade), "the first step of the plan is the first operation")
+		})
+
+		It("says why the versions a spec asks for cannot be reached", func() {
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) {
+				tc.Spec.Versions.Kubernetes = "1.38.0"
+				tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled
+			})
+			advance(time.Minute)
+
+			Expect(reachable().Status).To(Equal(metav1.ConditionFalse))
+			Expect(reachable().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(reachable().Message).To(ContainSubstring("the spec asks for Talos " + talosVersion + " with Kubernetes 1.38.0"))
+			Expect(versions().Plan).To(BeEmpty())
+			Expect(operation()).To(BeNil())
+
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Versions.Kubernetes = "1.36.5" })
+			advance(time.Minute)
+			Expect(reachable().Message).To(ContainSubstring("not downgraded"))
+		})
+
+		It("keeps what it knew when upstream does not answer, and says so", func() {
+			source.Err = errors.New("no route to host")
+			clock = clock.Add(catalog.DefaultKeep)
+			settle(nil)
+
+			Expect(versions().Available.Talos).To(Equal([]string{newerTalosVersion}))
+			Expect(versions().Available.Kubernetes).To(Equal([]string{"1.37.1"}))
+			Expect(versions().Available.Problem).To(ContainSubstring("no route to host"))
+			Expect(reachable().Status).To(Equal(metav1.ConditionTrue), "what the cluster runs and may be upgraded to does not depend on it")
+
+			source.Err = nil
+			clock = clock.Add(catalog.DefaultRetry)
+			settle(nil)
+			Expect(versions().Available.Problem).To(BeEmpty())
+		})
+
+		It("asks nobody when it was started without a source", func() {
+			reconciler.Catalog = nil
+			updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Paused = true })
+			asked := source.Asked
+			clock = clock.Add(2 * catalog.DefaultKeep)
+			settle(nil)
+
+			Expect(source.Asked).To(Equal(asked))
+			Expect(reachable().Status).To(Equal(metav1.ConditionTrue))
 		})
 	})
 

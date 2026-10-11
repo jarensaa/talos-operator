@@ -18,6 +18,7 @@ package talos
 
 import (
 	"fmt"
+	"strings"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/compatibility"
@@ -96,6 +97,25 @@ func UpgradeProblem(from, target, kubernetesVersion string) string {
 
 	if err := k8s.SupportedWith(to); err != nil {
 		return fmt.Sprintf("Talos %s does not support Kubernetes %s, which the cluster runs: %v", target, kubernetesVersion, err)
+	}
+
+	return ""
+}
+
+// RunsKubernetes says why a Talos release does not run a Kubernetes version, or returns "".
+func RunsKubernetes(talosVersion, kubernetesVersion string) string {
+	host, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: talosVersion})
+	if err != nil {
+		return fmt.Sprintf("unparsable Talos version %q", talosVersion)
+	}
+
+	k8s, err := compatibility.ParseKubernetesVersion(strings.TrimPrefix(kubernetesVersion, "v"))
+	if err != nil {
+		return fmt.Sprintf("unparsable Kubernetes version %q", kubernetesVersion)
+	}
+
+	if err := k8s.SupportedWith(host); err != nil {
+		return fmt.Sprintf("Talos %s does not run Kubernetes %s: %v", talosVersion, strings.TrimPrefix(kubernetesVersion, "v"), err)
 	}
 
 	return ""

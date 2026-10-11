@@ -127,7 +127,8 @@ func runs(tc *talosv1alpha1.TalosCluster, pool *talosv1alpha1.TalosMachinePool, 
 }
 
 // upgradeMachine is the planner's view of a machine.
-func (r *TalosClusterReconciler) upgradeMachine(obs observation, v upgradeView) plan.UpgradeMachine {
+func (r *TalosClusterReconciler) upgradeMachine(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, v upgradeView,
+) plan.UpgradeMachine {
 	m := plan.UpgradeMachine{
 		Name: v.tm.Name,
 		Node: v.hostname(),
@@ -151,7 +152,9 @@ func (r *TalosClusterReconciler) upgradeMachine(obs observation, v upgradeView) 
 	m.HostsOperator = r.NodeName != "" && v.kubernetesNode() == r.NodeName
 
 	if !yes {
-		m.Problem = talos.UpgradeProblem(v.node.version, v.install.Version, obs.kubernetes)
+		if m.Problem = talos.UpgradeProblem(v.node.version, v.install.Version, obs.kubernetes); m.Problem == "" {
+			m.Problem = r.installerProblem(ctx, tc, v.install)
+		}
 	}
 
 	return m
@@ -193,7 +196,7 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 
 	for i := range machines {
 		v := r.upgradeView(tc, obs.facts, pools, &machines[i])
-		planned = append(planned, r.upgradeMachine(obs, v))
+		planned = append(planned, r.upgradeMachine(ctx, tc, obs, v))
 		images[machines[i].Name] = v.install.Image
 	}
 

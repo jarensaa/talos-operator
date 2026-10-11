@@ -51,6 +51,9 @@ const (
 	// ConditionKubernetesUpToDate reports whether every node's config names, and every node runs,
 	// the Kubernetes version its spec asks for (docs/scope.md §7.4).
 	ConditionKubernetesUpToDate = "KubernetesUpToDate"
+	// ConditionVersionsReachable reports whether there is a sequence of upgrades from the versions
+	// the cluster runs to the versions its spec asks for (docs/scope.md §7.5).
+	ConditionVersionsReachable = "VersionsReachable"
 	// ConditionRolloutBlocked reports that a disruptive operation is halted and needs attention.
 	ConditionRolloutBlocked = "RolloutBlocked"
 )
@@ -142,6 +145,10 @@ const (
 	ReasonUpgrading        = "Upgrading"
 	ReasonUpgradesDisabled = "UpgradesDisabled"
 	ReasonIncompatible     = "Incompatible"
+	// ReasonUpToDate: the cluster runs the versions its spec asks for.
+	ReasonUpToDate = "UpToDate"
+	// ReasonPlanned: there is a way to the versions the spec asks for, in status.versions.plan.
+	ReasonPlanned = "Planned"
 	// ReasonAwaitingStatus: a TalosMachine's status does not reflect its spec and node yet.
 	ReasonAwaitingStatus = "AwaitingStatus"
 	// ReasonHeld: a machine does not run its rendered config and is on hold, or was skipped.

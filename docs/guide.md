@@ -160,7 +160,8 @@ kubectl -n talos-operator describe taloscluster my-cluster   # TalosUpToDate car
 - a version this operator doesn't support: older than 1.13, or newer than the Talos it was built for;
 - a downgrade;
 - a jump Talos doesn't allow in one step;
-- a Kubernetes version the new Talos release doesn't run. Upgrade Kubernetes first then.
+- a Kubernetes version the new Talos release doesn't run. Upgrade Kubernetes first then;
+- an installer Image Factory doesn't build: a release or a schematic it doesn't have, or an extension the schematic names that the release lacks.
 
 ### When a node doesn't come through
 
@@ -206,7 +207,7 @@ One component on one node at a time, in this order: the API server on every cont
 | `Verifying` | The component must run the new version and be ready, and the whole cluster must stay healthy for the soak. For a control-plane component that is its pod in `kube-system`; for the kubelet, the version its Node reports. |
 | `Confirming` | The config is made persistent. |
 
-A version more than one minor ahead of what the cluster runs is reached one minor at a time, each as an operation of its own. The steps in between go to the first release of each minor (`1.36.0` on the way from 1.35 to 1.37).
+A version more than one minor ahead of what the cluster runs is reached one minor at a time, each as an operation of its own. The steps in between go to the newest release the operator knows of each minor, or to its first release (`1.36.0` on the way from 1.35 to 1.37) where it does not know.
 
 With one control plane, the Kubernetes API is down while its API server restarts, for a minute or two, and the rest of the control plane needs a few more to find its feet again. The operator loses its leader lease then and restarts; whichever replica comes back carries on from what is in status. Because of this the API server's turn is given `stepTimeout` (10m) to be healthy again before its soak, not the shorter `tryTimeout`. If an API server really does not come up, that is also how long it takes until Talos puts the previous one back.
 
@@ -218,6 +219,7 @@ With one control plane, the Kubernetes API is down while its API server restarts
 - a version the Talos release on some node does not run. The message names the nodes and says to upgrade Talos first;
 - a flag, feature gate or admission plugin that a component is started with and the new version removed;
 - objects of an API the new version no longer serves. Migrate or delete them first;
+- an image the upgrade would pull that its registry does not have;
 - a control plane on hold (`spec.hold`). A worker on hold is left out, and its kubelet stays behind.
 
 If one of those checks cannot be run, the upgrade waits (`AwaitingStatus`) and says which.
@@ -238,6 +240,67 @@ Talos puts the previous image back when the try ends, the upgrade halts, and not
 
 - **kube-proxy, CoreDNS and the other manifests Talos applies when a cluster is bootstrapped.** Talos applies them once and never again, and the operator does not either. The upgrade does update the kube-proxy image that each control plane's config names, so that the config is right; nothing runs from it. If your cluster still runs the kube-proxy Talos deployed, update its DaemonSet yourself; `KubernetesUpToDate` says when it is behind. kube-proxy may be older than the API server, so there is no hurry, but it does not follow by itself.
 - **Everything Talos does not run:** the CNI, CSI drivers, workloads.
+
+## Versions: what exists, and what is planned
+
+`status.versions` on a TalosCluster says what the cluster runs, the upgrades that lead to what its spec asks for, and which releases exist:
+
+```yaml
+status:
+  versions:
+    talos: v1.14.1
+    kubernetes: 1.36.5
+    plan:
+      - { kind: Talos, from: v1.14.1, to: v1.14.2 }
+      - { kind: Kubernetes, from: 1.36.5, to: 1.37.1 }
+    available:
+      talos: [v1.14.2]
+      kubernetes: [1.36.5, 1.37.1]
+```
+
+`plan` is in the order the operator takes the steps. Talos and Kubernetes take turns as their versions allow: a Talos release is only installed while it runs the Kubernetes version the cluster has then, and the other way round. `VersionsReachable` is false, with the reason, when there is no way to the versions the spec asks for.
+
+`available` is information. Nothing is upgraded because a release is listed: the version a cluster runs is the one its spec names. Talos lists the newest release of each minor this operator supports; a newer minor needs a newer operator first.
+
+### What the operator asks, and whom
+
+Out of the box the operator talks to nothing but the cluster it manages, and `status.versions` has no `available`. With `versionSources.enabled: true` in the chart's values it asks services outside the cluster what exists, a few times a day and never during an upgrade:
+
+| Whom | What |
+|---|---|
+| The Image Factory your installer names | Which Talos releases it builds; before an upgrade, whether it has your schematic, the extensions it names for that release, and the installer. |
+| The Kubernetes release site (`dl.k8s.io`) | The newest patch release of a minor. |
+| The registries of the Kubernetes images | Before a Kubernetes upgrade, whether each image it is about to pull exists. |
+
+It only reads, only over HTTPS, and says who it is in every request. What it learns is used to refuse an upgrade to something that does not exist before a node tries to pull it, and to take a Kubernetes upgrade over several minors through the newest release of each. If a service does not answer, nothing is refused: the nodes find out when they pull.
+
+It is off unless you switch it on because these are other people's services, and using them from your cluster is yours to decide. Nothing is less safe without it. Which versions go together, which steps Talos and Kubernetes allow, and what a Kubernetes release removed are rules the operator is built with, not something it asks for. A release that does not exist is then found by the first node that fails to pull it, before anything on that node is changed, and the upgrade halts there. And a Kubernetes upgrade over several minors goes through the first release of each minor in between, so take one minor at a time.
+
+The check below asks the same services, once for every pull request it runs on, whether the operator does or not.
+
+### Checking a change before it merges
+
+The operator's image has a second command for repositories that hold the resources:
+
+```bash
+docker run --rm -v "$PWD:/work:ro" -w /work ghcr.io/jarensaa/talos-operator:v0.9.0 \
+  validate --base ../main/clusters/my-cluster clusters/my-cluster
+```
+
+It reads the TalosCluster, TalosMachinePool, TalosMachine and TalosMachineConfig documents in the files and directories given, and ignores everything else. It needs no cluster and no secret, and checks that:
+
+- the Talos and Kubernetes versions go together and are ones this operator upgrades to;
+- with `--base`, the manifests as they were before the change, the step is one that can be taken: no downgrade, no jump Talos does not make;
+- the installer exists, for the cluster and for every pool with a schematic of its own, extensions included, and so do the Kubernetes images;
+- maintenance windows and gate expressions can be understood;
+- every machine's config renders, with secrets made up for the purpose. A machine whose config comes partly from a Secret is not rendered, and is named;
+- no document has a field the API does not know, which the API server would drop without a word.
+
+It exits with 1 when something is wrong, and with 2 when the files cannot be read. If a service it asks does not answer, that is a failure too; `--offline` skips the questions. On GitHub Actions every problem is an annotation, and the run's summary lists the upgrades the change means.
+
+The check compares a change with the base branch, not with the cluster: an earlier bump may still be waiting for its window. The operator plans again from what the nodes run when the change arrives.
+
+[`docs/examples`](examples) has a workflow that runs the check on pull requests and a Renovate configuration that proposes version bumps, with patch releases merged by themselves once the check passes and minors left for a human.
 
 ## Windows, gates and hooks
 

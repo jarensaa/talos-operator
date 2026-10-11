@@ -155,7 +155,7 @@ func TestHopOf(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := HopOf(tt.machines)
+			got := HopOf(tt.machines, nil)
 			if got.From != tt.from || got.Version != tt.hop || got.To != tt.to {
 				t.Fatalf("got from %q via %q to %q, want from %q via %q to %q", got.From, got.Version, got.To, tt.from, tt.hop, tt.to)
 			}
