@@ -1003,7 +1003,7 @@ Marking a machine as removed takes it out of the cluster cleanly. A control plan
 ### M10 Observability
 
 **M10a: the operator's own state** is delivered (§14.2): metrics for what the operator already knows, alerts on them, and a dashboard, installed by the chart where there is a Prometheus to read them.
-- **Shown for M10a:** the alert rules are tested by promtool on the series the exporter really exports, a halted rollout among them, each rule broken once to see its test fail; on QEMU the halted rollout is found in the metrics of both replicas, with the labels the alert carries, and is gone from them once it is aborted. The QEMU cluster has no Prometheus, so no alert was seen to fire there, and the dashboard has not been looked at on any cluster.
+- **Shown for M10a:** the alert rules are tested by promtool on the series the exporter really exports, a halted rollout among them, each rule broken once to see its test fail; on QEMU the halted rollout is found in the metrics of both replicas, with the labels the alert carries, and is gone from them once it is aborted. The QEMU cluster has no Prometheus, so no alert was seen to fire there. Off any cluster, a Prometheus loaded with the chart's rules and scraping the exporter's output for a halted rollout fired `TalosOperationHalted`, and a Grafana showed the dashboard filled from it; neither has been seen on a cluster yet.
 
 **M10b: the cluster's own metrics and logs.** Exposing etcd and control-plane metrics, and shipping Talos's logs, are config changes that a user can declare since M3.
 - **To decide:** whether this is an operator feature at all (the earlier plan was a `spec.observability` profile) or documented config that the e2e proves. The second is less to own.

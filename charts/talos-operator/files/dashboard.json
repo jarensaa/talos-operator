@@ -1015,7 +1015,13 @@
       ],
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "machine",
+            "desc": false
+          }
+        ]
       },
       "fieldConfig": {
         "defaults": {
@@ -1216,7 +1222,13 @@
       ],
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "machine",
+            "desc": false
+          }
+        ]
       },
       "fieldConfig": {
         "defaults": {
