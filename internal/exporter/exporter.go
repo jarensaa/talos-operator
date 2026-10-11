@@ -72,6 +72,13 @@ var (
 		"Whether the cluster's operation has failed and waits for a person.", clusterLabels)
 	clusterApprovalDesc = desc("cluster_approval_pending",
 		"Whether a change waits for a person's approval.", clusterLabels)
+	clusterCertificateExpiryDesc = desc("cluster_certificate_expiry_timestamp_seconds",
+		"When a certificate the cluster depends on stops being valid: the operator's own client certificate, or one of "+
+			"the cluster's certificate authorities.", clusterLabels, "certificate")
+	clusterCertificateIssuedDesc = desc("cluster_certificate_issued_timestamp_seconds",
+		"When the validity of a certificate the cluster depends on began.", clusterLabels, "certificate")
+	clusterDefragmentedDesc = desc("cluster_etcd_defragmented_timestamp_seconds",
+		"When the operator last began to defragment etcd. There only once it has.", clusterLabels)
 
 	operationInfoDesc = desc("operation_info", "The operation that holds the cluster. Always 1.",
 		clusterLabels, "type", "target")
@@ -101,7 +108,34 @@ var (
 	machineEtcdDesc = desc("machine_etcd_member",
 		"Whether a control plane is a member of etcd, as a voter or a learner. 0 for both while it is neither.",
 		machineLabels, "role")
+	machineEtcdLeaderDesc = desc("machine_etcd_leader",
+		"Whether the control plane's etcd member led etcd when it was last read. There only while it can be read.", machineLabels)
+	machineEtcdSizeDesc = desc("machine_etcd_db_size_bytes",
+		"The size of the database file of the control plane's etcd member. It follows the file once that has moved by a "+
+			"twentieth of its size. There only while it can be read.", machineLabels)
+	machineEtcdInUseDesc = desc("machine_etcd_db_size_in_use_bytes",
+		"How much of the database file of the control plane's etcd member holds data: the rest is what a defragmentation "+
+			"gives back. As coarse as the size.", machineLabels)
+
+	// What Talos itself says about a node. Each is there only while the node can be read.
+	machineServiceDesc = desc("machine_service_healthy",
+		"Whether a Talos service of the node runs and passes its health check.", machineLabels, "service")
+	machineDiagnosticDesc = desc("machine_diagnostic_info",
+		"A warning Talos raises about the node's own configuration. Always 1, and there only while Talos raises it.",
+		machineLabels, "id")
+	machineTimeDesc = desc("machine_time_synced", "Whether the node's clock is synchronised.", machineLabels)
+	machineLinkDesc = desc("machine_link_up",
+		"Whether a physical network link of the node is up; bond names the bond it is a member of, if it is one.",
+		machineLabels, "link", "bond")
+	machineLinkSpeedDesc = desc("machine_link_speed_mbps",
+		"The speed of a physical network link of the node. There only for a link that reports one.", machineLabels, "link")
+	machineVolumeDesc = desc("machine_volume_ready",
+		"Whether one of Talos's volumes on the node is ready, with the phase Talos reports for it.",
+		machineLabels, "volume", "phase")
 )
+
+// volumeReady is the phase of a volume that is in order.
+const volumeReady = "ready"
 
 // Roles of an etcd member.
 const (
@@ -136,9 +170,11 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 		infoDesc,
 		clusterPhaseDesc, clusterConditionDesc, clusterObservedDesc, clusterVersionDesc, clusterPlanDesc, clusterEtcdDesc,
 		clusterOperationDesc, clusterHaltedDesc, clusterApprovalDesc,
+		clusterCertificateExpiryDesc, clusterCertificateIssuedDesc, clusterDefragmentedDesc,
 		operationInfoDesc, operationStartDesc, operationTurnsDesc, operationFailureDesc, operationFailureTimeDesc,
 		machineInfoDesc, machinePhaseDesc, machineConditionDesc, machineReadyDesc, machineHoldDesc, machineChangeDesc,
-		machineEtcdDesc,
+		machineEtcdDesc, machineEtcdLeaderDesc, machineEtcdSizeDesc, machineEtcdInUseDesc,
+		machineServiceDesc, machineDiagnosticDesc, machineTimeDesc, machineLinkDesc, machineLinkSpeedDesc, machineVolumeDesc,
 	} {
 		ch <- d
 	}
@@ -262,6 +298,17 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 		}
 	}
 
+	for _, cert := range st.Certificates {
+		out = append(out,
+			gauge(clusterCertificateExpiryDesc, seconds(cert.ExpiresAt), with(cert.Name)...),
+			gauge(clusterCertificateIssuedDesc, seconds(cert.IssuedAt), with(cert.Name)...),
+		)
+	}
+
+	if done := st.Maintenance; done != nil && done.EtcdDefragmentedAt != nil {
+		out = append(out, gauge(clusterDefragmentedDesc, seconds(*done.EtcdDefragmentedAt), base...))
+	}
+
 	if op := st.Operation; op != nil {
 		kind := string(op.Type)
 
@@ -332,6 +379,53 @@ func machineMetrics(tm *talosv1alpha1.TalosMachine, pool *talosv1alpha1.TalosMac
 			gauge(machineEtcdDesc, truth(member && !isLearner), with(voter)...),
 			gauge(machineEtcdDesc, truth(isLearner), with(learner)...),
 		)
+
+		// A size of zero is a member that was not read: an etcd database is never empty.
+		if member && st.Etcd.DBSize > 0 {
+			out = append(out,
+				gauge(machineEtcdLeaderDesc, truth(st.Etcd.Leader), base...),
+				gauge(machineEtcdSizeDesc, float64(st.Etcd.DBSize), base...),
+				gauge(machineEtcdInUseDesc, float64(st.Etcd.DBSizeInUse), base...),
+			)
+		}
+	}
+
+	return append(out, healthMetrics(st.Health, base)...)
+}
+
+// healthMetrics is what Talos said about the node when it was last read. Nothing of it is
+// exported for a node that was not read: what is not known is not said to be fine, or broken.
+func healthMetrics(health *talosv1alpha1.NodeHealth, base []string) []prometheus.Metric {
+	if health == nil {
+		return nil
+	}
+
+	with := func(more ...string) []string { return append(append([]string{}, base...), more...) }
+
+	var out []prometheus.Metric
+
+	for _, service := range health.Services {
+		out = append(out, gauge(machineServiceDesc, truth(service.Running && service.Healthy), with(service.Name)...))
+	}
+
+	for _, diagnostic := range health.Diagnostics {
+		out = append(out, gauge(machineDiagnosticDesc, 1, with(diagnostic.ID)...))
+	}
+
+	if health.TimeSynced != nil {
+		out = append(out, gauge(machineTimeDesc, truth(*health.TimeSynced), base...))
+	}
+
+	for _, link := range health.Links {
+		out = append(out, gauge(machineLinkDesc, truth(link.Up), with(link.Name, link.Bond)...))
+
+		if link.SpeedMbps > 0 {
+			out = append(out, gauge(machineLinkSpeedDesc, float64(link.SpeedMbps), with(link.Name)...))
+		}
+	}
+
+	for _, volume := range health.Volumes {
+		out = append(out, gauge(machineVolumeDesc, truth(volume.Phase == volumeReady), with(volume.Name, volume.Phase)...))
 	}
 
 	return out

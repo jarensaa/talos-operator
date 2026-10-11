@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -324,6 +325,167 @@ func scenarios() []scenario {
 
 				f.cluster.Status.Observed.EtcdMembers = f.cluster.Status.Observed.EtcdMembers[:2]
 				f.is(talosv1alpha1.ConditionMembershipCurrent, metav1.ConditionFalse, talosv1alpha1.ReasonAwaitingMachine)
+			},
+		},
+		{
+			name: "a Talos service that fails its health check",
+			change: func(f *fixture) {
+				f.machine("node-b").Status.Health.Services[1].Healthy = false
+			},
+			fires: []fired{{
+				alert: "TalosServiceUnhealthy", severity: "warning", labels: []string{"machine", "node-b", "service", "kubelet"},
+				summary: "The Talos service kubelet of node-b is not healthy.",
+				description: "kubelet on the node of node-b in my-cluster has not been running, or has failed its health check, " +
+					"for 15 minutes. status.health.services of the TalosMachine says which; the service's log is on the node.",
+			}},
+		},
+		{
+			name: "a node Talos has a warning about",
+			change: func(f *fixture) {
+				f.machine("node-d").Status.Health.Diagnostics = []talosv1alpha1.Diagnostic{{ID: "address-overlap", Message: "not exported"}}
+			},
+			fires: []fired{{
+				alert: "TalosNodeDiagnostic", severity: "warning", labels: []string{"machine", "node-d", "id", "address-overlap"},
+				summary: "Talos warns about node-d: address-overlap.",
+				description: "Talos has raised the warning address-overlap about the configuration of the node of node-d in " +
+					"my-cluster for 15 minutes. status.health.diagnostics of the TalosMachine has what Talos says about it.",
+			}},
+		},
+		{
+			name:   "a node whose clock is off",
+			change: func(f *fixture) { f.machine("node-a").Status.Health.TimeSynced = new(false) },
+			fires: []fired{{
+				alert: "TalosNodeClockNotSynced", severity: "warning", labels: []string{"machine", "node-a"},
+				summary: "The clock of node-a is not synchronised.",
+				description: "The node of node-a in my-cluster has not had its clock synchronised for 10 minutes. A clock that " +
+					"drifts breaks etcd and every certificate check: look at the node's time servers.",
+			}},
+		},
+		{
+			name: "a node that lost one link of its bond",
+			change: func(f *fixture) {
+				f.machine("node-c").Status.Health.Links = []talosv1alpha1.LinkHealth{
+					{Name: "eth0", Up: true, SpeedMbps: 10000, Bond: "bond0"}, {Name: "eth1", Bond: "bond0"},
+				}
+			},
+			fires: []fired{{
+				alert: "TalosBondMemberDown", severity: "warning", labels: []string{"machine", "node-c", "link", "eth1", "bond", "bond0"},
+				summary: "The link eth1 of node-c is down.",
+				description: "eth1, a member of the bond bond0 on the node of node-c in my-cluster, has been down for 5 minutes. " +
+					"The node is still reached through the rest of the bond, and has no link to spare.",
+			}},
+		},
+		{
+			// A port nothing is plugged into is down, and is nobody's problem.
+			name: "a node with a link that is down and in no bond",
+			change: func(f *fixture) {
+				f.machine("node-c").Status.Health.Links = append(f.machine("node-c").Status.Health.Links, talosv1alpha1.LinkHealth{Name: "eth1"})
+			},
+		},
+		{
+			name: "a volume of Talos that is not ready",
+			change: func(f *fixture) {
+				f.machine("node-d").Status.Health.Volumes[0] = talosv1alpha1.VolumeHealth{Name: "EPHEMERAL", Phase: "failed", Error: "not exported"}
+			},
+			fires: []fired{{
+				alert: "TalosVolumeNotReady", severity: "warning", labels: []string{"machine", "node-d", "volume", "EPHEMERAL", "phase", "failed"},
+				summary: "The volume EPHEMERAL of node-d is not ready.",
+				description: "Talos has reported the volume EPHEMERAL on the node of node-d in my-cluster as failed for 15 minutes. " +
+					"status.health.volumes of the TalosMachine has what Talos says went wrong.",
+			}},
+		},
+		{
+			// What Talos says about a node is gone from the metrics with the node: nothing of it
+			// alerts, and the node that cannot be read does.
+			name: "a node with an unhealthy service that can no longer be read",
+			change: func(f *fixture) {
+				f.machine("node-d").Status.Health = nil
+				unobserved(f.machine("node-d"))
+			},
+			fires: []fired{notObserved("node-d")},
+		},
+		{
+			name: "an etcd database close to its quota",
+			change: func(f *fixture) {
+				f.machine("node-a").Status.Etcd.DBSize, f.machine("node-a").Status.Etcd.DBSizeInUse = 1843<<20, 1700<<20
+			},
+			fires: []fired{{
+				alert: "TalosEtcdDatabaseLarge", severity: "critical", labels: []string{"machine", "node-a"},
+				summary: "The etcd database of node-a is close to etcd's quota.",
+				description: "The etcd database of node-a in my-cluster is 1.8GiB, more than four fifths of the 2 GiB etcd allows " +
+					"a database unless told otherwise. At the quota etcd refuses every write, and with it the Kubernetes API. " +
+					"Defragment it if most of it is free space, and find out what fills it if not.",
+			}},
+		},
+		{
+			name: "a fragmented etcd that the operator may not defragment",
+			change: func(f *fixture) {
+				f.is(talosv1alpha1.ConditionEtcdMaintained, metav1.ConditionFalse, talosv1alpha1.ReasonMaintenanceDisabled)
+			},
+			fires: []fired{{
+				alert: "TalosEtcdFragmented", severity: "warning", labels: []string{"reason", "MaintenanceDisabled"},
+				summary: "The etcd database of my-cluster is fragmented and is not being defragmented.",
+				description: "Much of the etcd database of my-cluster is free space, and for an hour the operator has not " +
+					"defragmented it without being paused, outside its maintenance window or waiting for its interval: " +
+					"MaintenanceDisabled. The EtcdMaintained condition of the TalosCluster says what it waits for.",
+			}},
+		},
+		{
+			// It was defragmented within the interval, and is again when the interval has passed.
+			name: "a fragmented etcd that waits for its interval",
+			change: func(f *fixture) {
+				f.is(talosv1alpha1.ConditionEtcdMaintained, metav1.ConditionFalse, talosv1alpha1.ReasonTooSoon)
+				f.cluster.Status.Maintenance = &talosv1alpha1.MaintenanceStatus{EtcdDefragmentedAt: &epoch}
+			},
+		},
+		{
+			name: "an etcd that is being defragmented",
+			change: func(f *fixture) {
+				f.is(talosv1alpha1.ConditionEtcdMaintained, metav1.ConditionFalse, talosv1alpha1.ReasonDefragmenting)
+				f.cluster.Status.Maintenance = &talosv1alpha1.MaintenanceStatus{EtcdDefragmentedAt: &epoch}
+				f.cluster.Status.Operation = &talosv1alpha1.Operation{
+					ID: "op-4", Type: talosv1alpha1.OperationEtcdDefragment, StartedAt: epoch,
+					Plan: []string{"node-b", "node-c", "node-a"}, Completed: []string{"node-b"},
+				}
+			},
+		},
+		{
+			name: "a certificate authority in the last tenth of its ten years",
+			change: func(f *fixture) {
+				f.cluster.Status.Certificates[0] = talosv1alpha1.Certificate{
+					Name: "etcd", IssuedAt: after(-10*year + 30*24*time.Hour), ExpiresAt: after(30 * 24 * time.Hour),
+				}
+			},
+			fires: []fired{{
+				alert: "TalosCertificateExpiring", severity: "warning", labels: []string{"certificate", "etcd"},
+				summary: "The etcd certificate of my-cluster is close to its end.",
+				description: "Less than a tenth of the validity of the etcd certificate of my-cluster is left. The operator's own " +
+					"certificate is renewed by Talos, or replaced by whoever supplied it; an authority that ends takes the cluster " +
+					"with it, and replacing one is a rotation of the cluster's PKI.",
+			}},
+		},
+		{
+			// Talos renews it an hour before its end. One that is past it was not renewed.
+			name: "an operator certificate that was not renewed",
+			change: func(f *fixture) {
+				f.cluster.Status.Certificates[2] = talosv1alpha1.Certificate{
+					Name: "operator", IssuedAt: after(-5 * time.Hour), ExpiresAt: after(time.Hour),
+				}
+			},
+			fires: []fired{
+				{
+					alert: "TalosCertificateExpiring", severity: "warning", labels: []string{"certificate", "operator"},
+					summary: "The operator certificate of my-cluster is close to its end.",
+					description: "Less than a tenth of the validity of the operator certificate of my-cluster is left. The " +
+						"operator's own certificate is renewed by Talos, or replaced by whoever supplied it; an authority that ends " +
+						"takes the cluster with it, and replacing one is a rotation of the cluster's PKI.",
+				},
+				{
+					alert: "TalosCertificateExpired", severity: "critical", labels: []string{"certificate", "operator"},
+					summary: "The operator certificate of my-cluster is no longer valid.",
+					description: "The operator certificate of my-cluster has reached the end of its validity. Without its own " +
+						"certificate the operator reaches no node; without an authority nothing in the cluster trusts anything.",
+				},
 			},
 		},
 		{
