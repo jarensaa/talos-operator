@@ -400,6 +400,83 @@ Three things to know when writing hooks:
 - **A node that failed gets no `postNode` hook.** What `preNode` set up for it is still set up while the operation is halted, and after a skip. Clean up in `postRollout`, which runs however the operation ends.
 - **A hook runs in the operator's namespace**, with the pod spec you wrote. Whoever may edit a TalosCluster can therefore run pods there, next to the cluster's secrets. They could already put any config on every node, so this grants nothing new, but it is one more reason to keep that permission narrow.
 
+## Adding and removing machines
+
+Set `spec.management.membership: Enabled` on the TalosCluster. Until you do, a TalosMachine that is not a node of the cluster is left alone: the operator does not even ask the machine at its address who it is.
+
+A machine is added, or removed, one at a time, as an operation like a rollout: it shows in `status.operation`, respects `paused`, your maintenance windows and gates, and halts with the same three choices when something fails. `MembershipCurrent` on the TalosCluster says whether the cluster's machines are the ones you declared.
+
+### Adding a machine
+
+1. Boot the machine into Talos's maintenance mode: from the ISO or PXE, without a config.
+2. Find its hardware UUID: `talosctl get systeminformation --insecure --nodes <address>`.
+3. Declare it:
+
+   ```yaml
+   apiVersion: talos.jarensaa.github.io/v1alpha1
+   kind: TalosMachine
+   metadata:
+     name: node-e
+   spec:
+     poolRef: { name: workers }        # the pool decides the role and the shared config
+     address: 10.0.0.15
+     identity:
+       systemUUID: aaaaaaaa-bbbb-4ccc-8ddd-000000000005
+     config:                           # only what this machine has that its pool does not
+       - inline: |
+           apiVersion: v1alpha1
+           kind: HostnameConfig
+           auto: off
+           hostname: node-e
+   ```
+
+The machine's `Provisionable` condition says whether it can be added, and what it waits for if not:
+
+| Reason | Meaning |
+|---|---|
+| `Unreachable` | Nothing answers in maintenance mode at the address. |
+| `NotInMaintenance` | Something answers there that already has a config. |
+| `IdentityMismatch` | The machine there reports another UUID. It is sent nothing. |
+| `ConfigDoesNotFit` | The install disk selector matches none of its disks, or more than one; or the config configures a link it does not have. |
+
+The UUID is what a new machine is trusted by. Its config carries every secret of the cluster, and a machine without a config can prove nothing about itself: keep the network a machine boots on one you trust.
+
+Once it is `Provisionable`, the machine is handed its config, installs itself, reboots and joins. That takes a few minutes; it has three times `spec.rollout.stepTimeout`. A control plane is not done until it is a voting member of etcd.
+
+A machine is only added to a cluster that runs what its spec asks for. If a rollout or an upgrade is due, that goes first, and `RolloutBlocked` says `NotAtRest` until it is done.
+
+### Removing a machine
+
+Set `desiredState: Removed` on its TalosMachine. Deleting the TalosMachine does not remove a machine, and the API server refuses it while the node is in the cluster.
+
+The operator then:
+1. runs your `preNode` hooks, cordons the node and evicts its pods, respecting disruption budgets;
+2. asks the node to reset: it leaves etcd if it is a control plane, wipes Talos's own `STATE` and `EPHEMERAL` partitions, and reboots;
+3. waits until the machine answers in maintenance mode again. That is how it knows the machine no longer holds the cluster's secrets;
+4. deletes its Node from Kubernetes.
+
+`status.removedAt` on the TalosMachine says it is done, and the TalosMachine can then be deleted. Set `desiredState` back to `Present` instead and the machine, which waits in maintenance mode, is added again.
+
+No disk but Talos's own system disk is touched, and of that only the two partitions. What your workloads kept on other disks is still there; taking a storage daemon out of service before the node goes is a `preNode` hook's job.
+
+### Replacing a control plane
+
+A control plane is only taken out while at least three voting members of etcd remain: with two, the loss of one more is the loss of the cluster. On three control planes a removal is therefore refused (`RolloutBlocked`, `QuorumAtRisk`), and a replacement is done by declaring the new machine and marking the old one `Removed`, in the same commit if you like. The operator adds the new one first, and takes the old one out once the new one votes.
+
+There is no way to shrink a control plane below three with this operator, and the only control plane of a cluster cannot be removed.
+
+### A machine that died
+
+A machine that does not answer is not guessed about. Its removal starts, takes nothing from the cluster, and halts after `spec.rollout.stepTimeout` with the reason `NodeUnreachable`. If the machine is only switched off, switch it on and retry. If it is gone for good, say so:
+
+```bash
+kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/confirm-dead=<token>
+```
+
+The token is in `status.operation.failure`. The operator then takes the machine's member out of etcd through another control plane, deletes its Node, and asks the machine nothing more. A dead member has no vote to lose, so this works on three control planes, and it is what makes room for a replacement.
+
+**Nothing on a dead machine is wiped.** If it is ever switched on again as it is, it comes up with the cluster's secrets and tries to rejoin. Wipe it first.
+
 ## Monitoring
 
 The operator exports what it knows as metrics, and the chart brings alerts on them and a Grafana dashboard. An operation that has failed and waits for you is the reason to set this up: without it, a halted rollout is only visible to someone who looks at the TalosCluster.

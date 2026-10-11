@@ -104,10 +104,12 @@ var _ = Describe("Adding and removing machines", func() {
 		Expect(k8sClient.Create(ctx, kube)).To(Succeed())
 		Expect(k8sClient.Status().Update(ctx, kube)).To(Succeed())
 
-		Expect(k8sClient.Create(ctx, &coordinationv1.Lease{
+		// A Lease outlives its Node here: the specs' API server has nothing that collects it.
+		err := k8sClient.Create(ctx, &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{Name: m.name, Namespace: nodeLeaseNamespace},
 			Spec:       coordinationv1.LeaseSpec{RenewTime: &metav1.MicroTime{Time: clock}},
-		})).To(Succeed())
+		})
+		Expect(client.IgnoreAlreadyExists(err)).To(Succeed())
 	}
 
 	// declare creates the TalosMachine of a machine.
@@ -646,6 +648,37 @@ var _ = Describe("Adding and removing machines", func() {
 				tc.Status.History[0].Type == talosv1alpha1.OperationConfigRollout
 		})
 		Expect(tc.Status.History[0].Completed).To(ConsistOf(cpA.name, wOne.name))
+	})
+
+	It("adds a machine again that was taken out, once it is asked to be present", func() {
+		start(cpA, wOne, wTwo)
+		remove(wTwo)
+
+		runUntil("the node is reset", func() bool { return sent(fake.MethodReset, wTwo) == 1 })
+		Expect(scenario.Boot(wTwo.addr)).To(BeTrue())
+		runUntil("the machine is gone", done)
+
+		// It waits in maintenance mode, as what it is, and is left there while it is to stay out.
+		scenario.UpdateNode(wTwo.addr, func(n *fake.Node) {
+			n.MachineType, n.Nodename, n.MachineStatus = fake.TypeWorker, wTwo.name, talos.MachineStatus{Stage: stageRunning, Ready: true}
+		})
+		clock = clock.Add(10 * time.Minute)
+		settle(nil)
+		Expect(sent(fake.MethodMaintenanceApply, wTwo)).To(BeZero())
+		Expect(machineCondition(wTwo, talosv1alpha1.ConditionProvisionable).Status).To(BeEmpty(), "a machine that is to stay out is not asked")
+
+		tm := get(wTwo)
+		tm.Spec.DesiredState = talosv1alpha1.DesiredStatePresent
+		Expect(k8sClient.Update(ctx, tm)).To(Succeed())
+
+		runUntil("the machine is handed its config", func() bool { return sent(fake.MethodMaintenanceApply, wTwo) == 1 })
+		boots(wTwo)
+		runUntil("the machine is a member again", done)
+
+		tm = get(wTwo)
+		Expect(tm.Status.RemovedAt).To(BeNil())
+		Expect(tm.Status.JoinedAt).NotTo(BeNil())
+		Expect(tm.Status.Phase).To(Equal(talosv1alpha1.MachinePhase("Ready")))
 	})
 
 	It("replaces a control plane: the old one stays until the new one is a member", func() {

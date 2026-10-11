@@ -368,7 +368,9 @@ spec:
   hold: false                         # exclude from rollouts (Omni's "locked")
 
 status:
-  phase: Pending | AwaitingIdentity | Provisioning | Joining | Ready | Updating | Draining | Rebooting | Removing | Failed
+  phase: Pending | AwaitingIdentity | Provisioning | Joining | Ready | Draining | Removing | Removed
+  joinedAt: …                         # when it was first found to be a member; never unset (§7.6)
+  removedAt: …                        # when the operator finished taking it out; unset when it is added again (§7.7)
   identity: { systemUUID, nodeID, hostname, kubernetesNodeName }
   talos: { version, schematicID, bootID, stage, ready }
   kubelet: { version }
@@ -382,8 +384,10 @@ status:
     diff: |                           # redacted, per document; this is what an approval is reviewed against
       …
   etcd: { memberID, isLearner }
-  conditions: […]                     # Matched, ConfigMatchesLive, NodeObserved
+  conditions: […]                     # Matched, ConfigMatchesLive, NodeObserved, Provisionable
 ```
+
+A machine is a **member** from `joinedAt` until `removedAt`. Only members are rolled out to, upgraded, and counted by the adoption proof. A machine that is declared and has not joined, or has left, holds nothing up: for it the conditions above say `NotAMember`, and `Provisionable` says whether it could be added and, if not, what it waits for (§7.6).
 
 `NodeObserved` says whether the node's state was read in the last pass, and names what was not. Status never shows a moment that has passed as the present: `talos.stage`, `talos.ready`, `talos.bootID` and `config.liveHash` are empty unless they were read in the last pass, and a machine is `Ready` only on what its node said in that pass. A boot ID that survived a failed read would say that no reboot happened. Facts that rarely change (version, schematic, identity, etcd member) keep their last value, which is more use than nothing while a node is away.
 
@@ -393,7 +397,7 @@ status:
 - Immutable fields stay immutable: a pool's `clusterRef` and `role` cannot change (CRD CEL).
 - `upgrades` and `membership` can be `Enabled` only with `config: Manage` (CRD CEL).
 - `config` may become `Manage` only while the **stored** status shows `ConfigProven=True` (policy `…-management-gate`). A spec update cannot carry its own status, so the gate reads `oldObject.status`. `Adopted` is kept current by the proof (§7.1 stage 3): any live or spec change since the proof sets it False. Once managed, a later invalidated proof does not lock the spec.
-- A TalosMachine cannot be **deleted while still `Present`** unless annotated `talos.jarensaa.github.io/orphan: "true"` (policy `…-deletion-guard`). This guards against a GitOps prune or a namespace deletion silently dropping a machine. `desiredState: Removed` is how a node leaves (§7.7).
+- A TalosMachine cannot be **deleted while its node is in the cluster** unless annotated `talos.jarensaa.github.io/orphan: "true"` (policy `…-deletion-guard`). That is while it is `Present`, and while it is `Removed` and a member still: `status.joinedAt` without `status.removedAt`. This guards against a GitOps prune or a namespace deletion silently dropping a machine, and against a commit that asks for a removal and deletes the resource at once, which would leave a node nobody describes. `desiredState: Removed` is how a node leaves (§7.7). There is no finalizer: the API server keeps the resource by itself, the operator running or not.
 - **In-use objects are protected by the finalizer `talos.jarensaa.github.io/in-use`**, the way Kubernetes protects bound PVCs. Their `InUse` condition says what holds them. A TalosMachineConfig stays while anything references it, and a pool while it has members. Deletion completes once they are unreferenced. If the operator is down, the deletion waits, which is the safe direction.
 - **A missing reference fails closed.** A `configRef` or `secretKeyRef` that does not resolve sets `ConfigMatchesLive=False` (`ConfigUnresolved`) on every affected machine, and no rollout touches them.
 - **No two machines act on one node.** This is enforced by the controller, failing closed, because admission cannot see other objects. Machines claiming the same systemUUID are both `Matched=False` (`Conflict`) and never acted on. A duplicate address with a different UUID fails the hardware check at that address.
@@ -748,38 +752,64 @@ It exits 1 when something is wrong and prints what; on GitHub Actions each probl
 
 **What decides the order of things** stays as it was: one operation at a time (§8.1), a failed operation halts until a human acts (§8.3), and nothing starts outside a window.
 
-### 7.6 Expanding the cluster (R4)
+### 7.6 Adding machines (R4)
 
-The user creates a `TalosMachine` with `poolRef`, `address` and `identity.systemUUID`, for a machine booted into maintenance mode. The pool supplies the role and the shared config, so a node that differs from its pool in nothing needs no config of its own.
+> **Built** (M7). `plan.PlanJoin`, `plan.NextJoinStep`, `internal/controller/membership.go`.
 
-1. **Probe** with an insecure maintenance client (`client.WithMaintenanceMode`). Require `MachineStatus.stage == maintenance`.
-2. **Verify identity.** Read `SystemInformation` over the same TLS session. If the UUID does not equal `spec.identity.systemUUID`, refuse and set `AwaitingIdentity`. Also record the disks (`storage.Disks`) and links (`LinkStatus`). The disk selector must match exactly one disk, which catches Talos's "first match wins" behaviour. Every link named in the rendered config must exist.
-   - If `identity` is empty, the operator only reports what it found (UUID, serial, disks, links) in status. It **never applies config to an unpinned machine**: the config carries every cluster secret, and maintenance mode is TOFU.
-3. **Gates.**
-   - Workers: cluster healthy.
-   - Control planes: take the disruption lock; etcd healthy with all members started and no learners; **the rendered hostname must not collide with an existing etcd member** (Talos would evict that member: `etcd.go:315`).
-4. **Apply** the rendered config with `ApplyConfiguration`. Expect `Unavailable`/`Canceled` afterwards while apid restarts with mTLS.
-5. **Wait for install.** Switch to the mTLS client. Wait for `UnattendedInstallStatus == installed`, the reboot if the config requests one, and then `MachineStatus` Running+Ready.
-6. **Join.**
-   - Control planes: the etcd member appears, then the learner is promoted (`IsLearner=false`). Then the etcd consistency check and CP static pods Ready.
-   - Workers: kubelet healthy.
-7. **Done.** The Node is Ready, then gates pass. Phase becomes `Ready`.
+The user creates a `TalosMachine` with `poolRef`, `address` and `identity.systemUUID`, for a machine booted into maintenance mode. The pool supplies the role and the shared config, so a node that differs from its pool in nothing needs no config of its own. Nothing happens while `spec.management.membership` is not `Enabled`: the machine is not even asked who it is.
 
-**Concurrency:** CP additions go one at a time (etcd allows one learner). Worker additions may run in parallel and are non-disruptive, so they do not take the lock. The design note "3→5 voters in two serialized steps" is enforced by the planner.
+**Who is talked to.** A machine in maintenance mode has no config, so no certificate anyone could check, and it takes a config from whoever hands it one. It is reached over a connection of its own (`talos.Maintenance`): to its address, without the cluster's credentials, good for reading its hardware and for handing it a config and nothing else. The connection remembers the key of whoever answered first and talks to nobody else afterwards, so the machine that said who it is and the machine that is sent the config are the same one, as far as an unauthenticated connection can tell.
 
-**Stretch alternatives** that remove TOFU:
+**Whether it can be added** is the machine's own controller's to say, in the condition `Provisionable`:
+- it waits in maintenance mode at the address (`MachineStatus.stage == maintenance`);
+- the UUID it reports is the pinned one. If not, the phase is `AwaitingIdentity` and the machine is sent nothing: the config carries every secret of the cluster;
+- the config rendered for it fits it. Its install disk selector must match exactly one of the machine's disks, by Talos's own matching (`blockhelpers.MatchDisks`): Talos installs to the first match without a word. Every physical link the config configures by name must exist.
+
+**The operation** (`AddMachine`) takes the lock like every other, and adds one machine at a time, workers before control planes. It only starts while:
+- the cluster is at rest: `ConfigInSync`, `TalosUpToDate` and `KubernetesUpToDate` say there is nothing to roll out. A machine joins on what its spec renders, and that must be what its peers run. A rollout or upgrade that is due goes first;
+- the whole cluster is healthy, nobody left out, no config pending anywhere, etcd with no learner (`plan.JoinGate`);
+- the hostname its config gives it is nobody's. A control plane that joins under the name of an etcd member has that member removed by Talos itself (`etcd.go:310-318`). A config that leaves the machine to name itself cannot collide this way.
+
+A machine's turn:
+1. **Provisioning.** The machine is asked again, in this pass, over one connection: in maintenance mode, the pinned identity, the config fits. Then it is handed exactly the config that was planned, on that connection (`ApplyConfiguration`, mode `NO_REBOOT`, the one mode that makes a machine without a config take one). A machine that says it is another one fails the operation at once.
+2. **Joining.** The machine installs itself and reboots; nothing answers for a while. It is a member once a node answers with the cluster's credentials and the pinned identity, has finished booting, has a Node that is Ready, and, for a control plane, is a voting member of etcd. It has three step timeouts for that.
+3. **Verifying.** The whole cluster, the new node included, healthy for the soak (`plan.VerifyGate`).
+
+A machine that was handed its config is never handed one again: a resumed step sees a member, and moves on. A failed turn halts the operation (§8.3). `abort` and `skip-machine` record the config the machine was to get (`status.membership.add`), and it is not added with that config again.
+
+**Not built:** adding several workers at once (the earlier plan; one at a time is the rule for every operation, §12.19); finding machines instead of declaring them; reporting what was found at an address whose identity is not pinned (`identity` is required).
+
+**Stretch alternatives** that remove trust on first use:
 - serving configs via `talos.config=` URLs keyed by UUID (pull model);
 - SideroLink.
 
-### 7.7 Removal and replacement
+### 7.7 Removing and replacing machines
 
-`desiredState: Removed` triggers removal. Deleting the CR without that is refused unless it is explicitly orphaned.
+> **Built** (M8). `plan.PlanRemoval`, `plan.NextRemovalStep`, `plan.RemovalGate`.
 
-1. **Gates.** For a CP: the remaining voters must number at least 3, unless `…/allow-reduced-quorum` is set. Remaining members must be healthy. For a **replacement**, the planner requires the new CP to be `Ready` before the old one is removed.
-2. **Drain.** Cordon, then drain with a bounded timeout. Ceph gates and hooks run first; the OSD out/purge is a hook, not built in.
-3. **Leave.** For a CP: forfeit leadership, then graceful `Reset` (which leaves etcd itself). Wipe only `STATE` and `EPHEMERAL`, **never user disks unless they are listed explicitly**.
-   - If the node is dead, use `EtcdRemoveMemberByID` from a healthy peer, gated by `…/node-is-dead` confirmation.
-4. **Clean up.** Delete the Kubernetes Node object and remove the finalizer.
+`desiredState: Removed` asks for a machine to leave. Deleting the resource does not: the API server refuses that while the node is in the cluster (§5.4).
+
+**The operation** (`RemoveMachine`) takes the lock, and takes out one machine at a time: workers first, the node the operator itself runs on last. Removals are considered before anything else: a node that is to go is not upgraded first, and one that ails can be taken out without waiting for the rollout it holds up. It only starts while every *other* node is healthy (`plan.TouchGate`), and for a control plane while etcd can spare it (`plan.RemovalGate`):
+- the only voting member is never taken out;
+- a member is only taken out if at least three voting members remain. With two left, losing one more loses the cluster;
+- there is no override. A cluster of three control planes is not shrunk by this operator.
+
+**A replacement** is those two rules and the order of things: the removal of a control plane that would leave too few is refused, the new machine is added (§7.6), and the old one then goes. One commit can ask for both.
+
+A machine's turn:
+1. **Draining.** Cordon, then evict through the eviction API, within the drain timeout; `preNode` hooks ran before (taking a storage daemon out of service is the user's hook, §6.4). A machine whose Talos API does not answer is not drained: what cannot be reset afterwards is left as it is.
+2. **Resetting.** A control plane hands off etcd leadership. Then one `Reset`: graceful (the node leaves etcd itself), wiping the `STATE` and `EPHEMERAL` partitions of the system disk, with a reboot. The connection that sends it (`talos.Remover`) lets no other reset through: not of the whole system disk, not of any other disk, whoever builds the request.
+3. **Leaving.** The machine is gone when it is seen to be: its member is out of etcd, and the machine answers in maintenance mode again at its address, with its identity. That is the proof that it forgot the cluster, and why the reset reboots instead of powering off.
+4. **Deleting.** The machine's Node is deleted, which Talos does not do.
+5. **Verifying.** What is left of the cluster, healthy for the soak. `status.removedAt` is set, and the TalosMachine may be deleted.
+
+**A machine that does not answer** is not judged. Its removal begins, takes nothing from the cluster, and halts when the machine has not answered for a step timeout (`NodeUnreachable`); a machine that was reset and does not come back halts it too (`NotWiped`). A human then says which it is. `talos.jarensaa.github.io/confirm-dead=<token>` on the TalosCluster says the machine is gone for good: it is asked nothing more, its etcd member is removed through another control plane (`EtcdRemoveMemberByID`), and its Node is deleted. Nothing on the machine is wiped, because nothing can be, so it must not be switched on again as it is. A dead member holds no vote that could be lost, so the three-voter rule does not stand in the way of taking it out, which is what makes room for its replacement.
+
+The cluster's discovery goes on listing a machine for a while after it left. One that was taken out and does not answer is not counted as a member that could not be read; one that answers again is a member again, and is taken out again.
+
+**What is wiped:** Talos's own `STATE` and `EPHEMERAL`, on the system disk, and nothing else. Naming other disks to wipe is not built.
+
+**Not built:** shrinking the control plane below three; a reset that is not graceful, for a control plane that answers and cannot leave etcd by itself; wiping user disks.
 
 ### 7.8 Greenfield bootstrap (lower priority, M9)
 
@@ -799,12 +829,13 @@ These are enforced in `internal/plan` and exhaustively table-tested.
 
 1. At most **one disruptive operation** per cluster: `status.operation` is the lock.
 2. At most **one CP** is not Ready or not a healthy etcd member at any time. The gate of a config rollout holds every node to this, workers included: a node is touched only while every other node is healthy (§6.3).
-3. etcd membership never goes 3→2 without an override. There is never more than one learner, and never two membership changes at once.
+3. A control plane only leaves etcd while three voting members remain, unless a human confirmed it dead; there is no other override. There is never more than one learner, and never two membership changes at once: adding and removing each hold the lock, for one machine at a time (`plan.RemovalGate`, `plan.JoinGate`).
 4. No disruptive step starts outside a maintenance window. An in-flight node step started inside a window finishes, but the next node waits.
 5. No disruptive step starts while `paused`, while `operation.failure` is set, or while any gate is false.
 6. No mutation happens for a capability that is not enabled in `spec.management`. Before `config: Manage`, controllers only hold a read-only Talos client interface, so writes are impossible by construction.
 7. Protected config fields never change.
-8. The operator never applies config to a machine whose identity is not pinned.
+8. The operator never applies config to a machine whose identity is not pinned, and hands a machine in maintenance mode its config only when the machine said, in that pass and on that connection, that it is the one declared (`plan.NextJoinStep`).
+9. A machine is only reset the way a removal resets it, and its Node is only deleted once the machine is seen to have forgotten the cluster or a human confirmed it dead.
 
 ### 8.2 Bounded everything
 Every wait has a timeout: drain, pull, install, reboot, static pod, kubelet, etcd promotion. A timeout is a failure, never a skip.
@@ -953,6 +984,8 @@ Task beads under a milestone are cut when the milestone starts, for the same rea
 | **M5 Kubernetes upgrades** | A version change takes the components Talos runs there, one component on one node at a time, every API server first, a minor at a time; refused up front when the nodes' Talos does not run the version or when it would strand a flag or an object (§7.4) | v0.8.0 |
 | **M6 Version awareness** | Status plans the upgrades to what the spec asks for and, where the operator is told to ask upstream, says which Talos and Kubernetes releases exist; an upgrade to an installer or image that does not exist is then refused before a node pulls; a `validate` command checks a repository's manifests before they are merged; an example bot configuration (§7.5) | v0.9.0 |
 | **M10a The operator's state as metrics** | What status says, exported at every scrape by every replica: an operation in flight or halted, what holds a change back, drift, nodes that cannot be read, etcd membership. The chart installs a ServiceMonitor, alerts and a Grafana dashboard where the cluster has the Prometheus Operator's API (§14.2) | v0.10.0 |
+| **M7 Adding machines** | A declared machine that waits in maintenance mode joins as a worker or a control plane, once it says it is the hardware that was declared and its config fits it; one at a time, on a cluster at rest (§7.6) | v0.11.0 |
+| **M8 Removing and replacing machines** | A machine marked `Removed` is drained, reset, seen to have forgotten the cluster, and its Node deleted; a control plane only while three voters remain, which makes a replacement an addition followed by a removal; a dead machine after a human confirms it (§7.7) | v0.11.0 |
 
 ### What every remaining milestone builds on
 
@@ -983,22 +1016,11 @@ It is postponed on purpose (decided 2026-10-10). While no cluster depends on the
 - **Out of M5:** anything Talos does not run itself (CNI, CSI, workloads), the manifests it applies at bootstrap (§12.20), and rolling a Kubernetes upgrade back. A failed upgrade halts and is fixed forward; the one component that was being changed goes back by itself.
 - **Not built in M4:** more than one worker at a time, a rollback to the previous boot slot on request (§12.19), and reinstalling a node for a change only an install can make, which stays refused (`RequiresReinstall`) and belongs with replacing machines (M8).
 
-### M7 Adding machines
+### M7 and M8, as delivered
 
-Declaring a machine that waits in maintenance mode makes it join the cluster, as a worker or a control plane, once its hardware is the hardware that was declared.
-- In: refusing a machine whose identity does not match, or is not declared, without sending it anything; checking that the rendered config fits the machine before sending it; control planes joining one at a time, with etcd whole in between; the `membership` switch.
-- Out: getting the machine to boot; finding machines by itself (M9).
-- **Done when:** a worker is added on QEMU; the control plane grows; a machine with the wrong identity is refused and received nothing.
-- **To decide:** whether the identity pin is enough. The config carries every cluster secret, and a machine in maintenance mode is whoever it says it is. §12.3 says the pin suffices for v1; this is the milestone to revisit that in.
-- Needs M3 only. It can move ahead of M4–M6 if a node is needed sooner.
-
-### M8 Removing and replacing machines
-
-Marking a machine as removed takes it out of the cluster cleanly. A control plane is replaced without the cluster ever having fewer healthy voters than it started with. A machine that is already dead can be removed after an explicit confirmation.
-- In: draining; keeping etcd whole and refusing a removal that would not; cleaning up what Kubernetes still holds of the node; a stated rule for what is wiped on the machine.
-- Out: taking storage out of service. What runs on the node (Ceph OSDs) stays with the user and the hooks of M4c. Disks other than Talos's own are never wiped unless named.
-- **Done when:** a control plane is replaced on QEMU with etcd healthy throughout; a removal below three voters is refused; a dead worker is removed after confirmation.
-- Needs M7 for replacement and M4 for draining.
+- **Shown:** the planners' rules as tables and as sweeps over every combination of what can be observed (a config is only handed to a machine that just said it is the one; nothing is taken while a gate is closed; a node is reset once, and only while it answers; an etcd member is removed from the outside only for a machine called dead). Against the fake: a worker added, a control plane added and not done before it votes, a wrong identity sent nothing, a control plane replaced, a removal out of three refused, a dead worker and a dead control plane taken out after confirmation. On QEMU: a machine in maintenance mode added as a worker after being refused under a wrong identity, taken out again and found waiting in maintenance mode, the removal of a control plane the cluster cannot spare refused, a machine that was cut off for good taken out after confirmation; and on three control planes, one replaced with three voters throughout.
+- **The identity pin stays the trust** (§12.3, §12.25). What was added to it: the config goes out on the connection, and to the key, that the identity was read from.
+- **Out of both:** getting a machine to boot; finding machines; shrinking the control plane; wiping other disks; taking storage out of service (the user's hooks).
 
 ### M10 Observability
 
@@ -1030,10 +1052,9 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 ### Suggested order
 
 1. The real cluster, when its owner decides the API has settled enough to depend on.
-2. M7, then M8.
-3. M10b, M11, and whatever of M9 has earned it.
+2. M10b, M11, and whatever of M9 has earned it.
 
-R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
+R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7 and M8.
 
 ### Testing strategy
 - **Pure unit tests** for planners (invariant tables), render/diff/patch derivation (golden files from real-shaped multi-doc configs with throwaway secrets), and compatibility ordering.
@@ -1111,6 +1132,7 @@ Decided 2026-10-08:
 22. **The operator may ask upstream what exists, only that, and only when told to** (decided 2026-10-11, with M6). Knowing which releases exist is what turns "the image could not be pulled" on the first node into a refusal before any node, and what lets a hop over several Kubernetes minors use a release with its fixes. The price is that the operator talks to something other than its cluster, and to services that are not this project's. How others do it: Omni lists the releases of Image Factory and scans a registry for Kubernetes tags every fifteen minutes, by default, and filters them with the compiled-in compatibility rules; OpenShift's version operator and the k3s upgrade controller ask an update service or a channel server; kubeadm asks the Kubernetes release site. Each of them asks a service its own project runs. tuppr, the one that like this operator is a third party to Talos, asks nothing: the version is what the resource says, a bot proposes it, and a release that does not exist fails at the pull. So asking is **off by default** (`versionSources.enabled`), and switching it on is the cluster owner's decision to use those services. Where it is on it is kept small: reads only, HTTPS only, a handful of requests every six hours, identified by a User-Agent, never during an operation. What it learns can refuse an upgrade and can choose a release on the way to the version asked for; it can never choose the version. The services asked are Image Factory, the Kubernetes release site and the registries the cluster's nodes pull from anyway. Image Factory's API reference documents the routes used as public; neither it nor the Kubernetes release site publishes terms for its use that were found, `registry.k8s.io` is a volunteer-run service that asks heavy users to mirror, and GitHub's acceptable use policy forbids burdening its servers by automation without naming a limit. Nothing was found that forbids these requests, and nothing that grants them either. The `validate` check asks the same services by default: it runs once for a pull request, beside the bot that proposed the change by asking them too. It is a subcommand of the operator's own binary, so that the image a cluster runs is the image that checks its manifests. **Not kept: a compatibility matrix of this project's own.** The rules (what runs what, which steps are allowed, what a release removed) are machinery's and go-kubernetes's, compiled in, and the removed kubelet flag the e2e uses is found by them. A table of the newest release of each minor, built in and refreshed by a bot, would let an operator that asks nothing go through a better release than `.0`; it is not built.
 23. **Backups are the owner's** (decided 2026-10-11). The earlier plan had the operator take etcd snapshots on a schedule and before every control-plane operation, encrypt them and ship them to object storage. That is a backup product inside an upgrade operator: storage, credentials from outside the cluster, encryption keys that must outlive the cluster, retention, and a restore that has to be rehearsed to be worth anything, which the operator cannot perform on the cluster it runs in. Whoever runs a cluster already answers for backing up what is on it, and has tools for it; a second, partial answer in the operator would be the one nobody tests. So the operator takes no snapshot and no other backup. What it owes the owner is not to cause the loss (§8), and a place to hang their own snapshot before an operation: a `preRollout` hook (§6.4).
 24. **Metrics are the status, read when scraped, and monitoring is installed where there is a Prometheus** (decided 2026-10-11, with M10a). The operator keeps no metric of the cluster's state beside the status it writes: a collector reads the resources at every scrape. Gauges set by the controllers would be the leader's alone, would outlive the resource they describe, and could drift from the status. The price is that nothing is exported that is not in status. The chart cannot ask whether a Prometheus is running, but it can see whether the cluster has the Prometheus Operator's API, and installs its ServiceMonitor, rules and dashboard exactly then (`auto`); a cluster without it gets none of the three, and a value forces either way. A chart finds this out when it is installed or upgraded, so a Prometheus that arrives later is picked up by the next upgrade. Grafana has no API to be told by, so the dashboard goes by the same sign: it is a ConfigMap, which does no harm unread. A Prometheus only reads what its selectors match, which the chart cannot know: `monitoring.labels` is where the owner says it.
+25. **Machines are added and removed like everything else is done, and a machine that left has to be seen to have left** (decided 2026-10-11, with M7 and M8). The earlier plan let workers join in parallel, outside the lock; one machine at a time through the one driver is the rule (§12.19), and a second way of doing things would have been a second set of invariants. The identity pin remains what a new machine is trusted by (3): a machine in maintenance mode can prove nothing, so what can be had is that the pinned identity is read in the very pass, and over the very connection and key, that the config then goes out on. A removal resets with a reboot and is done when the machine answers in maintenance mode again: a machine that was only asked to wipe itself may not have, and it holds the cluster's CA keys. For the same reason a machine that does not answer is never guessed about; a human says it is dead, with the token of that one failure. A control plane leaves only while three voters remain and there is no override: shrinking a control plane is rare, and an annotation that makes a quorum loss a typo away is not worth having for it. A TalosMachine is kept from deletion by the API server until `removedAt`, where the plan had a finalizer: a finalizer needs the operator to be there to let go. Only Talos's own two partitions are wiped.
 
 ## 13. Prior art summary
 
