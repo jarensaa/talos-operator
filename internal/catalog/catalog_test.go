@@ -208,7 +208,7 @@ func TestHTTP(t *testing.T) {
 func TestHTTPTellsAnOutageFromAnAbsence(t *testing.T) {
 	u := &upstream{status: http.StatusBadGateway}
 	base := u.serve(t)
-	h := &HTTP{KubernetesReleases: base}
+	h := &HTTP{KubernetesReleases: base, pause: noPause}
 	ctx := context.Background()
 
 	for name, err := range map[string]error{
@@ -229,8 +229,121 @@ func TestHTTPTellsAnOutageFromAnAbsence(t *testing.T) {
 	}
 
 	gone := "http://127.0.0.1:1"
-	if err := (&HTTP{}).Installer(ctx, gone, "metal", schematic, "v1.14.2"); err == nil || errors.Is(err, ErrNotFound) {
+	if err := (&HTTP{pause: noPause}).Installer(ctx, gone, "metal", schematic, "v1.14.2"); err == nil || errors.Is(err, ErrNotFound) {
 		t.Errorf("unreachable: got %v", err)
+	}
+}
+
+// noPause is the wait between two attempts of a test that does not look at it.
+func noPause(context.Context, time.Duration) error { return nil }
+
+// One connection that is not made, or one answer of a server that is unwell, is not what is
+// known about upstream: the check a repository runs would fail on a moment's trouble somewhere
+// else. A request is sent again, a few times and with a pause. An answer about what was asked
+// for is final.
+func TestHTTPAsksAgainWhenARequestFailsOnTheWay(t *testing.T) {
+	unwell := func(w http.ResponseWriter) { w.WriteHeader(http.StatusServiceUnavailable) }
+	broken := func(w http.ResponseWriter) {
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close() //nolint:errcheck // a test server
+		}
+	}
+	status := func(code int) func(http.ResponseWriter) {
+		return func(w http.ResponseWriter) { w.WriteHeader(code) }
+	}
+
+	for _, tc := range []struct {
+		name string
+		// fail answers the first failures requests; the ones after get the release.
+		fail     func(http.ResponseWriter)
+		failures int
+		gaveUp   bool
+
+		asked    int
+		pauses   []time.Duration
+		want     string
+		notFound bool
+	}{
+		{name: "a server that is well", asked: 1, want: "1.37.1"},
+		{name: "a server that is unwell once", fail: unwell, failures: 1, asked: 2, pauses: []time.Duration{retryWait}, want: "1.37.1"},
+		{
+			name: "a server that is unwell twice", fail: unwell, failures: 2,
+			asked: 3, pauses: []time.Duration{retryWait, 2 * retryWait}, want: "1.37.1",
+		},
+		{name: "a server that stays unwell", fail: unwell, failures: 9, asked: attempts, pauses: []time.Duration{retryWait, 2 * retryWait}},
+		{name: "a connection that breaks", fail: broken, failures: 1, asked: 2, pauses: []time.Duration{retryWait}, want: "1.37.1"},
+		{name: "a release that is not there", fail: status(http.StatusNotFound), failures: 9, asked: 1, notFound: true},
+		{name: "a server that says to ask less often", fail: status(http.StatusTooManyRequests), failures: 9, asked: 1},
+		{name: "a server that says no", fail: status(http.StatusForbidden), failures: 9, asked: 1},
+		{name: "a caller that has given up", fail: unwell, failures: 9, gaveUp: true, asked: 1, pauses: []time.Duration{retryWait}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu    sync.Mutex
+				asked int
+			)
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				mu.Lock()
+				asked++
+				failing := asked <= tc.failures
+				mu.Unlock()
+
+				if failing {
+					tc.fail(w)
+
+					return
+				}
+
+				_, _ = w.Write([]byte("v1.37.1\n")) //nolint:errcheck // a test server
+			}))
+			t.Cleanup(srv.Close)
+
+			var pauses []time.Duration
+
+			h := &HTTP{KubernetesReleases: srv.URL, pause: func(_ context.Context, d time.Duration) error {
+				pauses = append(pauses, d)
+
+				if tc.gaveUp {
+					return context.Canceled
+				}
+
+				return nil
+			}}
+
+			got, err := h.KubernetesLatest(context.Background(), "1.37")
+
+			if got != tc.want || (err == nil) != (tc.want != "") || errors.Is(err, ErrNotFound) != tc.notFound {
+				t.Errorf("got %q, %v", got, err)
+			}
+
+			if asked != tc.asked || !slices.Equal(pauses, tc.pauses) {
+				t.Errorf("asked %d times with pauses %v, want %d and %v", asked, pauses, tc.asked, tc.pauses)
+			}
+		})
+	}
+}
+
+// A redirect that is refused is refused every time.
+func TestHTTPDoesNotAskAgainAfterARefusedRedirect(t *testing.T) {
+	asked := 0
+
+	redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked++
+
+		http.Redirect(w, r, "http://releases.example.com/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(redirecting.Close)
+
+	h := &HTTP{KubernetesReleases: redirecting.URL, pause: func(context.Context, time.Duration) error {
+		t.Error("waited to ask again")
+
+		return nil
+	}}
+
+	if _, err := h.KubernetesLatest(context.Background(), "1.37"); err == nil || !errors.Is(err, errRedirect) || asked != 1 {
+		t.Errorf("asked %d times, got %v", asked, err)
 	}
 }
 
