@@ -89,8 +89,10 @@ hooks-remove: ## Remove the git hooks again.
 # CI runs test-unit directly: it checks modules, generated code and formatting with `make committed`,
 # and golangci-lint already runs vet.
 .PHONY: test-unit
+# The controllers' specs take most of go's ten minutes for one package on a laptop, and more on a
+# runner that is busy: the limit is theirs, set where it can be seen.
 test-unit: setup-envtest ## Run unit and envtest tests only.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -timeout 20m -coverprofile cover.out
 
 # e2e runs against a disposable QEMU Talos cluster (docs/dev/e2e.md).
 # The QEMU provisioner needs root on macOS, so e2e-cluster-up/down prompt for sudo.

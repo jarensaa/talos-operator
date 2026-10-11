@@ -145,7 +145,7 @@ func (r *TalosClusterReconciler) operate(ctx context.Context, tc *talosv1alpha1.
 
 	reportMembership(tc, obs, all)
 
-	return nil
+	return r.defragment(ctx, tc, obs, pools, machines)
 }
 
 // forgetHandover drops the handover state when config returns to Observe, so entering Manage

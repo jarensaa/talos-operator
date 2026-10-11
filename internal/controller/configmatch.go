@@ -154,7 +154,7 @@ func renderMachine(ctx context.Context, c client.Reader, tc *talosv1alpha1.Talos
 		return nil, resolved, err
 	}
 
-	in, err := adopt.RenderInput(&tc.Spec, &pool.Spec, bundle, resolved.contents)
+	in, err := adopt.RenderInput(&tc.Spec, &pool.Spec, &tm.Spec, bundle, resolved.contents)
 	if errors.Is(err, adopt.ErrIncompleteSpec) {
 		return nil, resolved, &configProblem{
 			metav1.ConditionUnknown, talosv1alpha1.ReasonPreconditionUnmet, "TalosCluster " + tc.Name + ": " + err.Error(),

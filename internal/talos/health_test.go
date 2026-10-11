@@ -43,9 +43,11 @@ func TestCheckUpkeep(t *testing.T) {
 	}{
 		{"defragment", machineapi.MachineService_EtcdDefragment_FullMethodName, &emptypb.Empty{}, true},
 		{"forfeit leadership", machineapi.MachineService_EtcdForfeitLeadership_FullMethodName, &machineapi.EtcdForfeitLeadershipRequest{}, true},
-		{"listing alarms", machineapi.MachineService_EtcdAlarmList_FullMethodName, &emptypb.Empty{}, true},
 		{"reading logs", machineapi.MachineService_Logs_FullMethodName, nil, true},
-		// An alarm that is disarmed without its cause being gone is an alarm that is hidden.
+		// An alarm that is disarmed without its cause being gone is an alarm that is hidden. And
+		// nothing here has a use for the list of them: an operator inside the cluster can write
+		// nothing down while etcd has one raised (docs/scope.md §14.6).
+		{"listing alarms", machineapi.MachineService_EtcdAlarmList_FullMethodName, &emptypb.Empty{}, false},
 		{"disarming alarms", machineapi.MachineService_EtcdAlarmDisarm_FullMethodName, &emptypb.Empty{}, false},
 		{"removing a member", machineapi.MachineService_EtcdRemoveMemberByID_FullMethodName, &machineapi.EtcdRemoveMemberByIDRequest{}, false},
 		{"leaving etcd", machineapi.MachineService_EtcdLeaveCluster_FullMethodName, &machineapi.EtcdLeaveClusterRequest{}, false},
@@ -142,26 +144,10 @@ func TestMachineryReadsWhatTalosSaysAboutANode(t *testing.T) {
 	}
 }
 
-func TestMachineryReadsEtcdAlarmsAndLogs(t *testing.T) {
+func TestMachineryReadsTheEndOfLogs(t *testing.T) {
 	api, c := serve(t, dial(accessReadOnly)...)
 	r := reader(c)
 	ctx := context.Background()
-
-	alarms, err := r.EtcdAlarms(ctx, apiNode)
-	if err != nil || alarms == nil || len(alarms) != 0 {
-		t.Fatalf("no alarms is an empty list, not an unknown one: got %#v, %v", alarms, err)
-	}
-
-	api.alarms = []*machineapi.EtcdMemberAlarm{
-		{MemberId: 0xa1, Alarm: machineapi.EtcdMemberAlarm_NOSPACE},
-		{MemberId: 0xb2, Alarm: machineapi.EtcdMemberAlarm_CORRUPT},
-		{MemberId: 0xc3, Alarm: machineapi.EtcdMemberAlarm_NONE},
-	}
-
-	alarms, err = r.EtcdAlarms(ctx, apiNode)
-	if err != nil || !slices.Equal(alarms, []EtcdAlarm{{MemberID: 0xa1, Type: AlarmNoSpace}, {MemberID: 0xb2, Type: AlarmCorrupt}}) {
-		t.Fatalf("got %+v, %v", alarms, err)
-	}
 
 	api.logs = map[string][]string{
 		"kubelet": {"first line\nsecond", " line\n"},

@@ -136,6 +136,7 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	r.applyObservation(tc, obs)
 	r.observeVersions(ctx, tc, obs)
+	r.observeCertificates(ctx, tc, obs)
 
 	var adoptErr error
 
@@ -155,6 +156,10 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if adoptErr == nil && managing(tc) {
 		obs.policy, obs.policyChanges = r.policy(ctx, tc)
 		adoptErr = r.manage(ctx, tc, obs)
+
+		if adoptErr == nil {
+			r.collectBundle(ctx, tc, obs)
+		}
 	}
 
 	if !equality.Semantic.DeepEqual(original.Status, tc.Status) {
@@ -476,6 +481,7 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 				facts.etcdErrors = es.Errors
 				facts.etcdStatusRead = true
 				facts.etcdLeader = es.MemberID != 0 && es.MemberID == es.Leader
+				facts.etcdSize, facts.etcdInUse = es.DBSize, es.DBSizeInUse
 			}
 
 			return err

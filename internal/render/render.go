@@ -22,6 +22,7 @@ package render
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 
 	jsonpatch "github.com/evanphx/json-patch"
 	"github.com/siderolabs/talos/pkg/machinery/config"
@@ -66,6 +67,12 @@ type Input struct {
 	DNSDomain string
 	// ClusterDiscovery mirrors `--with-cluster-discovery` (talosctl default: enabled).
 	ClusterDiscovery *bool
+
+	// MetricsAddress, when set on a control plane, is the node's own address: the node then
+	// serves the metrics of etcd on it, and those of the controller manager and the scheduler on
+	// every interface (metricsPatch). It is applied before Patches, so a user's own setting of the
+	// same arguments stands.
+	MetricsAddress netip.Addr
 
 	// Patches are strategic merge patches (multi-document YAML), applied in the order given:
 	// cluster-wide, role, machine, then operator overlays.
@@ -129,7 +136,16 @@ func Generate(in Input) (config.Provider, error) {
 		return nil, fmt.Errorf("generate %s config: %w", in.Role, err)
 	}
 
-	patches := make([]configpatcher.Patch, 0, len(in.Patches))
+	patches := make([]configpatcher.Patch, 0, len(in.Patches)+1)
+
+	if in.MetricsAddress.IsValid() && in.Role == machine.TypeControlPlane {
+		p, err := configpatcher.LoadPatch(metricsPatch(in.Contract, in.MetricsAddress))
+		if err != nil {
+			return nil, fmt.Errorf("the control-plane metrics config: %w", err)
+		}
+
+		patches = append(patches, p)
+	}
 
 	for i, raw := range in.Patches {
 		p, err := configpatcher.LoadPatch(raw)

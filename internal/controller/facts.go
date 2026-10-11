@@ -52,6 +52,9 @@ type nodeFacts struct {
 	etcdStatusRead bool
 	// etcdLeader is true when the node's etcd member leads; like etcdErrors it needs etcdStatusRead.
 	etcdLeader bool
+	// etcdSize is the size of the member's database file and etcdInUse what of it holds data, in
+	// bytes; they too need etcdStatusRead.
+	etcdSize, etcdInUse int64
 	// kubeNode is what the Kubernetes API says about the member's Node; nil when the Nodes were
 	// not read.
 	kubeNode *plan.KubernetesNode

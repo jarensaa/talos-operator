@@ -42,7 +42,6 @@ var readOnlyMethods = map[string]bool{
 	machineapi.MachineService_Version_FullMethodName:        true,
 	machineapi.MachineService_EtcdMemberList_FullMethodName: true,
 	machineapi.MachineService_EtcdStatus_FullMethodName:     true,
-	machineapi.MachineService_EtcdAlarmList_FullMethodName:  true,
 	machineapi.MachineService_Logs_FullMethodName:           true,
 	machineapi.MachineService_Dmesg_FullMethodName:          true,
 	clusterapi.ClusterService_HealthCheck_FullMethodName:    true,

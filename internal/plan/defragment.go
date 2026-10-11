@@ -91,8 +91,11 @@ type Defragment struct {
 	// Pending lists the members to defragment: every control plane, because what fragments one
 	// fragments them all, followers first by name and the leader last.
 	Pending []string
-	// Fragmented says which members are over the threshold, with their numbers.
+	// Fragmented names the members that are over the threshold, and Detail says the same with
+	// their numbers. The numbers change with every write to the cluster, so they are for a log
+	// and not for a condition.
 	Fragmented []string
+	Detail     []string
 	// Change identifies this defragmentation.
 	Change string
 	// BlockReason and BlockMessage are set when Pending is not empty but it may not start.
@@ -109,11 +112,13 @@ func PlanDefragment(members []DefragMember, s DefragSettings, p Pass) Defragment
 
 	for _, m := range members {
 		if m.Known && m.Size >= s.MinimumSize && m.free() >= s.FreePercent {
-			out.Fragmented = append(out.Fragmented, fmt.Sprintf("%s (%d%% of %d MiB is free)", m.Name, m.free(), m.Size>>20))
+			out.Fragmented = append(out.Fragmented, m.Name)
+			out.Detail = append(out.Detail, fmt.Sprintf("%s (%d%% of %d MiB is free)", m.Name, m.free(), m.Size>>20))
 		}
 	}
 
 	slices.Sort(out.Fragmented)
+	slices.Sort(out.Detail)
 
 	if len(out.Fragmented) == 0 {
 		return out

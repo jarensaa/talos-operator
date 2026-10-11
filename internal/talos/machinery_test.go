@@ -106,14 +106,9 @@ type testAPI struct {
 	removals  []uint64
 	removeErr error
 
-	// What etcd says about itself, what the upkeep sends, and what a node's logs hold.
-	alarms  []*machineapi.EtcdMemberAlarm
+	// What the upkeep sends, and what a node's logs hold.
 	defrags int
 	logs    map[string][]string
-}
-
-func (a *testAPI) EtcdAlarmList(context.Context, *emptypb.Empty) (*machineapi.EtcdAlarmListResponse, error) {
-	return &machineapi.EtcdAlarmListResponse{Messages: []*machineapi.EtcdAlarm{{MemberAlarms: a.alarms}}}, nil
 }
 
 func (a *testAPI) EtcdDefragment(context.Context, *emptypb.Empty) (*machineapi.EtcdDefragmentResponse, error) {

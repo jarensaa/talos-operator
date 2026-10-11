@@ -37,8 +37,8 @@ import (
 	timeres "github.com/siderolabs/talos/pkg/machinery/resources/time"
 )
 
-// What Talos says about a node besides whether it is ready (docs/scope.md §14.2), what etcd says
-// about itself, and the last of a node's logs. All of it is read, with the role a Reader has.
+// What Talos says about a node besides whether it is ready (docs/scope.md §14.2), and the last
+// of a node's logs. All of it is read, with the role a Reader has.
 
 // Diagnostic is a warning Talos raises about a node's own configuration. It is there only while
 // the warning is.
@@ -71,21 +71,6 @@ type Volume struct {
 
 // VolumeReady is the phase of a volume that is in order.
 const VolumeReady = "ready"
-
-// Alarms etcd raises.
-const (
-	// AlarmNoSpace: a member's database reached its quota, and etcd refuses writes.
-	AlarmNoSpace = "NOSPACE"
-	// AlarmCorrupt: the members disagree about the data.
-	AlarmCorrupt = "CORRUPT"
-)
-
-// EtcdAlarm is an alarm etcd has raised for one member.
-type EtcdAlarm struct {
-	MemberID uint64
-	// Type is AlarmNoSpace or AlarmCorrupt.
-	Type string
-}
 
 // maxLog bounds what is kept of one log: the end of it, where what went wrong is.
 const maxLog = 128 << 10
@@ -180,32 +165,6 @@ func (r *machineryReader) Volumes(ctx context.Context, node netip.Addr) ([]Volum
 	}
 
 	slices.SortFunc(out, func(a, b Volume) int { return cmpString(a.Name, b.Name) })
-
-	return out, nil
-}
-
-// EtcdAlarms implements Reader. Alarms belong to the cluster: any control plane lists them all.
-func (r *machineryReader) EtcdAlarms(ctx context.Context, node netip.Addr) ([]EtcdAlarm, error) {
-	ctx, cancel := r.callContext(ctx, node)
-	defer cancel()
-
-	resp, err := r.client.EtcdAlarmList(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("etcd alarms through %s: %w", node, err)
-	}
-
-	out := []EtcdAlarm{}
-
-	for _, msg := range resp.GetMessages() {
-		for _, alarm := range msg.GetMemberAlarms() {
-			switch alarm.GetAlarm() { //nolint:exhaustive // NONE is no alarm
-			case machineapi.EtcdMemberAlarm_NOSPACE:
-				out = append(out, EtcdAlarm{MemberID: alarm.GetMemberId(), Type: AlarmNoSpace})
-			case machineapi.EtcdMemberAlarm_CORRUPT:
-				out = append(out, EtcdAlarm{MemberID: alarm.GetMemberId(), Type: AlarmCorrupt})
-			}
-		}
-	}
 
 	return out, nil
 }

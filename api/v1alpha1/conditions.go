@@ -179,11 +179,11 @@ const (
 	ReasonIdentityMismatch = "IdentityMismatch"
 	// ReasonConfigDoesNotFit: the rendered config names a disk or a link the machine does not have.
 	ReasonConfigDoesNotFit = "ConfigDoesNotFit"
-	// Reasons of EtcdMaintained.
+	// Reasons of EtcdMaintained. A defragmentation that is due and does not start has the reason
+	// of what it waits for, as RolloutBlocked has; TooSoon is its own.
 	ReasonDefragmenting       = "Defragmenting"
-	ReasonFragmented          = "Fragmented"
-	ReasonEtcdAlarm           = "EtcdAlarm"
 	ReasonMaintenanceDisabled = "MaintenanceDisabled"
+	ReasonTooSoon             = "TooSoon"
 	// Reasons of MembershipCurrent.
 	ReasonAdding          = "Adding"
 	ReasonRemoving        = "Removing"

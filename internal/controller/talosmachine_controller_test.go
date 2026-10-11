@@ -105,7 +105,7 @@ var _ = Describe("TalosMachine binding", func() {
 			Version: talosVersion, SchematicID: schematic, BootID: cpNodename + "-boot-1", Stage: stageRunning, Ready: true,
 		}))
 		Expect(got.Status.Kubelet).To(Equal(&talosv1alpha1.KubeletState{Version: kubernetesVersion}))
-		Expect(got.Status.Etcd).To(Equal(&talosv1alpha1.EtcdState{MemberID: "a1"}))
+		Expect(got.Status.Etcd).To(Equal(&talosv1alpha1.EtcdState{MemberID: "a1", Leader: true}))
 		Expect(got.Status.Config.LiveHash).To(Equal(normalizedHash(scenario.Node(cpAddr).Config.Active)))
 
 		scenario.AssertNoMutations(GinkgoT())
@@ -203,10 +203,14 @@ var _ = Describe("TalosMachine binding", func() {
 			Expect(callsTo(cpAddr)-before).To(Equal(4), "nothing is asked of a node after it failed to answer")
 			Expect(observed(got).Status).To(Equal(metav1.ConditionFalse))
 			Expect(observed(got).Message).To(Equal(
-				"not read in the last pass: version, boot ID, schematic, machine status, nodename, machine config, etcd status"))
+				"not read in the last pass: version, boot ID, schematic, machine status, nodename, machine config, etcd status, " +
+					"services, diagnostics, time status, links, volumes"))
 			Expect(got.Status.Phase).To(Equal(machinePhasePending))
 			Expect(got.Status.Talos).To(Equal(&talosv1alpha1.TalosState{Version: talosVersion, SchematicID: schematic}))
 			Expect(got.Status.Config.LiveHash).To(BeEmpty())
+			// Which member of etcd it is stays; that it led, and how it was, does not.
+			Expect(got.Status.Etcd).To(Equal(&talosv1alpha1.EtcdState{MemberID: "a1"}))
+			Expect(got.Status.Health).To(BeNil())
 		})
 
 		It("keeps nothing that only described a moment once the node cannot be identified", func() {

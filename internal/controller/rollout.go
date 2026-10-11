@@ -1011,6 +1011,7 @@ func (r *TalosClusterReconciler) abandonOperation(tc *talosv1alpha1.TalosCluster
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionMembershipCurrent)
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionTalosUpToDate)
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionKubernetesUpToDate)
+	forgetUpkeep(st)
 }
 
 // operationEndpoints selects the Talos API endpoints of a cluster: never the node an operation is

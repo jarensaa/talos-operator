@@ -253,8 +253,8 @@ spec:
                   maintenance:
                     default: Disabled
                     description: |-
-                      Maintenance enables the upkeep the operator does by itself: defragmenting etcd, and
-                      disarming the alarm etcd raises when it runs out of space (docs/scope.md §14.6).
+                      Maintenance enables the upkeep the operator does by itself: defragmenting etcd before a
+                      member's database reaches its quota (docs/scope.md §14.6).
                     enum:
                     - Disabled
                     - Enabled
@@ -286,15 +286,19 @@ spec:
                   rule: '!has(self.maintenance) || self.maintenance != ''Enabled''
                     || (has(self.config) && self.config == ''Manage'')'
               observability:
+                default: {}
                 description: Observability is what the cluster exposes for a Prometheus
                   to read.
                 properties:
                   controlPlaneMetrics:
                     default: Disabled
                     description: |-
-                      ControlPlaneMetrics makes etcd, the controller manager and the scheduler serve their
-                      metrics where a Prometheus in the cluster can reach them: on every interface instead of on
-                      localhost only. It is a config change to every control plane, rolled out like any other.
+                      ControlPlaneMetrics makes every control plane serve the metrics of etcd, the controller
+                      manager and the scheduler where a Prometheus in the cluster can reach them. Talos binds the
+                      two components to localhost and serves etcd's metrics only to a client certificate; with
+                      this they listen on every interface, and etcd serves its metrics in plain HTTP on port
+                      2381 of the machine's address. It is a config change, rolled out like any other, and a
+                      layer of the spec that sets the same arguments wins over it (docs/scope.md §14.2).
                     enum:
                     - Disabled
                     - Enabled
@@ -706,16 +710,24 @@ spec:
                     and when it stops being valid.
                   properties:
                     expiresAt:
-                      description: ExpiresAt is the end of the certificate's validity.
+                      format: date-time
+                      type: string
+                    issuedAt:
+                      description: |-
+                        IssuedAt and ExpiresAt are the start and the end of the certificate's validity. How much of
+                        it is left says more than a date does: Talos issues the operator's certificate for hours and
+                        renews it, an authority lasts ten years.
                       format: date-time
                       type: string
                     name:
                       description: |-
                         Name says which: operator for the client certificate the operator reaches the Talos API
-                        with, and os, kubernetes and etcd for the cluster's certificate authorities.
+                        with, and os, kubernetes, kubernetes-aggregator and etcd for the cluster's certificate
+                        authorities.
                       type: string
                   required:
                   - expiresAt
+                  - issuedAt
                   - name
                   type: object
                 type: array
@@ -863,25 +875,6 @@ spec:
               observed:
                 description: Observed is the last observed live state.
                 properties:
-                  etcdAlarms:
-                    description: |-
-                      EtcdAlarms are the alarms etcd has raised: NOSPACE when a member's database reached its
-                      quota, which makes etcd refuse writes, and CORRUPT when members disagree about the data.
-                      Empty when there are none; nil when they could not be read.
-                    items:
-                      description: EtcdAlarm is an alarm etcd has raised for one member.
-                      properties:
-                        memberID:
-                          description: MemberID is the etcd member ID in hex.
-                          type: string
-                        type:
-                          description: Type is NOSPACE or CORRUPT.
-                          type: string
-                      required:
-                      - memberID
-                      - type
-                      type: object
-                    type: array
                   etcdMembers:
                     description: EtcdMembers is the observed etcd membership.
                     items:

@@ -67,7 +67,6 @@ const (
 	// What the upkeep of etcd sends, and what is read of a node's health and logs.
 	MethodEtcdDefragment = "EtcdDefragment"
 	MethodNodeHealth     = "NodeHealth"
-	MethodEtcdAlarms     = "EtcdAlarmList"
 	MethodLogs           = "Logs"
 )
 
@@ -175,7 +174,6 @@ type Scenario struct {
 	members     []talos.Member
 	etcdMembers []talos.EtcdMember
 	etcdLeader  uint64
-	etcdAlarms  []talos.EtcdAlarm
 	health      talos.HealthResult
 	// removed is what the Kubernetes upgrade checks find, by the version checked.
 	removed map[string][]string
@@ -869,18 +867,6 @@ func (r *reader) Volumes(ctx context.Context, node netip.Addr) ([]talos.Volume, 
 	return slices.Clone(n.Volumes), nil
 }
 
-// EtcdAlarms implements talos.Reader.
-func (r *reader) EtcdAlarms(ctx context.Context, node netip.Addr) ([]talos.EtcdAlarm, error) {
-	if _, err := r.s.record(ctx, MethodEtcdAlarms, node); err != nil {
-		return nil, err
-	}
-
-	r.s.mu.Lock()
-	defer r.s.mu.Unlock()
-
-	return append([]talos.EtcdAlarm{}, r.s.etcdAlarms...), nil
-}
-
 // Logs implements talos.Reader.
 func (r *reader) Logs(ctx context.Context, node netip.Addr, service string, _ int32) ([]byte, error) {
 	n, err := r.s.record(ctx, MethodLogs, node)
@@ -894,14 +880,6 @@ func (r *reader) Logs(ctx context.Context, node netip.Addr, service string, _ in
 // Dmesg implements talos.Reader.
 func (r *reader) Dmesg(ctx context.Context, node netip.Addr) ([]byte, error) {
 	return r.Logs(ctx, node, "dmesg", 0)
-}
-
-// SetEtcdAlarms sets the alarms etcd has raised.
-func (s *Scenario) SetEtcdAlarms(alarms ...talos.EtcdAlarm) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.etcdAlarms = alarms
 }
 
 // Keeper returns a talos.Keeper backed by the scenario.

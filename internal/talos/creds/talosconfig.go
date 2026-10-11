@@ -112,8 +112,8 @@ type Credentials struct {
 	Endpoints []Endpoint
 	// Roles carried in the client certificate's Organization field.
 	Roles role.Set
-	// NotAfter is the client certificate's expiry.
-	NotAfter time.Time
+	// NotBefore and NotAfter are the client certificate's validity.
+	NotBefore, NotAfter time.Time
 }
 
 // LoadFromSecret reads and validates a talosconfig stored in a Secret, whose endpoints must be
@@ -227,9 +227,10 @@ func loadIdentity(data []byte, contextName string, now time.Time) (*Credentials,
 	}
 
 	return &Credentials{
-		Context:  ctx,
-		Roles:    roles,
-		NotAfter: cert.NotAfter,
+		Context:   ctx,
+		Roles:     roles,
+		NotBefore: cert.NotBefore,
+		NotAfter:  cert.NotAfter,
 	}, contextName, nil
 }
 

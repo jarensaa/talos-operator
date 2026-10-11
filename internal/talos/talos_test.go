@@ -50,7 +50,7 @@ var readerMethods = []string{
 	"MachineStatus", "MachineType", "Members", "Nodename", "Services", "SystemInformation",
 	"UnattendedInstallStatus", "Version",
 	// What Talos and etcd say about themselves, and the end of a node's logs: all read.
-	"Diagnostics", "Dmesg", "EtcdAlarms", "Links", "Logs", "TimeSynced", "Volumes",
+	"Diagnostics", "Dmesg", "Links", "Logs", "TimeSynced", "Volumes",
 }
 
 func TestReaderMethodSetIsReviewed(t *testing.T) {

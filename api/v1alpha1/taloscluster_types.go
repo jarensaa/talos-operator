@@ -63,8 +63,8 @@ type Management struct {
 	// +optional
 	Membership CapabilityState `json:"membership,omitempty"`
 
-	// Maintenance enables the upkeep the operator does by itself: defragmenting etcd, and
-	// disarming the alarm etcd raises when it runs out of space (docs/scope.md §14.6).
+	// Maintenance enables the upkeep the operator does by itself: defragmenting etcd before a
+	// member's database reaches its quota (docs/scope.md §14.6).
 	// +kubebuilder:default=Disabled
 	// +optional
 	Maintenance CapabilityState `json:"maintenance,omitempty"`
@@ -97,9 +97,12 @@ type EtcdMaintenance struct {
 
 // Observability is what the cluster is asked to expose for a Prometheus to read.
 type Observability struct {
-	// ControlPlaneMetrics makes etcd, the controller manager and the scheduler serve their
-	// metrics where a Prometheus in the cluster can reach them: on every interface instead of on
-	// localhost only. It is a config change to every control plane, rolled out like any other.
+	// ControlPlaneMetrics makes every control plane serve the metrics of etcd, the controller
+	// manager and the scheduler where a Prometheus in the cluster can reach them. Talos binds the
+	// two components to localhost and serves etcd's metrics only to a client certificate; with
+	// this they listen on every interface, and etcd serves its metrics in plain HTTP on port
+	// 2381 of the machine's address. It is a config change, rolled out like any other, and a
+	// layer of the spec that sets the same arguments wins over it (docs/scope.md §14.2).
 	// +kubebuilder:default=Disabled
 	// +optional
 	ControlPlaneMetrics CapabilityState `json:"controlPlaneMetrics,omitempty"`
@@ -412,6 +415,7 @@ type TalosClusterSpec struct {
 	Maintenance Maintenance `json:"maintenance,omitempty"`
 
 	// Observability is what the cluster exposes for a Prometheus to read.
+	// +kubebuilder:default={}
 	// +optional
 	Observability Observability `json:"observability,omitempty"`
 }
@@ -441,20 +445,16 @@ type EtcdMember struct {
 	IsLearner bool `json:"isLearner,omitempty"`
 }
 
-// EtcdAlarm is an alarm etcd has raised for one member.
-type EtcdAlarm struct {
-	// MemberID is the etcd member ID in hex.
-	MemberID string `json:"memberID"`
-	// Type is NOSPACE or CORRUPT.
-	Type string `json:"type"`
-}
-
 // Certificate is a certificate the cluster depends on, and when it stops being valid.
 type Certificate struct {
 	// Name says which: operator for the client certificate the operator reaches the Talos API
-	// with, and os, kubernetes and etcd for the cluster's certificate authorities.
+	// with, and os, kubernetes, kubernetes-aggregator and etcd for the cluster's certificate
+	// authorities.
 	Name string `json:"name"`
-	// ExpiresAt is the end of the certificate's validity.
+	// IssuedAt and ExpiresAt are the start and the end of the certificate's validity. How much of
+	// it is left says more than a date does: Talos issues the operator's certificate for hours and
+	// renews it, an authority lasts ten years.
+	IssuedAt  metav1.Time `json:"issuedAt"`
 	ExpiresAt metav1.Time `json:"expiresAt"`
 }
 
@@ -480,12 +480,6 @@ type ObservedState struct {
 	// +listMapKey=id
 	// +optional
 	EtcdMembers []EtcdMember `json:"etcdMembers,omitempty"`
-
-	// EtcdAlarms are the alarms etcd has raised: NOSPACE when a member's database reached its
-	// quota, which makes etcd refuse writes, and CORRUPT when members disagree about the data.
-	// Empty when there are none; nil when they could not be read.
-	// +optional
-	EtcdAlarms *[]EtcdAlarm `json:"etcdAlarms,omitempty"`
 
 	// ObservedAt is when this observation completed.
 	// +optional
