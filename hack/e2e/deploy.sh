@@ -47,13 +47,15 @@ install() {
   (cd "$REPO_ROOT" && go run ./hack/e2e/import-image "$TARBALL")
 
   log "installing the chart into $NAMESPACE"
-  # Short intervals keep the specs short, and the suite's gate asks about a ConfigMap; everything
-  # else is the chart's default, two replicas that never share a node included.
+  # Short intervals keep the specs short, the suite's gate asks about a ConfigMap, and one spec
+  # reads which releases exist upstream from status; everything else is the chart's default, two
+  # replicas that never share a node included.
   helm upgrade --install talos-operator "$REPO_ROOT/charts/talos-operator" \
     --kubeconfig "$E2E_KUBECONFIG" \
     --namespace "$NAMESPACE" --create-namespace \
     --set image.repository="$IMAGE_REPOSITORY" \
     --set image.tag="$IMAGE_TAG" \
+    --set versionSources.enabled=true \
     --set-json 'extraArgs=["--observe-interval=10s"]' \
     --set-json 'gates.rules=[{"apiGroups":[""],"resources":["configmaps"],"verbs":["get"]}]' \
     --wait --timeout 5m
