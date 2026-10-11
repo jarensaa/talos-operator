@@ -7,11 +7,13 @@
 # a read-only token whatever a workflow asks for. There is still no pull_request_target and no
 # stored secret here.
 #
-# What merges by itself (docs/dev/dependencies.md):
-#   Go modules                      patch releases
-#   GitHub Actions, release tooling patch and minor releases
-# Everything else waits for a person: every major, and a new minor of a Go module, which for
-# machinery is a new Talos to support and for k8s.io a new Kubernetes to build against.
+# What merges by itself (docs/dev/dependencies.md): every bump whose checks pass, of a Go module,
+# a GitHub Action or the release tooling, whatever its size. The checks are the judge: the unit
+# tests, the linter, the image and chart, and the e2e on a cluster.
+#
+# One kind waits for a person: a new minor or major of the Talos libraries (machinery,
+# go-kubernetes, the COSI runtime). The checks cannot judge it. It is a new Talos to support:
+# the operator would start saying it knows a Talos release that no test here has run.
 #
 # A merge made with the workflow's own token starts no workflow on main, so nothing is tested
 # again, released or published by it. The checks ran on the pull request, on top of main as it
@@ -42,20 +44,31 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           BRANCH: ${{ github.head_ref }}
           UPDATE: ${{ steps.bump.outputs.update-type }}
+          NAMES: ${{ steps.bump.outputs.dependency-names }}
         run: |
-          # Anything this does not recognise waits for a person, an update without a type included.
-          case "$BRANCH $UPDATE" in
-            "dependabot/go_modules/"*" version-update:semver-patch") ;;
-            "dependabot/github_actions/"*" version-update:semver-patch") ;;
-            "dependabot/github_actions/"*" version-update:semver-minor") ;;
-            "dependabot/npm_and_yarn/"*" version-update:semver-patch") ;;
-            "dependabot/npm_and_yarn/"*" version-update:semver-minor") ;;
-            *)
-              # A pull request Dependabot rebuilt may have been one that merges by itself before.
-              gh pr merge --disable-auto "$PR_URL" || true
-              echo "Waits for a person: ${UPDATE:-an update of no known type} on $BRANCH." >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+          # A pull request Dependabot rebuilt may have been one that merges by itself before.
+          wait_for_a_person() {
+            gh pr merge --disable-auto "$PR_URL" || true
+            echo "Waits for a person: $1." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          # Anything this does not recognise waits, an update without a type included.
+          case "$BRANCH" in
+            dependabot/go_modules/* | dependabot/github_actions/* | dependabot/npm_and_yarn/*) ;;
+            *) wait_for_a_person "$BRANCH is no branch of Dependabot's that is known here" ;;
+          esac
+
+          case "$UPDATE" in
+            version-update:semver-patch) ;;
+            version-update:semver-minor | version-update:semver-major)
+              case "$NAMES" in
+                *github.com/siderolabs/* | *github.com/cosi-project/*)
+                  wait_for_a_person "$UPDATE of the Talos libraries ($NAMES) is a new Talos to support"
+                  ;;
+              esac
               ;;
+            *) wait_for_a_person "${UPDATE:-an update of no known type} on $BRANCH" ;;
           esac
 
           gh pr merge --auto --merge "$PR_URL"
