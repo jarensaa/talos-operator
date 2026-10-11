@@ -191,6 +191,17 @@ helm-lint: manifests ## Lint the Helm chart and check what it renders.
 	helm lint $(CHART_DIR)
 	hack/chart/check.sh $(CHART_DIR)
 
+# The alerts are tested on what the exporter really exports: internal/exporter writes
+# hack/chart/alerts_test.yaml from its scenarios, and fails when the file is not the one committed.
+.PHONY: alerts
+alerts: ## Regenerate the test of the chart's alert rules from the exporter's scenarios.
+	go test ./internal/exporter/ -run TestAlertScenarios -update
+
+.PHONY: alerts-test
+alerts-test: promtool ## Check the chart's alert rules and test them.
+	$(PROMTOOL) check rules $(CHART_DIR)/files/alerts.yaml
+	$(PROMTOOL) test rules hack/chart/alerts_test.yaml
+
 .PHONY: helm-template
 helm-template: manifests ## Render the Helm chart for inspection.
 	helm template talos-operator $(CHART_DIR) --namespace talos-operator
@@ -236,6 +247,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+PROMTOOL ?= $(LOCALBIN)/promtool
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.3
@@ -273,6 +285,10 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: promtool
+promtool: ## Download promtool locally if necessary.
+	@hack/tools/promtool.sh $(PROMTOOL)
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

@@ -70,6 +70,35 @@ metrics:
   # Serve metrics over HTTPS on 8443, authenticated via the Kubernetes API.
   enabled: true
 
+# What the operator knows as metrics, alerts on them, and a dashboard: an operation that is halted,
+# drift, nodes that cannot be read, etcd membership (docs/guide.md, "Monitoring").
+#
+# Each part is "auto", true or false. auto installs it where the cluster has the Prometheus
+# Operator's API (monitoring.coreos.com/v1), which is how the chart can tell that there is a
+# Prometheus to read it, and leaves it out where there is none. The chart finds out when it is
+# installed or upgraded: a Prometheus that arrives later is picked up by the next upgrade, or by
+# setting true. true on a cluster without that API fails the install.
+monitoring:
+  # Labels for the ServiceMonitor and the PrometheusRule. A Prometheus only reads the ones its
+  # selectors match: kube-prometheus-stack, as it comes, wants `release: <its release name>`.
+  labels: {}
+  serviceMonitor:
+    enabled: auto
+    # How often to scrape; the Prometheus's own default if empty.
+    interval: ""
+  # The alerts in files/alerts.yaml, as a PrometheusRule.
+  alerts:
+    enabled: auto
+  # A Grafana dashboard, as a ConfigMap that Grafana's sidecar loads by its label. There is no
+  # API to tell a Grafana by, so auto goes by the Prometheus Operator's too: the dashboard shows
+  # nothing without the metrics, and a ConfigMap nobody loads does no harm.
+  dashboard:
+    enabled: auto
+    labels:
+      grafana_dashboard: "1"
+    # For example grafana_folder: Talos, where the sidecar sorts dashboards into folders.
+    annotations: {}
+
 # What exists upstream. Off by default: the operator then talks to nothing but the cluster it
 # manages, and a release that does not exist is found when the first node fails to pull it, before
 # anything on that node is changed. Switched on, a TalosCluster's status lists the Talos and
