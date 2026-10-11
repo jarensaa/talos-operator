@@ -1,6 +1,7 @@
 # Dependabot proposes the bumps of what this repository is built from. It runs weekly, waits a few
 # days after a release before proposing it, and groups what has to move together, so that a week
-# is a handful of pull requests. Nothing is merged by itself.
+# is a handful of pull requests. Which of them merge by themselves is decided in
+# .github/workflows/dependabot-merge.yml.
 #
 # The commit prefix decides whether a merged bump is released (CLAUDE.md, "Releases are
 # automatic"): Go modules are compiled into the operator, so they are a fix; everything else
