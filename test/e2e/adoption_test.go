@@ -2011,8 +2011,19 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			cfgs, err := harness.MachineConfig(ctx, spare)
 			Expect(err).NotTo(HaveOccurred())
 
+			// The config takes away the way its own answer has to come back on, through a control
+			// plane: the call ends with the answer or without one, whichever is first. What says
+			// that it took is the machine no longer answering.
 			isolated := withPatch(cfgs.Active, blackholeDocuments(addrsOf("E2E_CONTROLPLANES")))
-			Expect(harnessWriter(ctx).ApplyConfig(ctx, spare, isolated, talos.ApplyNoReboot, 0)).To(Succeed())
+			if err := harnessWriter(ctx).ApplyConfig(ctx, spare, isolated, talos.ApplyNoReboot, 0); err != nil {
+				Expect(talos.IsUnreachable(err)).To(BeTrue(), "the config was refused: %v", err)
+			}
+
+			Eventually(func(g Gomega) {
+				_, err := harness.BootID(ctx, spare)
+				g.Expect(err).To(HaveOccurred(), "the machine still answers through a control plane")
+				g.Expect(talos.IsUnreachable(err)).To(BeTrue(), "%v", err)
+			}).WithContext(ctx).WithTimeout(3 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
 
 			setDesiredState(ctx, doomed, talosv1alpha1.DesiredStateRemoved)
 
