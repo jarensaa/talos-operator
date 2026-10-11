@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -115,6 +116,25 @@ func (f *Factory) Upgrader(ctx context.Context, t Target) (Upgrader, error) {
 	}
 
 	return &machineryUpgrader{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+}
+
+// Remover returns a client that can also take a machine out of the cluster. Callers hand it out
+// only while spec.management.membership is Enabled (docs/scope.md §8.1, invariant 6). Its
+// connection is separate from the others and cannot apply config, upgrade or reboot.
+func (f *Factory) Remover(ctx context.Context, t Target) (Remover, error) {
+	c, err := f.client(ctx, t, accessMembership)
+	if err != nil {
+		return nil, err
+	}
+
+	return &machineryRemover{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+}
+
+// Maintenance returns a connection to the machine that waits in maintenance mode at addr.
+// Callers ask for it only while spec.management.membership is Enabled, and close it when they
+// are done: it is not cached, because the key it pins is that of one conversation.
+func (f *Factory) Maintenance(ctx context.Context, addr netip.Addr) (Maintenance, error) {
+	return newMaintenance(ctx, addr, f)
 }
 
 func (f *Factory) callTimeout() time.Duration {

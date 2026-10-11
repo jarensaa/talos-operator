@@ -39,6 +39,9 @@ env:
   # must show. The weekly run has three control planes.
   CONTROLPLANES: ${{ inputs.controlplanes || (github.event_name == 'schedule' && '3') || '1' }}
   WORKERS: ${{ inputs.workers || '1' }}
+  # One machine more than the cluster has, left in maintenance mode: the one the suite adds,
+  # removes, and on three control planes replaces one with (docs/scope.md §7.6, §7.7).
+  MAINTENANCE_NODES: "1"
   VM_CPUS: "1.0"
   VM_MEMORY: 2GiB
   WORKER_MEMORY: ${{ inputs.worker_memory || '2GiB' }}

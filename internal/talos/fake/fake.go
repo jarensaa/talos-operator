@@ -58,6 +58,12 @@ const (
 	MethodReboot                  = "Reboot"
 	MethodKubernetesImagePull     = "KubernetesImagePull"
 	MethodKubernetesUpgradeChecks = "KubernetesUpgradeChecks"
+	// What a removal and a machine in maintenance mode are sent.
+	MethodReset            = "Reset"
+	MethodEtcdRemoveMember = "EtcdRemoveMemberByID"
+	MethodMaintenanceProbe = "MaintenanceProbe"
+	MethodMaintenanceFits  = "MaintenanceFits"
+	MethodMaintenanceApply = "MaintenanceApply"
 )
 
 // Machine types as Talos reports them.
@@ -70,7 +76,7 @@ const (
 // under ApplyConfiguration with DryRun set, which AssertNoMutations allows.
 var mutatingMethods = map[string]bool{
 	MethodApplyConfiguration: true, MethodImagePull: true, MethodInstall: true, MethodEtcdForfeitLeadership: true, MethodReboot: true,
-	MethodKubernetesImagePull: true,
+	MethodKubernetesImagePull: true, MethodReset: true, MethodEtcdRemoveMember: true, MethodMaintenanceApply: true,
 }
 
 func (n *Node) unhealthy() bool { return n.UnhealthyWhen != nil && n.UnhealthyWhen(n.Config.Active) }
@@ -117,6 +123,16 @@ type Node struct {
 	// EtcdMemberID identifies the node's etcd member; 0 means none (workers).
 	EtcdMemberID uint64
 	EtcdLearner  bool
+	// Maintenance is true for a machine that has no config and waits for one: it answers nobody
+	// who comes with the cluster's credentials, is no member of anything, and takes a config
+	// from whoever hands it one over a maintenance connection. Everything else the Node says is
+	// what it will be once it has joined.
+	Maintenance bool
+	// FitProblems is what a config does not fit of the machine, as its disks and links would say.
+	FitProblems []string
+	// joining is true from the moment a machine in maintenance mode took its config until it
+	// boots: it is installing, and not a member yet.
+	joining bool
 }
 
 // Call is one recorded Reader call.
@@ -334,7 +350,7 @@ func (s *Scenario) Boot(addr netip.Addr) bool {
 		return false
 	}
 
-	n.down = false
+	n.down, n.joining = false, false
 	n.BootID += "+"
 
 	if n.installed != "" && !n.FallsBack {
@@ -362,6 +378,179 @@ func ParseInstaller(image string) (schematic, version string, ok bool) {
 
 	return image[slash+1 : colon], image[colon+1:], true
 }
+
+// Remover returns a talos.Remover backed by the scenario.
+func (s *Scenario) Remover() talos.Remover { return &remover{reader{s: s}} }
+
+// Maintenance returns the maintenance connection to the machine at addr.
+func (s *Scenario) Maintenance(addr netip.Addr) talos.Maintenance {
+	return &maintenance{s: s, addr: addr}
+}
+
+// Add puts another node on the network.
+func (s *Scenario) Add(n Node) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.nodes[n.Addr] = &n
+}
+
+// Forget takes a node out of the scenario altogether, as when its machine is switched off for
+// good and the cluster's discovery has dropped it.
+func (s *Scenario) Forget(addr netip.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.nodes, addr)
+}
+
+// Kill makes a node answer nothing from now on, with no reboot to come back from. It stays a
+// member of whatever it was a member of, as a machine that died does.
+func (s *Scenario) Kill(addr netip.Addr) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if n, ok := s.nodes[addr]; ok {
+		n.down = true
+	}
+}
+
+// remover is the Remover of a scenario.
+type remover struct{ reader }
+
+// ForfeitEtcdLeadership implements talos.Remover.
+func (r *remover) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
+	return (&upgrader{r.reader}).ForfeitEtcdLeadership(ctx, node)
+}
+
+// Reset implements talos.Remover: the node leaves etcd, forgets its config and reboots. It comes
+// back from Boot as a machine in maintenance mode.
+func (r *remover) Reset(ctx context.Context, node netip.Addr) error {
+	if _, err := r.s.record(ctx, MethodReset, node); err != nil {
+		return err
+	}
+
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+
+	n := r.s.nodes[node]
+	if n.EtcdMemberID != 0 && r.s.etcdLeader == n.EtcdMemberID {
+		r.s.etcdLeader = 0
+
+		for _, other := range r.s.sortedNodesLocked() {
+			if other.EtcdMemberID != 0 && other.EtcdMemberID != n.EtcdMemberID && !other.Maintenance {
+				r.s.etcdLeader = other.EtcdMemberID
+
+				break
+			}
+		}
+	}
+
+	n.down, n.Maintenance, n.EtcdMemberID, n.EtcdLearner = true, true, 0, false
+	n.Config = talos.MachineConfigs{}
+	n.tryPrevious = nil
+
+	return nil
+}
+
+// RemoveEtcdMember implements talos.Remover: whichever node has the member loses it, dead or not.
+func (r *remover) RemoveEtcdMember(ctx context.Context, peer netip.Addr, id uint64) error {
+	asked, err := r.s.record(ctx, MethodEtcdRemoveMember, peer)
+	if err != nil {
+		return err
+	}
+
+	if asked.MachineType != TypeControlPlane {
+		return fmt.Errorf("%s on %s: %w", MethodEtcdRemoveMember, peer, status.Error(codes.FailedPrecondition, "fake: not a control plane"))
+	}
+
+	r.s.mu.Lock()
+	defer r.s.mu.Unlock()
+
+	for _, n := range r.s.nodes {
+		if n.EtcdMemberID == id {
+			n.EtcdMemberID, n.EtcdLearner = 0, false
+		}
+	}
+
+	return nil
+}
+
+// maintenance is the maintenance connection to one machine of a scenario.
+type maintenance struct {
+	s    *Scenario
+	addr netip.Addr
+}
+
+// candidate logs a call and returns a copy of the machine, if it waits in maintenance mode.
+func (m *maintenance) candidate(ctx context.Context, method string) (*Node, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	m.s.mu.Lock()
+	defer m.s.mu.Unlock()
+
+	m.s.calls = append(m.s.calls, Call{Method: method, Node: m.addr})
+
+	if err := m.s.errors[errorKey{method: method, node: m.addr}]; err != nil {
+		return nil, fmt.Errorf("%s on %s: %w", method, m.addr, err)
+	}
+
+	n, ok := m.s.nodes[m.addr]
+
+	switch {
+	case !ok, n.down:
+		return nil, fmt.Errorf("%s on %s: %w", method, m.addr, status.Error(codes.Unavailable, "fake: nothing answers"))
+	case !n.Maintenance:
+		// A configured node asks for a client certificate, and a maintenance connection has none.
+		return nil, fmt.Errorf("%s on %s: %w", method, m.addr, status.Error(codes.Unavailable, "fake: the node wants a client certificate"))
+	}
+
+	copied := *n
+
+	return &copied, nil
+}
+
+// Probe implements talos.Maintenance.
+func (m *maintenance) Probe(ctx context.Context) (talos.Candidate, error) {
+	n, err := m.candidate(ctx, MethodMaintenanceProbe)
+	if err != nil {
+		return talos.Candidate{}, err
+	}
+
+	return talos.Candidate{Stage: talos.StageMaintenance, UUID: n.SystemInformation.UUID}, nil
+}
+
+// Fits implements talos.Maintenance.
+func (m *maintenance) Fits(ctx context.Context, _ []byte) ([]string, error) {
+	n, err := m.candidate(ctx, MethodMaintenanceFits)
+	if err != nil {
+		return nil, err
+	}
+
+	return slices.Clone(n.FitProblems), nil
+}
+
+// ApplyConfig implements talos.Maintenance: the machine takes the config and goes away to
+// install itself. It is back, as what its Node says, after Boot.
+func (m *maintenance) ApplyConfig(ctx context.Context, machineConfig []byte) error {
+	if _, err := m.candidate(ctx, MethodMaintenanceApply); err != nil {
+		return err
+	}
+
+	m.s.mu.Lock()
+	defer m.s.mu.Unlock()
+
+	n := m.s.nodes[m.addr]
+	n.Maintenance, n.joining, n.down = false, true, true
+	n.Config = talos.MachineConfigs{Active: slices.Clone(machineConfig), Persistent: slices.Clone(machineConfig)}
+
+	return nil
+}
+
+// Close implements talos.Maintenance.
+func (m *maintenance) Close() error { return nil }
 
 // Upgrader returns a talos.Upgrader backed by the scenario.
 func (s *Scenario) Upgrader() talos.Upgrader {
@@ -402,6 +591,11 @@ func (s *Scenario) record(ctx context.Context, method string, node netip.Addr) (
 		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: node is rebooting"))
 	}
 
+	if n.Maintenance {
+		// It asks for no client certificate and has no CA to check one against.
+		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: the machine is in maintenance mode"))
+	}
+
 	if n.UnreachableWhen != nil && n.UnreachableWhen(n.Config.Active) {
 		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: node is cut off"))
 	}
@@ -418,6 +612,10 @@ func (s *Scenario) membersLocked() []talos.Member {
 
 	out := make([]talos.Member, 0, len(s.nodes))
 	for _, n := range s.sortedNodesLocked() {
+		if n.Maintenance || n.joining {
+			continue
+		}
+
 		out = append(out, talos.Member{
 			Hostname:        n.Nodename,
 			MachineType:     n.MachineType,
@@ -437,7 +635,7 @@ func (s *Scenario) etcdMembersLocked() []talos.EtcdMember {
 	var out []talos.EtcdMember
 
 	for _, n := range s.sortedNodesLocked() {
-		if n.EtcdMemberID != 0 {
+		if n.EtcdMemberID != 0 && !n.Maintenance && !n.joining {
 			out = append(out, talos.EtcdMember{ID: n.EtcdMemberID, Hostname: n.Nodename, IsLearner: n.EtcdLearner})
 		}
 	}
@@ -653,6 +851,30 @@ type Factory struct {
 	targets         []talos.Target
 	writerTargets   []talos.Target
 	upgraderTargets []talos.Target
+	removerTargets  []talos.Target
+}
+
+// Remover implements target.ClientFactory.
+func (f *Factory) Remover(_ context.Context, t talos.Target) (talos.Remover, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.removerTargets = append(f.removerTargets, t)
+
+	return f.Scenario.Remover(), nil
+}
+
+// RemoverTargets returns the targets a Remover was requested for.
+func (f *Factory) RemoverTargets() []talos.Target {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.removerTargets)
+}
+
+// Maintenance implements target.ClientFactory.
+func (f *Factory) Maintenance(_ context.Context, addr netip.Addr) (talos.Maintenance, error) {
+	return f.Scenario.Maintenance(addr), nil
 }
 
 // Upgrader implements target.ClientFactory.

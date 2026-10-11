@@ -99,6 +99,30 @@ type testAPI struct {
 	forfeits int
 	pull     []*machineapi.ImageServicePullResponse
 	install  []*machineapi.LifecycleServiceUpgradeResponse
+
+	// What a removal sends.
+	resets    []*machineapi.ResetRequest
+	removals  []uint64
+	removeErr error
+}
+
+func (a *testAPI) Reset(_ context.Context, req *machineapi.ResetRequest) (*machineapi.ResetResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.resets = append(a.resets, req)
+
+	return &machineapi.ResetResponse{}, nil
+}
+
+func (a *testAPI) EtcdRemoveMemberByID(_ context.Context, req *machineapi.EtcdRemoveMemberByIDRequest,
+) (*machineapi.EtcdRemoveMemberByIDResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.removals = append(a.removals, req.GetMemberId())
+
+	return &machineapi.EtcdRemoveMemberByIDResponse{}, a.removeErr
 }
 
 // imageAPI and lifecycleAPI serve the two services whose method names the machine service also

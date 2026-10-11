@@ -875,6 +875,17 @@ func remediation(reason, token string, skippable bool) string {
 	case plan.FailFellBack:
 		first = "The node runs its previous system again, and may still be cordoned. " +
 			"Find out why the new one did not boot: its console has the answer."
+	case plan.FailIdentity:
+		first = "The machine was sent nothing. Check which machine answers at the address, and what spec.identity.systemUUID says."
+	case plan.FailDoesNotFit:
+		first = "The machine was sent nothing. Fix the install disk or the links in the config, or the machine."
+	case plan.FailNotJoined:
+		first = "The machine took its config and did not become a member. Its console says how far it got; " +
+			"to start it over, bring it back to maintenance mode."
+	case plan.FailNodeGone, plan.FailNotWiped:
+		first = fmt.Sprintf("If the machine is gone for good, annotate the TalosCluster with %s=%s: what is left of it in etcd and in "+
+			"Kubernetes is then taken out, and nothing on the machine is wiped, so it must not be switched on again as it is. "+
+			"Otherwise bring it back.", talosv1alpha1.AnnotationConfirmDead, token)
 	default:
 		first = "Find out what kept the step from finishing."
 	}
@@ -996,7 +1007,8 @@ func (r *TalosClusterReconciler) abandonOperation(tc *talosv1alpha1.TalosCluster
 		r.finish(tc, talosv1alpha1.OperationAborted, "config management returned to Observe"+leftCordoned(st.Operation))
 	}
 
-	st.Approval, st.AbortedTargets, st.Upgrades = nil, nil, nil
+	st.Approval, st.AbortedTargets, st.Upgrades, st.Membership = nil, nil, nil, nil
+	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionMembershipCurrent)
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionTalosUpToDate)
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionKubernetesUpToDate)
 }

@@ -60,15 +60,21 @@ spec:
     # A GitOps prune or namespace deletion must not silently drop a machine the cluster still
     # runs on. Deleting the CR never touches the node; desiredState Removed is how a node leaves
     # (§7.7), and the orphan annotation releases a machine knowingly.
+    #
+    # Removed alone is not enough: the node is still a member until the operator has taken it
+    # out, which status.removedAt records. A machine that was deleted in the commit that asked for
+    # its removal would leave a node nobody describes. One that never was a member (no
+    # status.joinedAt) has no node to leave behind.
     - expression: >-
-        (has(oldObject.spec.desiredState) && oldObject.spec.desiredState == 'Removed') ||
+        (has(oldObject.spec.desiredState) && oldObject.spec.desiredState == 'Removed' &&
+        (!has(oldObject.status) || !has(oldObject.status.joinedAt) || has(oldObject.status.removedAt))) ||
         (has(oldObject.metadata.annotations) &&
         oldObject.metadata.annotations.exists(k, k == 'talos.jarensaa.github.io/orphan') &&
         oldObject.metadata.annotations['talos.jarensaa.github.io/orphan'] == 'true')
       message: >-
-        a TalosMachine with desiredState Present cannot be deleted: set desiredState Removed to
-        take the node out of the cluster, or annotate it talos.jarensaa.github.io/orphan=true to
-        stop managing it while it keeps running.
+        a TalosMachine can be deleted once it is out of the cluster: set desiredState Removed and
+        wait for status.removedAt, or annotate it talos.jarensaa.github.io/orphan=true to stop
+        managing it while its node keeps running.
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

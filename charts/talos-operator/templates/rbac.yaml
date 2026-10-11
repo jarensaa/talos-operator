@@ -89,6 +89,35 @@ subjects:
     name: {{ include "talos-operator.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 ---
+# A machine that is taken out of the cluster leaves a Node behind, which Talos does not delete
+# (docs/scope.md §7.7). The operator deletes it once the machine is seen to have forgotten the
+# cluster, or a human confirmed it dead. Nothing else is deleted by the operator, anywhere.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-remover
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "talos-operator.fullname" . }}-node-remover
+  labels:
+    {{- include "talos-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "talos-operator.fullname" . }}-node-remover
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "talos-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
 # Upgrades reboot nodes, and drain them first (docs/scope.md §7.3): cordon and uncordon the Node,
 # list its pods wherever they live, and evict them, which is what makes PodDisruptionBudgets count.
 # Nothing else about pods: no reading their logs, no deleting them past a budget.

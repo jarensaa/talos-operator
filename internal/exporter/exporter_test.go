@@ -103,6 +103,7 @@ func healthy() *fixture {
 					condition(talosv1alpha1.ConditionConfigMatchesLive, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded),
 				},
 				Identity: &talosv1alpha1.ObservedIdentity{KubernetesNodeName: name},
+				JoinedAt: &epoch,
 				Talos:    &talosv1alpha1.TalosState{Version: "v1.14.2", SchematicID: strings.Repeat("a", 64), Ready: true},
 				Kubelet:  &talosv1alpha1.KubeletState{Version: "1.37.1"},
 				Etcd:     &talosv1alpha1.EtcdState{MemberID: fmt.Sprintf("%c%d", 'a'+i, i+1)},

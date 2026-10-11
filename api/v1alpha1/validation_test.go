@@ -348,7 +348,7 @@ func TestMachineDesiredStateDefaultsToPresent(t *testing.T) {
 // Messages of the admission policies in config/admission/policies.yaml.
 const (
 	gateMessage     = "may become Manage only once status shows ConfigProven=True"
-	deletionMessage = "cannot be deleted"
+	deletionMessage = "can be deleted once it is out of the cluster"
 )
 
 // installAdmissionPolicies creates the shipped ValidatingAdmissionPolicies and waits until the
@@ -511,7 +511,37 @@ func TestPresentMachinesCannotBeDeleted(t *testing.T) {
 	}
 
 	if err := k8sClient.Delete(ctx, removed); err != nil {
-		t.Fatalf("a Removed machine can be deleted: %v", err)
+		t.Fatalf("a Removed machine that never was a member can be deleted: %v", err)
+	}
+
+	// A machine that is a member is still one when it is asked to leave. Deleting it then would
+	// leave a node that nobody describes; it can go once the operator has taken it out.
+	member := validMachine("member")
+	if err := k8sClient.Create(ctx, member); err != nil {
+		t.Fatal(err)
+	}
+
+	now := metav1.Now()
+	member.Status.JoinedAt = &now
+
+	if err := k8sClient.Status().Update(ctx, member); err != nil {
+		t.Fatal(err)
+	}
+
+	member.Spec.DesiredState = talosv1alpha1.DesiredStateRemoved
+	if err := k8sClient.Update(ctx, member); err != nil {
+		t.Fatal(err)
+	}
+
+	requireRejected(t, k8sClient.Delete(ctx, member), deletionMessage)
+
+	member.Status.RemovedAt = &now
+	if err := k8sClient.Status().Update(ctx, member); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := k8sClient.Delete(ctx, member); err != nil {
+		t.Fatalf("a machine that has left can be deleted: %v", err)
 	}
 }
 

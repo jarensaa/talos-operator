@@ -304,12 +304,24 @@ func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.
 	// etcdVia is a control plane that answered, to ask for the etcd member list.
 	var etcdVia netip.Addr
 
+	left, err := r.left(ctx, tc)
+	if err != nil {
+		obs.kubeErr = err
+	}
+
 	for _, m := range members {
 		if len(m.Addresses) == 0 {
 			continue
 		}
 
 		addr := m.Addresses[0]
+		facts := observeNodeFacts(nodesCtx, tgt.Talos, m, addr)
+
+		// The cluster's discovery goes on listing a machine for a while after it left. One that
+		// was taken out and does not answer is not a member that could not be read.
+		if facts.version == "" && left[addr] {
+			continue
+		}
 
 		switch m.MachineType {
 		case machineTypeControlPlane:
@@ -318,7 +330,6 @@ func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.
 			obs.workers = append(obs.workers, addr)
 		}
 
-		facts := observeNodeFacts(nodesCtx, tgt.Talos, m, addr)
 		obs.facts.nodes = append(obs.facts.nodes, facts)
 
 		if facts.version == "" {
@@ -475,6 +486,33 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 	facts.readErr = reads.reason()
 
 	return facts
+}
+
+// left lists the addresses of the machines the operator took out of the cluster, or is past the
+// point of taking out: removed, reset and on its way out, or confirmed dead.
+func (r *TalosClusterReconciler) left(ctx context.Context, tc *talosv1alpha1.TalosCluster) (map[netip.Addr]bool, error) {
+	machines, err := machinesOf(ctx, r.Client, tc.Namespace, tc.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	out := map[netip.Addr]bool{}
+
+	for i := range machines {
+		tm := &machines[i]
+
+		leaving := false
+		if op := tc.Status.Operation; op != nil && op.Type == talosv1alpha1.OperationRemoveMachine && op.Current != nil &&
+			op.Current.Machine == tm.Name {
+			leaving = op.Current.Dead || slices.Contains([]string{plan.StepLeaving, plan.StepDeleting, plan.StepVerifying}, op.Current.Step)
+		}
+
+		if addr, err := netip.ParseAddr(tm.Spec.Address); err == nil && (leaving || tm.Status.RemovedAt != nil) {
+			out[addr] = true
+		}
+	}
+
+	return out, nil
 }
 
 // observeUnmatched finds live members whose hardware identity no TalosMachine claims, so the
@@ -723,6 +761,10 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 			kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
 		case talosv1alpha1.OperationKubernetesUpgrade:
 			kind, done, does = "KubernetesUpgrade", "ComponentUpgraded", "runs the new version"
+		case talosv1alpha1.OperationAddMachine:
+			kind, done, does = "Addition", "MachineAdded", "is a member of the cluster"
+		case talosv1alpha1.OperationRemoveMachine:
+			kind, done, does = "Removal", "MachineRemoved", "has left the cluster"
 		}
 	}
 

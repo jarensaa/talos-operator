@@ -54,6 +54,10 @@ const (
 	// ConditionVersionsReachable reports whether there is a sequence of upgrades from the versions
 	// the cluster runs to the versions its spec asks for (docs/scope.md §7.5).
 	ConditionVersionsReachable = "VersionsReachable"
+	// ConditionMembershipCurrent reports whether the cluster's machines are the ones that are
+	// declared: every TalosMachine that is Present is a member, and none that is Removed still is
+	// (docs/scope.md §7.6, §7.7).
+	ConditionMembershipCurrent = "MembershipCurrent"
 	// ConditionRolloutBlocked reports that a disruptive operation is halted and needs attention.
 	ConditionRolloutBlocked = "RolloutBlocked"
 )
@@ -81,6 +85,10 @@ const (
 	// While it is not True, status.talos.stage, ready and bootID are empty rather than stale, and
 	// everything else keeps the last value that was read.
 	ConditionNodeObserved = "NodeObserved"
+	// ConditionProvisionable reports, for a machine that is not a member of the cluster, whether
+	// it can be added: it waits in maintenance mode at its address, carries the pinned identity,
+	// and the config rendered for it fits its disks and links (docs/scope.md §7.6).
+	ConditionProvisionable = "Provisionable"
 )
 
 // Condition reasons shared across types.
@@ -153,6 +161,30 @@ const (
 	ReasonAwaitingStatus = "AwaitingStatus"
 	// ReasonHeld: a machine does not run its rendered config and is on hold, or was skipped.
 	ReasonHeld = "Held"
+	// Reasons of Provisionable, and of the conditions of a machine that is no member.
+	// ReasonNotAMember: the machine is not a member of the cluster, so there is no node to read.
+	ReasonNotAMember = "NotAMember"
+	// ReasonMember: the machine is a member of the cluster already.
+	ReasonMember = "Member"
+	// ReasonMembershipDisabled: spec.management.membership is not Enabled, so nothing is asked of
+	// a machine that is not a member.
+	ReasonMembershipDisabled = "MembershipDisabled"
+	// ReasonNotInMaintenance: something answers at the machine's address, and it is not a machine
+	// waiting in maintenance mode.
+	ReasonNotInMaintenance = "NotInMaintenance"
+	// ReasonIdentityMismatch: the machine at the address is not the one that was declared.
+	ReasonIdentityMismatch = "IdentityMismatch"
+	// ReasonConfigDoesNotFit: the rendered config names a disk or a link the machine does not have.
+	ReasonConfigDoesNotFit = "ConfigDoesNotFit"
+	// Reasons of MembershipCurrent.
+	ReasonAdding          = "Adding"
+	ReasonRemoving        = "Removing"
+	ReasonAwaitingMachine = "AwaitingMachine"
+	// Reasons of RolloutBlocked for machines to be added or removed (docs/scope.md §7.6, §7.7).
+	ReasonNotAtRest        = "NotAtRest"
+	ReasonQuorumAtRisk     = "QuorumAtRisk"
+	ReasonHostnameInUse    = "HostnameInUse"
+	ReasonLastControlPlane = "LastControlPlane"
 )
 
 // Annotations and labels used by the operator.
@@ -167,6 +199,11 @@ const (
 	AnnotationRetry       = "talos.jarensaa.github.io/retry"
 	AnnotationSkipMachine = "talos.jarensaa.github.io/skip-machine"
 	AnnotationAbort       = "talos.jarensaa.github.io/abort"
+	// AnnotationConfirmDead, on the TalosCluster and carrying the token of a removal that halted
+	// because the machine does not answer, confirms that the machine is gone for good. The
+	// removal then goes on without it: its etcd member is removed through another control plane
+	// and its Node is deleted. Nothing on the machine is wiped, because nothing can be.
+	AnnotationConfirmDead = "talos.jarensaa.github.io/confirm-dead"
 	// AnnotationOrphan, set to "true" on a TalosMachine, lets it be deleted while desiredState is
 	// Present: the operator stops managing the machine and leaves the node running.
 	AnnotationOrphan = "talos.jarensaa.github.io/orphan"

@@ -110,6 +110,11 @@ const (
 	accessConfig
 	// accessUpgrade additionally allows upgradeMethods.
 	accessUpgrade
+	// accessMembership additionally allows what a removal is made of (checkMembership).
+	accessMembership
+	// accessMaintenance is the connection to a machine in maintenance mode: it allows reading
+	// resources and handing the machine its config, and nothing a Reader may do besides.
+	accessMaintenance
 )
 
 func (a access) check(method string, req any) error {
@@ -118,6 +123,10 @@ func (a access) check(method string, req any) error {
 		return checkConfig(method, req)
 	case accessUpgrade:
 		return checkUpgrade(method, req)
+	case accessMembership:
+		return checkMembership(method, req)
+	case accessMaintenance:
+		return checkMaintenance(method, req)
 	case accessReadOnly:
 	}
 

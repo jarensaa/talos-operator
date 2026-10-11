@@ -322,7 +322,9 @@ func machineMetrics(tm *talosv1alpha1.TalosMachine, pool *talosv1alpha1.TalosMac
 		out = append(out, gauge(machineChangeDesc, 1, with(st.Config.ChangeClass)...))
 	}
 
-	if pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane {
+	// A machine that has not joined, or has left, is no control plane of the cluster yet or any
+	// more: it has no place in etcd to be missing from.
+	if pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane && st.JoinedAt != nil && st.RemovedAt == nil {
 		member := st.Etcd != nil && st.Etcd.MemberID != ""
 		isLearner := member && st.Etcd.IsLearner
 

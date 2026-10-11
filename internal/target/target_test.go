@@ -400,3 +400,58 @@ func TestResolveUpgraderNeedsUpgradesEnabled(t *testing.T) {
 		t.Fatal("an upgrader is its own client, not the reader's or the config writer's")
 	}
 }
+
+// The clients that add and remove machines are handed out only while membership is enabled, on a
+// cluster whose config the operator owns. Upgrades being enabled is not enough.
+func TestMembershipClientsNeedMembershipEnabled(t *testing.T) {
+	tc := cluster("happy", "talosconfig")
+	r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
+	outside := talos.SelectOptions{Exclude: netip.MustParseAddr("10.0.0.11")}
+	candidate := netip.MustParseAddr("10.0.0.19")
+
+	refused := []talosv1alpha1.Management{
+		{},
+		{Config: talosv1alpha1.ConfigManagementObserve, Membership: talosv1alpha1.CapabilityEnabled},
+		{Config: talosv1alpha1.ConfigManagementManage},
+		{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityEnabled},
+		{Config: talosv1alpha1.ConfigManagementManage, Membership: talosv1alpha1.CapabilityDisabled},
+	}
+
+	for _, m := range refused {
+		tc.Spec.Management = m
+
+		if _, err := r.ResolveRemover(context.Background(), tc, outside); !errors.Is(err, target.ErrMembershipDisabled) {
+			t.Fatalf("management %+v: expected ErrMembershipDisabled for a remover, got %v", m, err)
+		}
+
+		if _, err := r.ResolveMaintenance(context.Background(), tc, candidate); !errors.Is(err, target.ErrMembershipDisabled) {
+			t.Fatalf("management %+v: expected ErrMembershipDisabled for a maintenance connection, got %v", m, err)
+		}
+	}
+
+	if len(f.RemoverTargets()) != 0 {
+		t.Fatal("no client that can reset a node may even be built while membership is off")
+	}
+
+	tc.Spec.Management = talosv1alpha1.Management{Config: talosv1alpha1.ConfigManagementManage, Membership: talosv1alpha1.CapabilityEnabled}
+
+	remover, err := r.ResolveRemover(context.Background(), tc, outside)
+	if err != nil || remover == nil {
+		t.Fatalf("expected a remover once membership is enabled: %v", err)
+	}
+
+	// It reaches the node through another one, like every other client.
+	targets := f.RemoverTargets()
+	if len(targets) != 1 || len(targets[0].Endpoints) != 1 || targets[0].Endpoints[0].Addr != netip.MustParseAddr("10.0.0.12") {
+		t.Fatalf("remover targets: %+v", targets)
+	}
+
+	if len(f.Targets())+len(f.WriterTargets())+len(f.UpgraderTargets()) != 0 {
+		t.Fatal("a remover is its own client, not anyone else's")
+	}
+
+	maintenance, err := r.ResolveMaintenance(context.Background(), tc, candidate)
+	if err != nil || maintenance == nil {
+		t.Fatalf("expected a maintenance connection once membership is enabled: %v", err)
+	}
+}
