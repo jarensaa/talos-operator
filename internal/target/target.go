@@ -54,6 +54,8 @@ type ClientFactory interface {
 	ReaderFactory
 	ConfigWriter(ctx context.Context, t talos.Target) (talos.ConfigWriter, error)
 	Upgrader(ctx context.Context, t talos.Target) (talos.Upgrader, error)
+	Remover(ctx context.Context, t talos.Target) (talos.Remover, error)
+	Maintenance(ctx context.Context, addr netip.Addr) (talos.Maintenance, error)
 }
 
 // Target is everything needed to observe one cluster.
@@ -139,6 +141,44 @@ func (r *Resolver) ResolveUpgrader(ctx context.Context, tc *talosv1alpha1.TalosC
 	}
 
 	return r.Factory.Upgrader(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
+}
+
+// ErrMembershipDisabled is returned for the clients that add and remove machines while
+// membership is not enabled.
+var ErrMembershipDisabled = errors.New("machines are only added and removed while spec.management.membership is Enabled")
+
+func membership(tc *talosv1alpha1.TalosCluster) bool {
+	return tc.Spec.Management.Config == talosv1alpha1.ConfigManagementManage &&
+		tc.Spec.Management.Membership == talosv1alpha1.CapabilityEnabled
+}
+
+// ResolveRemover returns a client that can take a machine out of tc. It refuses unless
+// spec.management.membership is Enabled and config is Manage, so nothing else can obtain one
+// (docs/scope.md §8.1, invariant 6).
+func (r *Resolver) ResolveRemover(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions,
+) (talos.Remover, error) {
+	if !membership(tc) {
+		return nil, ErrMembershipDisabled
+	}
+
+	c, endpoints, err := r.identity(ctx, tc, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.Factory.Remover(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
+}
+
+// ResolveMaintenance returns the connection to a machine that waits in maintenance mode at addr,
+// to be added to tc. It refuses unless spec.management.membership is Enabled and config is
+// Manage. The connection carries none of the cluster's credentials; the caller closes it.
+func (r *Resolver) ResolveMaintenance(ctx context.Context, tc *talosv1alpha1.TalosCluster, addr netip.Addr,
+) (talos.Maintenance, error) {
+	if !membership(tc) {
+		return nil, ErrMembershipDisabled
+	}
+
+	return r.Factory.Maintenance(ctx, addr)
 }
 
 // identity loads tc's credentials and selects its endpoints.
