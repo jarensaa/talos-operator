@@ -19,6 +19,11 @@ updates:
     commit-message:
       prefix: fix
       include: scope
+    ignore:
+      # Newer releases of cel-go are the module cel.dev/cel-go, which Dependabot cannot make of
+      # this one: every run that tries fails (go_module_path_mismatch). It follows machinery,
+      # which requires it (docs/dev/dependencies.md).
+      - dependency-name: github.com/google/cel-go
     groups:
       # What the operator knows about Talos and Kubernetes is compiled in from these: which
       # Kubernetes a Talos release runs, which steps an upgrade may take, what a Kubernetes
