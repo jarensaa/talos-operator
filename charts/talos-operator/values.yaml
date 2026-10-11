@@ -70,6 +70,18 @@ metrics:
   # Serve metrics over HTTPS on 8443, authenticated via the Kubernetes API.
   enabled: true
 
+# What exists upstream. With it, a TalosCluster's status lists the Talos and Kubernetes releases
+# that are available, a Kubernetes upgrade over several minors goes through the newest release of
+# each, and an upgrade to an installer or a release that does not exist is refused before a node is
+# asked to pull it. The operator then asks the Image Factory a TalosCluster's installer names
+# (GET /versions, the schematic, the installer's manifest) and the Kubernetes release site, about
+# once an hour, over HTTPS. Nothing is upgraded because of what they answer. Switch it off where
+# the operator must not, or cannot, reach them: everything else works without.
+versionSources:
+  enabled: true
+  # Where Kubernetes publishes its releases; https://dl.k8s.io if empty.
+  kubernetesReleases: ""
+
 # Gates (spec.rollout.gates on a TalosCluster) are conditions on objects in the cluster, such as a
 # storage cluster's health. The operator reads a gate's object with its own ServiceAccount and may
 # read nothing it is not granted here: one rule for every kind a gate names, with the verb get.

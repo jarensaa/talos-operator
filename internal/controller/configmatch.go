@@ -177,6 +177,22 @@ func renderMachine(ctx context.Context, c client.Reader, tc *talosv1alpha1.Talos
 	return desired, resolved, nil
 }
 
+// RenderMachine renders a machine's config as the controllers do, for a caller outside them: the
+// check that runs before a spec reaches a cluster (internal/validate). problem says why the spec
+// does not render; err is a failure to read what it refers to.
+func RenderMachine(ctx context.Context, c client.Reader, tc *talosv1alpha1.TalosCluster, pool *talosv1alpha1.TalosMachinePool,
+	tm *talosv1alpha1.TalosMachine,
+) (rendered *render.Config, problem string, err error) {
+	rendered, _, err = renderMachine(ctx, c, tc, pool, tm)
+
+	var cp *configProblem
+	if errors.As(err, &cp) {
+		return nil, cp.msg, nil
+	}
+
+	return rendered, "", err
+}
+
 // observeConfig renders the machine's desired config and compares it with the live one per
 // document (docs/scope.md §7.1 stage 2). It reads Kubernetes objects only and never writes to
 // Talos. Only API errors of the management cluster are returned.

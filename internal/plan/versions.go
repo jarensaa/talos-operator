@@ -105,7 +105,7 @@ func KubernetesHops(from, to string, releases Releases) ([]string, string) {
 
 	switch {
 	case desired.LessThan(current):
-		return nil, fmt.Sprintf("Kubernetes is not downgraded: the cluster runs %s and the spec asks for %s", core(current), core(desired))
+		return nil, fmt.Sprintf("Kubernetes is not downgraded, and %s is older than %s", core(desired), core(current))
 	case desired.Major() != current.Major():
 		return nil, fmt.Sprintf("there is no upgrade from Kubernetes %s to %s", core(current), core(desired))
 	}
