@@ -18,6 +18,17 @@ Packages verified to build together: machinery
 
 and go-kubernetes `kubernetes/{upgrade,manifests,ssa}`, plus controller-runtime and `pkg/envtest`.
 
+## Keeping them current
+
+Dependabot proposes the bumps (`.github/dependabot.yml`): weekly, a few days after a release came out, grouped so that what has to move together does. Nothing is merged by itself; a pull request that changes `go.mod` runs the e2e like any other.
+
+- **machinery and go-kubernetes, patch releases.** These carry what the operator knows about Talos and Kubernetes: which Kubernetes a Talos release runs, which steps an upgrade may take, what a Kubernetes release removed. The operator keeps no table of its own (docs/scope.md §7.5), so merging these is how that knowledge stays current. They are committed as `fix(deps)` and therefore released.
+- **A new minor of machinery** is a new Talos to support, not a bump. It arrives as a pull request of its own and stays open until the work is done: the config version contract, the versions the e2e runs, and the table above.
+- **`k8s.io/*` and controller-runtime** move together, in one pull request. The envtest binaries follow them: the `Makefile` reads their version from `go.mod`.
+- **GitHub Actions and the release tooling** are committed as `ci` and `chore`, and release nothing.
+
+Not covered, and bumped by hand: the Go toolchain, the tools the `Makefile` pins (golangci-lint, which `lint.yml` names too, controller-gen and kustomize), and the `talosctl`, Talos and Kubernetes versions of the e2e (docs/dev/e2e.md).
+
 ## Notes
 
 - **No `replace` directives are needed.** machinery's go.mod replaces `github.com/mdlayher/ethtool` with a Sidero fork. Downstream modules ignore that, and none of the packages above need the fork's extra APIs: the build resolves upstream `ethtool v0.6.1` and compiles cleanly. Revisit if we import machinery network helpers.
