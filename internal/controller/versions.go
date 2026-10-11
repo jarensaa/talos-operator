@@ -256,6 +256,11 @@ func (r *TalosClusterReconciler) kubernetesAhead(ctx context.Context, tc *talosv
 
 		latest, err := r.Catalog.KubernetesLatest(ctx, fmt.Sprintf("%d.%d", from.Major(), minor))
 		if errors.Is(err, catalog.ErrNotFound) {
+			if minor == from.Minor() {
+				// The cluster's own minor is no longer listed. That says nothing about the next.
+				continue
+			}
+
 			// Not released yet, and so nothing after it is either.
 			break
 		}
