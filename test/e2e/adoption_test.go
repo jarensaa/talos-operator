@@ -37,6 +37,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -1436,6 +1437,355 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}).WithContext(ctx).WithTimeout(5 * time.Minute).Should(Succeed())
 		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(150*time.Minute))
+
+	// Adding and removing machines (docs/scope.md §7.6, §7.7), on the machine the harness left in
+	// maintenance mode. The specs hand that one machine on to each other: added as a worker, taken
+	// out again, on three control planes made a control plane in the place of another, and at the
+	// end whatever machine is left waiting is added once more to die.
+	Context("membership", func() {
+		var (
+			// spare is the address of the machine that waits in maintenance mode, and spareUUID
+			// what it says its hardware is.
+			spare     netip.Addr
+			spareUUID string
+		)
+
+		// candidate asks a machine in maintenance mode what it is, as the operator does: without
+		// credentials, because such a machine has none to check.
+		candidate := func(ctx context.Context, addr netip.Addr) (talos.Candidate, error) {
+			f := talos.NewFactory()
+			defer f.Close()
+
+			m, err := f.Maintenance(ctx, addr)
+			if err != nil {
+				return talos.Candidate{}, err
+			}
+
+			defer m.Close() //nolint:errcheck // only read from
+
+			ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+
+			return m.Probe(ctx)
+		}
+
+		// declare creates a TalosMachine for the machine at addr, as a user would write it: where
+		// it is, what its hardware says it is, and what only this machine has in its config. The
+		// taint keeps the operator's own pods off it: its image is in no registry, and was only
+		// loaded into the nodes the harness built.
+		declare := func(ctx context.Context, name string, role talosv1alpha1.MachineRole, addr netip.Addr, uuid string,
+		) *talosv1alpha1.TalosMachine {
+			GinkgoHelper()
+
+			tm := &talosv1alpha1.TalosMachine{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: name, Namespace: testNamespace, Labels: map[string]string{talosv1alpha1.LabelCluster: tc.Name},
+				},
+				Spec: talosv1alpha1.TalosMachineSpec{
+					PoolRef:  corev1.LocalObjectReference{Name: pools[role].Name},
+					Address:  addr.String(),
+					Identity: talosv1alpha1.MachineIdentity{SystemUUID: uuid},
+					Config: []talosv1alpha1.ConfigSource{{Inline: "apiVersion: v1alpha1\nkind: HostnameConfig\nauto: off\nhostname: " + name +
+						"\n---\napiVersion: v1alpha1\nkind: KubeNodeConfig\ntaints:\n  e2e.talos-operator/added: \"true:NoSchedule\"\n"}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, tm)).To(Succeed())
+
+			return tm
+		}
+
+		setDesiredState := func(ctx context.Context, tm *talosv1alpha1.TalosMachine, state talosv1alpha1.DesiredState) {
+			GinkgoHelper()
+
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tm), tm)).To(Succeed())
+
+				tm.Spec.DesiredState = state
+				g.Expect(k8sClient.Update(ctx, tm)).To(Succeed())
+			}).WithContext(ctx).WithTimeout(30 * time.Second).Should(Succeed())
+		}
+
+		membershipCurrent := func() *metav1.Condition {
+			return meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionMembershipCurrent)
+		}
+
+		// settled waits until the cluster's machines are the ones that are declared and nothing is
+		// in flight. A halted operation ends the wait at once.
+		settled := func(ctx context.Context, what string, timeout time.Duration, also func(Gomega)) {
+			GinkgoHelper()
+
+			Eventually(func(g Gomega) {
+				refresh(ctx, g)
+				halted(tc.Status.Operation, what)
+
+				g.Expect(tc.Status.Operation).To(BeNil(), "%+v", tc.Status.Operation)
+				g.Expect(membershipCurrent()).NotTo(BeNil())
+				g.Expect(membershipCurrent().Status).To(Equal(metav1.ConditionTrue), membershipCurrent().Message)
+
+				if also != nil {
+					also(g)
+				}
+			}).WithContext(ctx).WithTimeout(timeout).WithPolling(10 * time.Second).Should(Succeed())
+		}
+
+		// joined checks that a machine is a node of the cluster in every sense.
+		joined := func(ctx context.Context, tm *talosv1alpha1.TalosMachine) func(Gomega) {
+			return func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tm), tm)).To(Succeed())
+				g.Expect(tm.Status.JoinedAt).NotTo(BeNil())
+				g.Expect(tm.Status.RemovedAt).To(BeNil())
+				g.Expect(tm.Status.Phase).To(Equal(talosv1alpha1.MachinePhase("Ready")))
+
+				node := &corev1.Node{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: tm.Name}, node)).To(Succeed())
+				g.Expect(node.Status.Conditions).To(ContainElement(SatisfyAll(
+					HaveField("Type", corev1.NodeReady), HaveField("Status", corev1.ConditionTrue))))
+			}
+		}
+
+		// gone checks that a machine has left: recorded as removed, its Node deleted, and the
+		// machine itself waiting in maintenance mode again, having forgotten the cluster.
+		gone := func(ctx context.Context, tm *talosv1alpha1.TalosMachine, uuid string) func(Gomega) {
+			return func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tm), tm)).To(Succeed())
+				g.Expect(tm.Status.RemovedAt).NotTo(BeNil())
+
+				err := k8sClient.Get(ctx, client.ObjectKey{Name: tm.Status.Identity.KubernetesNodeName}, &corev1.Node{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the machine's Node is still there: %v", err)
+
+				found, err := candidate(ctx, netip.MustParseAddr(tm.Spec.Address))
+				g.Expect(err).NotTo(HaveOccurred(), "the machine does not answer in maintenance mode")
+				g.Expect(found.Stage).To(Equal(talos.StageMaintenance))
+				g.Expect(strings.EqualFold(found.UUID, uuid)).To(BeTrue())
+			}
+		}
+
+		lastControlPlane := func() *talosv1alpha1.TalosMachine {
+			GinkgoHelper()
+
+			controlPlanes := addrsOf("E2E_CONTROLPLANES")
+			last := controlPlanes[len(controlPlanes)-1].String()
+
+			for _, tm := range machines {
+				if tm.Spec.Address == last {
+					return tm
+				}
+			}
+
+			Fail("no TalosMachine for the control plane at " + last)
+
+			return nil
+		}
+
+		BeforeAll(func(ctx context.Context) {
+			spares := addrsOf("E2E_MAINTENANCE_NODES")
+			if len(spares) == 0 {
+				Skip("the harness cluster has no machine in maintenance mode (MAINTENANCE_NODES)")
+			}
+
+			spare = spares[0]
+
+			found, err := candidate(ctx, spare)
+			Expect(err).NotTo(HaveOccurred(), "the spare machine must wait in maintenance mode")
+			Expect(found.Stage).To(Equal(talos.StageMaintenance))
+
+			spareUUID = found.UUID
+
+			inSync(ctx, 5*time.Minute)
+			updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Management.Membership = talosv1alpha1.CapabilityEnabled })
+		})
+
+		It("adds a machine that waits in maintenance mode, and sends nothing to one that is not the machine declared", func(ctx context.Context) {
+			ended := rollouts(ctx)
+
+			By("declaring the machine with the identity of another")
+			wrong := declare(ctx, "e2e-added", talosv1alpha1.MachineRoleWorker, spare, "aaaaaaaa-bbbb-4ccc-8ddd-999999999999")
+
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(wrong), wrong)).To(Succeed())
+
+				cond := meta.FindStatusCondition(wrong.Status.Conditions, talosv1alpha1.ConditionProvisionable)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Reason).To(Equal(talosv1alpha1.ReasonIdentityMismatch), cond.Message)
+			}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
+
+			Consistently(func(g Gomega) {
+				refresh(ctx, g)
+				g.Expect(tc.Status.Operation).To(BeNil(), "nothing is begun for a machine that is another one")
+
+				found, err := candidate(ctx, spare)
+				g.Expect(err).NotTo(HaveOccurred(), "the machine was sent something: it no longer waits in maintenance mode")
+				g.Expect(found.Stage).To(Equal(talos.StageMaintenance))
+			}).WithContext(ctx).WithTimeout(time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+
+			// A machine that never was a member is nobody's to protect.
+			deleteMachine(ctx, wrong)
+
+			By("declaring it as what it is")
+			added := declare(ctx, "e2e-added", talosv1alpha1.MachineRoleWorker, spare, spareUUID)
+			settled(ctx, "addition", 30*time.Minute, joined(ctx, added))
+
+			Expect(tc.Status.History).To(HaveLen(ended + 1))
+			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationAddMachine))
+			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+			Expect(tc.Status.History[0].Completed).To(Equal([]string{added.Name}))
+
+			inSync(ctx, 5*time.Minute)
+			Expect(rejectedRPCs(ctx)).To(BeZero())
+		}, NodeTimeout(45*time.Minute))
+
+		It("refuses to take out a control plane the cluster cannot spare", func(ctx context.Context) {
+			controlPlane := lastControlPlane()
+			ended := rollouts(ctx)
+
+			setDesiredState(ctx, controlPlane, talosv1alpha1.DesiredStateRemoved)
+
+			Eventually(func(g Gomega) {
+				refresh(ctx, g)
+
+				blocked := meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionRolloutBlocked)
+				g.Expect(blocked).NotTo(BeNil())
+				g.Expect(blocked.Reason).To(BeElementOf(plan.BlockQuorumAtRisk, plan.BlockLastControlPlane), blocked.Message)
+			}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
+
+			Consistently(func(g Gomega) {
+				refresh(ctx, g)
+				g.Expect(tc.Status.Operation).To(BeNil())
+
+				node := &corev1.Node{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: controlPlane.Status.Identity.KubernetesNodeName}, node)).To(Succeed())
+				g.Expect(node.Spec.Unschedulable).To(BeFalse(), "a node that may not leave is not cordoned either")
+			}).WithContext(ctx).WithTimeout(time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+
+			setDesiredState(ctx, controlPlane, talosv1alpha1.DesiredStatePresent)
+			inSync(ctx, 3*time.Minute)
+			Expect(rollouts(ctx)).To(Equal(ended))
+		}, NodeTimeout(10*time.Minute))
+
+		It("takes the machine out again: drained, reset, waiting in maintenance mode, its Node deleted", func(ctx context.Context) {
+			added := &talosv1alpha1.TalosMachine{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNamespace, Name: "e2e-added"}, added)).To(Succeed())
+
+			// Asked to leave is not gone: the API server keeps the TalosMachine of a node that is
+			// still a member.
+			setDesiredState(ctx, added, talosv1alpha1.DesiredStateRemoved)
+			Expect(k8sClient.Delete(ctx, added)).To(MatchError(ContainSubstring("can be deleted once it is out of the cluster")))
+
+			settled(ctx, "removal", 30*time.Minute, gone(ctx, added, spareUUID))
+
+			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationRemoveMachine))
+			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+
+			By("deleting the TalosMachine of the machine that has left")
+			Expect(k8sClient.Delete(ctx, added)).To(Succeed())
+
+			inSync(ctx, 5*time.Minute)
+			Expect(rejectedRPCs(ctx)).To(BeZero())
+		}, NodeTimeout(40*time.Minute))
+
+		It("replaces a control plane, with three voting members of etcd throughout", func(ctx context.Context) {
+			if len(addrsOf("E2E_CONTROLPLANES")) < 3 {
+				Skip("needs three control planes: one is only taken out of etcd while three voting members remain")
+			}
+
+			old := lastControlPlane()
+			oldUUID := old.Spec.Identity.SystemUUID
+
+			// One commit: the new machine is declared, and the old one is to go.
+			replacement := declare(ctx, "e2e-replacement", talosv1alpha1.MachineRoleControlPlane, spare, spareUUID)
+			setDesiredState(ctx, old, talosv1alpha1.DesiredStateRemoved)
+
+			fewest := 99
+
+			settled(ctx, "replacement", 60*time.Minute, func(g Gomega) {
+				// Asked at every look, until both are done.
+				if tc.Status.Observed != nil && len(tc.Status.Observed.EtcdMembers) > 0 {
+					voters := 0
+
+					for _, m := range tc.Status.Observed.EtcdMembers {
+						if !m.IsLearner {
+							voters++
+						}
+					}
+
+					fewest = min(fewest, voters)
+				}
+
+				joined(ctx, replacement)(g)
+				gone(ctx, old, oldUUID)(g)
+			})
+
+			Expect(fewest).To(BeNumerically(">=", 3), "etcd must never have had fewer than three voting members")
+			Expect(tc.Status.Observed.EtcdMembers).To(HaveLen(len(addrsOf("E2E_CONTROLPLANES"))))
+			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationRemoveMachine), "the old one left after the new one joined")
+			Expect(tc.Status.History[1].Type).To(Equal(talosv1alpha1.OperationAddMachine))
+
+			// The machine that waits now is the one that was a control plane.
+			spare, spareUUID = netip.MustParseAddr(old.Spec.Address), oldUUID
+
+			Expect(k8sClient.Delete(ctx, old)).To(Succeed())
+
+			inSync(ctx, 10*time.Minute)
+			Expect(rejectedRPCs(ctx)).To(BeZero())
+		}, NodeTimeout(75*time.Minute))
+
+		It("takes out a machine that died, once a human says it is dead", func(ctx context.Context) {
+			By("adding the machine that waits, to have one to lose")
+			doomed := declare(ctx, "e2e-doomed", talosv1alpha1.MachineRoleWorker, spare, spareUUID)
+			settled(ctx, "addition", 30*time.Minute, joined(ctx, doomed))
+
+			// As far as the cluster can tell, a machine that drops everything it would send to the
+			// control planes is dead: its Talos API answers through none of them, and its kubelet
+			// reaches no API server. Nothing short of the harness's own tools gets it back.
+			By("cutting the machine off for good, behind the operator's back")
+			cfgs, err := harness.MachineConfig(ctx, spare)
+			Expect(err).NotTo(HaveOccurred())
+
+			isolated := withPatch(cfgs.Active, blackholeDocuments(addrsOf("E2E_CONTROLPLANES")))
+			Expect(harnessWriter(ctx).ApplyConfig(ctx, spare, isolated, talos.ApplyNoReboot, 0)).To(Succeed())
+
+			setDesiredState(ctx, doomed, talosv1alpha1.DesiredStateRemoved)
+
+			By("waiting for the removal to halt, with nothing taken from the cluster")
+			var token string
+
+			Eventually(func(g Gomega) {
+				refresh(ctx, g)
+				g.Expect(tc.Status.Operation).NotTo(BeNil(), "no removal in flight")
+				g.Expect(tc.Status.Operation.Failure).NotTo(BeNil(), "not halted yet: %+v", tc.Status.Operation.Current)
+				g.Expect(tc.Status.Operation.Failure.Reason).To(Equal(plan.FailNodeGone), tc.Status.Operation.Failure.Message)
+
+				token = tc.Status.Operation.Failure.Token
+			}).WithContext(ctx).WithTimeout(25 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+
+			Expect(tc.Status.Operation.Failure.Remediation).To(ContainSubstring(talosv1alpha1.AnnotationConfirmDead))
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: doomed.Name}, &corev1.Node{})).To(Succeed(),
+				"the Node of a machine that only does not answer is not deleted on a guess")
+
+			By("saying that it is dead")
+			updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
+				if tc.Annotations == nil {
+					tc.Annotations = map[string]string{}
+				}
+
+				tc.Annotations[talosv1alpha1.AnnotationConfirmDead] = token
+			})
+
+			settled(ctx, "removal", 20*time.Minute, func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(doomed), doomed)).To(Succeed())
+				g.Expect(doomed.Status.RemovedAt).NotTo(BeNil())
+
+				err := k8sClient.Get(ctx, client.ObjectKey{Name: doomed.Name}, &corev1.Node{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "the dead machine's Node is still there: %v", err)
+			})
+
+			// The cluster's discovery goes on listing the machine. The cluster is whole without it.
+			inSync(ctx, 10*time.Minute)
+			Eventually(conditionTrue(ctx, tc, clusterConditions, talosv1alpha1.ConditionHealthy)).
+				WithContext(ctx).WithTimeout(5 * time.Minute).Should(Succeed())
+			Expect(rejectedRPCs(ctx)).To(BeZero())
+		}, NodeTimeout(90*time.Minute))
+	})
 })
 
 // diffOf returns a machine's last reported config diff, for failure messages.

@@ -21,7 +21,8 @@ KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.36.0}
 KUBERNETES_UPGRADE_TO=${KUBERNETES_UPGRADE_TO:-1.37.0}
 CONTROLPLANES=${CONTROLPLANES:-3}
 WORKERS=${WORKERS:-1}
-# Extra workers left in maintenance mode, for expansion tests (M7).
+# Extra machines left in maintenance mode, without a config: the ones the suite has the operator
+# add to the cluster (docs/scope.md §7.6).
 MAINTENANCE_NODES=${MAINTENANCE_NODES:-0}
 CIDR_PREFIX=${CIDR_PREFIX:-10.5.0}
 # Per-VM resources; CI runners are small, so these are tunable.
@@ -179,6 +180,13 @@ wait_for_maintenance() { # ip
 for t in "${targets[@]}"; do
   read -r ip _ <<<"$t"
   log "waiting for $ip to answer in maintenance mode"
+  wait_for_maintenance "$ip"
+done
+
+# The spare machines get no config: they are for the operator to add. They have to be up before
+# the suite declares them, though.
+for ip in ${maintenance_ips[@]+"${maintenance_ips[@]}"}; do
+  log "waiting for the spare machine $ip to answer in maintenance mode"
   wait_for_maintenance "$ip"
 done
 
