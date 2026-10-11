@@ -42,6 +42,9 @@ var readOnlyMethods = map[string]bool{
 	machineapi.MachineService_Version_FullMethodName:        true,
 	machineapi.MachineService_EtcdMemberList_FullMethodName: true,
 	machineapi.MachineService_EtcdStatus_FullMethodName:     true,
+	machineapi.MachineService_EtcdAlarmList_FullMethodName:  true,
+	machineapi.MachineService_Logs_FullMethodName:           true,
+	machineapi.MachineService_Dmesg_FullMethodName:          true,
 	clusterapi.ClusterService_HealthCheck_FullMethodName:    true,
 	cosiGetMethod:   true,
 	cosiListMethod:  true,
@@ -112,6 +115,8 @@ const (
 	accessUpgrade
 	// accessMembership additionally allows what a removal is made of (checkMembership).
 	accessMembership
+	// accessUpkeep additionally allows what the upkeep of etcd is made of (checkUpkeep).
+	accessUpkeep
 	// accessMaintenance is the connection to a machine in maintenance mode: it allows reading
 	// resources and handing the machine its config, and nothing a Reader may do besides.
 	accessMaintenance
@@ -125,6 +130,8 @@ func (a access) check(method string, req any) error {
 		return checkUpgrade(method, req)
 	case accessMembership:
 		return checkMembership(method, req)
+	case accessUpkeep:
+		return checkUpkeep(method, req)
 	case accessMaintenance:
 		return checkMaintenance(method, req)
 	case accessReadOnly:

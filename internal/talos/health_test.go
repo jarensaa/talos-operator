@@ -1,0 +1,216 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package talos
+
+import (
+	"context"
+	"slices"
+	"strings"
+	"testing"
+
+	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
+	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
+	timeres "github.com/siderolabs/talos/pkg/machinery/resources/time"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+)
+
+func TestCheckUpkeep(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		req    any
+		allow  bool
+	}{
+		{"defragment", machineapi.MachineService_EtcdDefragment_FullMethodName, &emptypb.Empty{}, true},
+		{"forfeit leadership", machineapi.MachineService_EtcdForfeitLeadership_FullMethodName, &machineapi.EtcdForfeitLeadershipRequest{}, true},
+		{"listing alarms", machineapi.MachineService_EtcdAlarmList_FullMethodName, &emptypb.Empty{}, true},
+		{"reading logs", machineapi.MachineService_Logs_FullMethodName, nil, true},
+		// An alarm that is disarmed without its cause being gone is an alarm that is hidden.
+		{"disarming alarms", machineapi.MachineService_EtcdAlarmDisarm_FullMethodName, &emptypb.Empty{}, false},
+		{"removing a member", machineapi.MachineService_EtcdRemoveMemberByID_FullMethodName, &machineapi.EtcdRemoveMemberByIDRequest{}, false},
+		{"leaving etcd", machineapi.MachineService_EtcdLeaveCluster_FullMethodName, &machineapi.EtcdLeaveClusterRequest{}, false},
+		{"a reset", machineapi.MachineService_Reset_FullMethodName, reset(nil), false},
+		{"a reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, false},
+		{"apply", machineapi.MachineService_ApplyConfiguration_FullMethodName,
+			&machineapi.ApplyConfigurationRequest{Mode: machineapi.ApplyConfigurationRequest_NO_REBOOT}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := accessUpkeep.check(tt.method, tt.req)
+			if tt.allow && err != nil {
+				t.Fatalf("expected allowed, got %v", err)
+			}
+
+			if !tt.allow && status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("expected PermissionDenied, got %v", err)
+			}
+		})
+	}
+
+	// Defragmenting takes a member away for a moment: no other connection may ask for it, and
+	// none at all disarms an alarm.
+	for _, a := range []access{accessReadOnly, accessConfig, accessUpgrade, accessMembership, accessMaintenance} {
+		if status.Code(a.check(machineapi.MachineService_EtcdDefragment_FullMethodName, &emptypb.Empty{})) != codes.PermissionDenied {
+			t.Fatalf("a defragmentation must be refused on a connection with access %d", a)
+		}
+	}
+
+	for _, a := range []access{accessReadOnly, accessConfig, accessUpgrade, accessMembership, accessMaintenance, accessUpkeep} {
+		if status.Code(a.check(machineapi.MachineService_EtcdAlarmDisarm_FullMethodName, &emptypb.Empty{})) != codes.PermissionDenied {
+			t.Fatalf("disarming an alarm must be refused on a connection with access %d", a)
+		}
+	}
+}
+
+func TestMachineryReadsWhatTalosSaysAboutANode(t *testing.T) {
+	api, c := serve(t, dial(accessReadOnly)...)
+	r := reader(c)
+	ctx := context.Background()
+
+	warning := runtime.NewDiagnostic(runtime.NamespaceName, "address-overlap")
+	warning.TypedSpec().Message = "host and Kubernetes pod/service CIDR addresses overlap"
+	create(t, api, warning)
+
+	clock := timeres.NewStatus()
+	clock.TypedSpec().Synced = false
+	create(t, api, clock)
+
+	link := func(name string, index uint32, change func(*network.LinkStatusSpec)) {
+		res := network.NewLinkStatus(network.NamespaceName, name)
+		res.TypedSpec().Type, res.TypedSpec().Index = nethelpers.LinkEther, index
+		res.TypedSpec().OperationalState = nethelpers.OperStateUp
+		change(res.TypedSpec())
+		create(t, api, res)
+	}
+	link("bond0", 9, func(s *network.LinkStatusSpec) { s.Kind = "bond" })
+	link("eth0", 2, func(s *network.LinkStatusSpec) { s.SpeedMegabits, s.MasterIndex, s.SlaveKind = 10000, 9, "bond" })
+	link("eth1", 3, func(s *network.LinkStatusSpec) {
+		s.OperationalState, s.MasterIndex, s.SlaveKind = nethelpers.OperStateDown, 9, "bond"
+	})
+	link("lo", 1, func(s *network.LinkStatusSpec) { s.Type = nethelpers.LinkLoopbck })
+
+	volume := func(name string, phase block.VolumePhase, message string) {
+		res := block.NewVolumeStatus(block.NamespaceName, name)
+		res.TypedSpec().Phase, res.TypedSpec().ErrorMessage = phase, message
+		create(t, api, res)
+	}
+	volume("STATE", block.VolumePhaseReady, "")
+	volume("EPHEMERAL", block.VolumePhaseFailed, "no space left on the disk")
+
+	diagnostics, err := r.Diagnostics(ctx, apiNode)
+	if err != nil || len(diagnostics) != 1 || diagnostics[0].ID != "address-overlap" || !strings.Contains(diagnostics[0].Message, "overlap") {
+		t.Fatalf("diagnostics: got %+v, %v", diagnostics, err)
+	}
+
+	if synced, err := r.TimeSynced(ctx, apiNode); err != nil || synced {
+		t.Fatalf("time: got %t, %v", synced, err)
+	}
+
+	// A bond is as healthy as its members: only what is a physical link is listed, with the bond
+	// it belongs to.
+	links, err := r.Links(ctx, apiNode)
+	if err != nil || !slices.Equal(links, []Link{{Name: "eth0", Up: true, SpeedMbps: 10000, Bond: "bond0"}, {Name: "eth1", Bond: "bond0"}}) {
+		t.Fatalf("links: got %+v, %v", links, err)
+	}
+
+	volumes, err := r.Volumes(ctx, apiNode)
+	want := []Volume{{Name: "EPHEMERAL", Phase: "failed", Error: "no space left on the disk"}, {Name: "STATE", Phase: VolumeReady}}
+
+	if err != nil || !slices.Equal(volumes, want) {
+		t.Fatalf("volumes: got %+v, %v", volumes, err)
+	}
+}
+
+func TestMachineryReadsEtcdAlarmsAndLogs(t *testing.T) {
+	api, c := serve(t, dial(accessReadOnly)...)
+	r := reader(c)
+	ctx := context.Background()
+
+	alarms, err := r.EtcdAlarms(ctx, apiNode)
+	if err != nil || alarms == nil || len(alarms) != 0 {
+		t.Fatalf("no alarms is an empty list, not an unknown one: got %#v, %v", alarms, err)
+	}
+
+	api.alarms = []*machineapi.EtcdMemberAlarm{
+		{MemberId: 0xa1, Alarm: machineapi.EtcdMemberAlarm_NOSPACE},
+		{MemberId: 0xb2, Alarm: machineapi.EtcdMemberAlarm_CORRUPT},
+		{MemberId: 0xc3, Alarm: machineapi.EtcdMemberAlarm_NONE},
+	}
+
+	alarms, err = r.EtcdAlarms(ctx, apiNode)
+	if err != nil || !slices.Equal(alarms, []EtcdAlarm{{MemberID: 0xa1, Type: AlarmNoSpace}, {MemberID: 0xb2, Type: AlarmCorrupt}}) {
+		t.Fatalf("got %+v, %v", alarms, err)
+	}
+
+	api.logs = map[string][]string{
+		"kubelet": {"first line\nsecond", " line\n"},
+		"dmesg":   {"kern: info: booted\n"},
+		// More than is kept: the end is what says what went wrong.
+		"etcd": {strings.Repeat("old line\n", maxLog/9), strings.Repeat("x", maxLog/2) + "\n", "the last line\n"},
+	}
+
+	if got, err := r.Logs(ctx, apiNode, "kubelet", 100); err != nil || string(got) != "first line\nsecond line\n" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+
+	if got, err := r.Dmesg(ctx, apiNode); err != nil || string(got) != "kern: info: booted\n" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+
+	got, err := r.Logs(ctx, apiNode, "etcd", 100)
+	if err != nil || len(got) > maxLog || !strings.HasSuffix(string(got), "the last line\n") || strings.HasPrefix(string(got), "ld line") {
+		t.Fatalf("got %d bytes ending %q, %v", len(got), got[max(0, len(got)-20):], err)
+	}
+
+	// Reading is all a Reader's connection does about etcd.
+	if _, err := c.EtcdDefragment(client.WithNode(ctx, apiNode.String())); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a read-only connection must refuse to defragment, got %v", err)
+	}
+
+	if _, err := c.EtcdAlarmDisarm(client.WithNode(ctx, apiNode.String())); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a read-only connection must refuse to disarm alarms, got %v", err)
+	}
+}
+
+func TestKeeperDefragmentsTheMemberItIsAskedFor(t *testing.T) {
+	api, c := serve(t, dial(accessUpkeep)...)
+	keeper := &machineryKeeper{*reader(c)}
+	ctx := context.Background()
+
+	if err := keeper.DefragmentEtcd(ctx, apiNode); err != nil || api.defrags != 1 {
+		t.Fatalf("got %d defragmentations, %v", api.defrags, err)
+	}
+
+	if got := api.nodes[machineapi.MachineService_EtcdDefragment_FullMethodName]; !slices.Equal(got, []string{apiNode.String()}) {
+		t.Fatalf("the defragmentation was addressed to %v", got)
+	}
+
+	if _, err := c.EtcdAlarmDisarm(client.WithNode(ctx, apiNode.String())); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("the upkeep connection must refuse to disarm alarms, got %v", err)
+	}
+
+	if err := c.Reboot(client.WithNode(ctx, apiNode.String())); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("the upkeep connection must refuse a reboot, got %v", err)
+	}
+}
