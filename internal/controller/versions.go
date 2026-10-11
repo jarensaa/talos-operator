@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
@@ -40,8 +41,13 @@ import (
 // Kubernetes minor on the way to the version the spec asks for, and to refuse an upgrade to
 // something that certainly does not exist before a node is asked to pull it.
 
-// maxKubernetesAhead bounds how many Kubernetes minors ahead of the cluster's are asked about.
-const maxKubernetesAhead = 6
+const (
+	// maxKubernetesAhead bounds how many Kubernetes minors ahead of the cluster's are asked about.
+	maxKubernetesAhead = 6
+	// upstreamTimeout bounds what one pass spends asking upstream. What is not answered in time is
+	// not known, which refuses nothing.
+	upstreamTimeout = 20 * time.Second
+)
 
 // versionRules is what Talos says about versions, as the version planner asks it.
 func versionRules() plan.VersionRules {
@@ -158,6 +164,9 @@ func (r *TalosClusterReconciler) available(ctx context.Context, tc *talosv1alpha
 	if r.Catalog == nil || tc.Spec.ConfigGeneration == nil || tc.Spec.ConfigGeneration.Installer == nil || current.Talos == "" {
 		return known
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
+	defer cancel()
 
 	out := &talosv1alpha1.AvailableVersions{}
 	if known != nil {
@@ -285,6 +294,9 @@ func (r *TalosClusterReconciler) installerProblem(ctx context.Context, tc *talos
 
 	installer := tc.Spec.ConfigGeneration.Installer
 
+	ctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
+	defer cancel()
+
 	err := r.Catalog.Installer(ctx, installer.FactoryURL, installer.Platform, install.SchematicID, install.Version)
 	if errors.Is(err, catalog.ErrNotFound) {
 		return err.Error()
@@ -293,15 +305,37 @@ func (r *TalosClusterReconciler) installerProblem(ctx context.Context, tc *talos
 	return ""
 }
 
-// releaseProblem says that a Kubernetes release certainly does not exist, or returns "".
-func (r *TalosClusterReconciler) releaseProblem(ctx context.Context, release string) string {
+// imagesProblem says which of the images a Kubernetes upgrade is about to pull certainly do not
+// exist, or returns "". The newest release of Kubernetes is published a while before the kubelet
+// image Talos runs is: asking for the images themselves is what tells.
+func (r *TalosClusterReconciler) imagesProblem(ctx context.Context, images map[string]string) string {
 	if r.Catalog == nil {
 		return ""
 	}
 
-	if err := r.Catalog.Kubernetes(ctx, release); errors.Is(err, catalog.ErrNotFound) {
-		return err.Error()
+	ctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
+	defer cancel()
+
+	unique := make([]string, 0, len(images))
+	for _, image := range images {
+		if !slices.Contains(unique, image) {
+			unique = append(unique, image)
+		}
 	}
 
-	return ""
+	slices.Sort(unique)
+
+	var missing []string
+
+	for _, image := range unique {
+		if err := r.Catalog.Image(ctx, image); errors.Is(err, catalog.ErrNotFound) {
+			missing = append(missing, image)
+		}
+	}
+
+	if len(missing) == 0 {
+		return ""
+	}
+
+	return "these images do not exist: " + strings.Join(missing, ", ")
 }

@@ -24,13 +24,14 @@ import (
 	"time"
 )
 
-// How long an answer is kept. What exists upstream changes with a release, a few times a month.
-// A "no" is asked again sooner, since the release someone waits for may be minutes away, and a
-// source that did not answer sooner still, without being asked on every pass of a controller.
+// How long an answer is kept. The services asked are other people's, run for everyone: they are
+// asked as rarely as is of use. What exists upstream changes with a release, a few times a
+// month. A "no" is asked again sooner, since the release someone waits for may be minutes away,
+// and a source that did not answer is left alone for as long.
 const (
-	DefaultKeep       = time.Hour
+	DefaultKeep       = 6 * time.Hour
 	DefaultKeepAbsent = 10 * time.Minute
-	DefaultRetry      = 2 * time.Minute
+	DefaultRetry      = 10 * time.Minute
 )
 
 // Cached is a Source that remembers the answers of another. It is safe for concurrent use.
@@ -113,10 +114,10 @@ func (c *Cached) KubernetesLatest(ctx context.Context, minor string) (string, er
 	return remember(c, "latest "+minor, func() (string, error) { return c.Source.KubernetesLatest(ctx, minor) })
 }
 
-// Kubernetes implements Source.
-func (c *Cached) Kubernetes(ctx context.Context, release string) error {
-	_, err := remember(c, "kubernetes "+release, func() (struct{}, error) {
-		return struct{}{}, c.Source.Kubernetes(ctx, release)
+// Image implements Source.
+func (c *Cached) Image(ctx context.Context, image string) error {
+	_, err := remember(c, "image "+image, func() (struct{}, error) {
+		return struct{}{}, c.Source.Image(ctx, image)
 	})
 
 	return err
@@ -130,10 +131,11 @@ type Fake struct {
 	Talos []string
 	// Installers holds the installers that exist, as "<schematic> <version>".
 	Installers map[string]bool
-	// Latest maps a Kubernetes minor to its newest release; Releases holds further releases
-	// that exist.
-	Latest   map[string]string
-	Releases map[string]bool
+	// Latest maps a Kubernetes minor to its newest release.
+	Latest map[string]string
+	// Tags holds the tags that exist: an image exists if its tag does, whatever its name. The
+	// newest releases in Latest exist as "v<release>".
+	Tags map[string]bool
 	// Err makes every question fail: the source cannot be reached.
 	Err error
 	// Asked counts the questions.
@@ -183,23 +185,28 @@ func (f *Fake) KubernetesLatest(_ context.Context, minor string) (string, error)
 		return latest, nil
 	}
 
-	return "", fmt.Errorf("Kubernetes %s: %w", minor, ErrNotFound)
+	return "", fmt.Errorf("no release of Kubernetes %s: %w", minor, ErrNotFound)
 }
 
-// Kubernetes implements Source.
-func (f *Fake) Kubernetes(_ context.Context, release string) error {
+// Image implements Source.
+func (f *Fake) Image(_ context.Context, image string) error {
 	if err := f.asked(); err != nil {
 		return err
 	}
 
+	_, _, tag, err := splitImage(image)
+	if err != nil {
+		return err
+	}
+
 	for _, latest := range f.Latest {
-		if latest == release {
+		if tag == "v"+latest {
 			return nil
 		}
 	}
 
-	if !f.Releases[release] {
-		return fmt.Errorf("there is no Kubernetes release %s: %w", release, ErrNotFound)
+	if !f.Tags[tag] {
+		return fmt.Errorf("the image %s does not exist: %w", image, ErrNotFound)
 	}
 
 	return nil

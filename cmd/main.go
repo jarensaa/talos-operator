@@ -106,10 +106,10 @@ func parseFlags() *options {
 	flag.DurationVar(&o.observeInterval, "observe-interval", controller.DefaultObserveInterval,
 		"How often a cluster and its machines are observed when nothing else brings a reconcile.")
 
-	flag.BoolVar(&o.versionSources, "version-sources", true,
-		"Ask Image Factory and the Kubernetes release site what exists: status then says which releases are available, "+
-			"and an upgrade to something that does not exist is refused before a node is asked to pull it. "+
-			"Without it the operator talks to nothing but the cluster it manages.")
+	flag.BoolVar(&o.versionSources, "version-sources", false,
+		"Ask Image Factory, the Kubernetes release site and the registries of the Kubernetes images what exists: "+
+			"status then says which releases are available, and an upgrade to something that does not exist is refused "+
+			"before a node is asked to pull it. Without it the operator talks to nothing but the cluster it manages.")
 	flag.StringVar(&o.kubernetesReleases, "kubernetes-releases", catalog.DefaultKubernetesReleases,
 		"Where Kubernetes publishes its releases. Image Factory is the one a TalosCluster's installer names.")
 

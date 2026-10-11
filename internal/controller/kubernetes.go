@@ -252,6 +252,14 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 		}
 	}
 
+	// Last, because it asks upstream: an image that certainly does not exist is refused before a
+	// node is asked to pull it.
+	if result.MayStart() {
+		if problem := r.imagesProblem(ctx, result.Images); problem != "" {
+			result.BlockReason, result.BlockMessage = plan.BlockIncompatible, problem
+		}
+	}
+
 	if result.MayStart() {
 		now := r.stamp()
 		st.Operation = &talosv1alpha1.Operation{
@@ -306,10 +314,6 @@ func (r *TalosClusterReconciler) checkKubernetes(ctx context.Context, obs observ
 	}
 
 	if problem := talos.KubernetesUpgradeProblem(hop.From, hop.Version, versions); problem != "" {
-		return []string{problem}, ""
-	}
-
-	if problem := r.releaseProblem(ctx, hop.Version); problem != "" {
 		return []string{problem}, ""
 	}
 

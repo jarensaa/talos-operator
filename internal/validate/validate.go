@@ -79,6 +79,9 @@ type Options struct {
 	Source catalog.Source
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
+	// Summary, if set, is written a summary in Markdown: for every cluster the versions asked
+	// for, the upgrades that lead there from the base, and what was found.
+	Summary io.Writer
 }
 
 // manifests is what the files hold of the operator's kinds.
@@ -123,6 +126,10 @@ func Run(ctx context.Context, opts Options) ([]Finding, error) {
 
 		c.cluster()
 		findings = append(findings, c.findings...)
+
+		if opts.Summary != nil {
+			c.summarize(opts.Summary)
+		}
 	}
 
 	slices.SortStableFunc(findings, func(a, b Finding) int {
@@ -253,14 +260,58 @@ type check struct {
 	object string
 
 	findings []Finding
+	// way is the upgrades from what the base asks for to what the change asks for, if both are
+	// known and there is a way.
+	way []plan.VersionStep
+}
+
+// summarize writes what was checked about the cluster, for a human who reads a pull request.
+func (c *check) summarize(w io.Writer) {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "### %s\n\n", c.object)
+
+	if v := c.tc.Spec.Versions; v != nil && v.Talos != "" {
+		fmt.Fprintf(&b, "Asks for Talos %s and Kubernetes %s.\n\n", v.Talos, v.Kubernetes)
+	}
+
+	if len(c.way) > 0 {
+		b.WriteString("Upgrades from what the base asks for, in the order the operator takes them:\n\n")
+
+		for i, step := range c.way {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, step)
+		}
+
+		b.WriteString("\n")
+	}
+
+	problems := 0
+
+	for _, f := range c.findings {
+		if f.Skipped {
+			fmt.Fprintf(&b, "- Not checked: %s\n", f)
+		} else {
+			problems++
+
+			fmt.Fprintf(&b, "- **Problem:** %s\n", f)
+		}
+	}
+
+	if problems == 0 {
+		b.WriteString("\nNothing wrong.\n")
+	}
+
+	b.WriteString("\n")
+
+	_, _ = io.WriteString(w, b.String()) //nolint:errcheck // a summary nobody may be reading
 }
 
 func (c *check) problem(format string, args ...any) {
 	c.findings = append(c.findings, Finding{Object: c.object, Message: fmt.Sprintf(format, args...)})
 }
 
-func (c *check) skipped(format string, args ...any) {
-	c.findings = append(c.findings, Finding{Object: c.object, Message: fmt.Sprintf(format, args...), Skipped: true})
+func (c *check) skipped(message string) {
+	c.findings = append(c.findings, Finding{Object: c.object, Message: message, Skipped: true})
 }
 
 func (c *check) cluster() {
@@ -305,11 +356,15 @@ func (c *check) versions() bool {
 	from := plan.VersionState{Talos: c.before.Spec.Versions.Talos, Kubernetes: c.before.Spec.Versions.Kubernetes}
 	rules := plan.VersionRules{TalosUpgrade: talos.UpgradeProblem, Runs: talos.RunsKubernetes}
 
-	if way := plan.PlanVersions(from, want, rules, nil); way.Problem != "" {
-		c.problem("versions: there is no way from Talos %s and Kubernetes %s, which the base asks for: %s", from.Talos, from.Kubernetes, way.Problem)
+	way := plan.PlanVersions(from, want, rules, nil)
+	if way.Problem != "" {
+		c.problem("versions: there is no way from Talos %s and Kubernetes %s, which the base asks for: %s",
+			from.Talos, from.Kubernetes, way.Problem)
 
 		return false
 	}
+
+	c.way = way.Steps
 
 	return true
 }
@@ -351,24 +406,25 @@ func (c *check) pools() []*talosv1alpha1.TalosMachinePool {
 	return out
 }
 
-// upstream asks whether what the spec names exists.
+// asked turns an answer from upstream into a finding, if it is one.
+func (c *check) asked(what string, err error) {
+	switch {
+	case err == nil:
+	case errors.Is(err, catalog.ErrNotFound):
+		c.problem("%s", err)
+	default:
+		// Not knowing is not passing: a check that lets a change through because a site was down is
+		// not one to rely on.
+		c.problem("%s could not be checked: %v", what, err)
+	}
+}
+
+// upstream asks whether the installers the spec names exist.
 func (c *check) upstream() {
 	if c.opts.Source == nil {
-		c.skipped("offline: whether the installer and the Kubernetes release exist was not asked")
+		c.skipped("offline: whether the installer and the Kubernetes images exist was not asked")
 
 		return
-	}
-
-	asked := func(what string, err error) {
-		switch {
-		case err == nil:
-		case errors.Is(err, catalog.ErrNotFound):
-			c.problem("%s", err)
-		default:
-			// Not knowing is not passing: a check that lets a change through because a site was
-			// down is not one to rely on.
-			c.problem("%s could not be checked: %v", what, err)
-		}
 	}
 
 	installer := c.tc.Spec.ConfigGeneration
@@ -376,12 +432,10 @@ func (c *check) upstream() {
 		c.skipped("it names no installer yet (adoption fills it in), so there is none to look for")
 	} else {
 		for _, install := range c.installers() {
-			asked("the installer "+install.Image,
+			c.asked("the installer "+install.Image,
 				c.opts.Source.Installer(c.ctx, installer.Installer.FactoryURL, installer.Installer.Platform, install.SchematicID, install.Version))
 		}
 	}
-
-	asked("Kubernetes "+c.tc.Spec.Versions.Kubernetes, c.opts.Source.Kubernetes(c.ctx, c.tc.Spec.Versions.Kubernetes))
 }
 
 // policy checks the parts of spec.rollout the API server takes as they are: a schedule, a time
@@ -407,8 +461,9 @@ func (c *check) policy() {
 
 // renders renders the config of every machine the files hold, with secrets made up for the
 // purpose. It finds a spec that does not render at the versions it names, and a config document
-// Talos does not take. It says nothing about what the change would do to a node: that takes the
-// node's own config, which only the operator sees.
+// Talos does not take, and it asks whether the images of the Kubernetes components the rendered
+// configs name exist: those are what a Kubernetes upgrade pulls. It says nothing about what the
+// change would do to a node: that takes the node's own config, which only the operator sees.
 func (c *check) renders() {
 	spec := &c.tc.Spec
 	if spec.ConfigGeneration == nil || spec.ConfigGeneration.VersionContract == "" {
@@ -446,6 +501,8 @@ func (c *check) renders() {
 
 	rendered := 0
 
+	var images []string
+
 	for _, pool := range c.pools() {
 		for _, tm := range c.all.machines {
 			if tm.Namespace != c.tc.Namespace || tm.Spec.PoolRef.Name != pool.Name {
@@ -463,7 +520,7 @@ func (c *check) renders() {
 				continue
 			}
 
-			_, problem, err := controller.RenderMachine(c.ctx, reader, c.tc, pool, tm)
+			rendering, problem, err := controller.RenderMachine(c.ctx, reader, c.tc, pool, tm)
 			if err != nil {
 				problem = err.Error()
 			}
@@ -475,11 +532,36 @@ func (c *check) renders() {
 			}
 
 			rendered++
+
+			named, err := talos.KubernetesImages(rendering.Bytes)
+			if err != nil {
+				c.findings = append(c.findings, Finding{Object: about, Message: "its rendered config cannot be read back: " + err.Error()})
+
+				continue
+			}
+
+			for _, image := range named {
+				if !slices.Contains(images, image) {
+					images = append(images, image)
+				}
+			}
 		}
 	}
 
-	if rendered == 0 && len(c.findings) == 0 {
-		c.skipped("the files hold none of its machines, so no config was rendered")
+	if rendered == 0 {
+		c.skipped("no machine of it was rendered, so the images of its Kubernetes components were not looked for")
+
+		return
+	}
+
+	if c.opts.Source == nil {
+		return
+	}
+
+	slices.Sort(images)
+
+	for _, image := range images {
+		c.asked("the image "+image, c.opts.Source.Image(c.ctx, image))
 	}
 }
 

@@ -46,6 +46,11 @@ linters:
       - linters:
           - lll
         path: api/*
+      # A table of test cases is read as data. A version or a name written out in each case says
+      # more in place than a constant would, and saying it again is the next case, not a missed name.
+      - linters:
+          - goconst
+        path: _test\.go
     paths:
       - third_party$
       - builtin$

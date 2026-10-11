@@ -117,8 +117,8 @@ func upstream() *catalog.Fake {
 		Installers: map[string]bool{
 			schematic + " " + talosVersion: true, schematic + " " + newerTalosVersion: true,
 		},
-		Latest:   map[string]string{"1.36": "1.36.5", "1.37": "1.37.1"},
-		Releases: map[string]bool{kubernetesVersion: true, "1.37.2": true},
+		Latest: map[string]string{"1.36": "1.36.5", "1.37": "1.37.1"},
+		Tags:   map[string]bool{"v" + kubernetesVersion: true, "v1.37.2": true},
 	}
 }
 
@@ -2601,7 +2601,8 @@ var _ = Describe("Config rollout", func() {
 			advance(time.Hour)
 			Expect(operation()).To(BeNil())
 			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
-			Expect(upToDate().Message).To(ContainSubstring("there is no Kubernetes release 1.37.9"))
+			Expect(upToDate().Message).To(And(ContainSubstring("these images do not exist"),
+				ContainSubstring("registry.k8s.io/kube-apiserver:v1.37.9"), ContainSubstring("ghcr.io/siderolabs/kubelet:v1.37.9")))
 			Expect(pulled()).To(BeEmpty())
 
 			// Two minors behind what the spec asks for now.

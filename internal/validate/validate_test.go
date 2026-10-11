@@ -160,7 +160,7 @@ func upstream() *catalog.Fake {
 	return &catalog.Fake{
 		Installers: map[string]bool{schematic + " v1.14.2": true, schematic + " v1.14.1": true, schematic + " v1.13.5": true},
 		Latest:     map[string]string{"1.37": "1.37.1"},
-		Releases:   map[string]bool{"1.36.2": true, "1.37.0": true, "1.35.4": true},
+		Tags:       map[string]bool{"v1.36.2": true, "v1.37.0": true, "v1.35.4": true},
 	}
 }
 
@@ -232,11 +232,13 @@ func TestProblems(t *testing.T) {
 			"no installer of Talos v1.14.9"},
 		{"a pool's own schematic that does not exist", with(func(r *repository) { r.workers = "installer: {schematicID: " + other + "}" }),
 			nil, upstream(), "for schematic " + other},
-		{"a Kubernetes release that does not exist", with(func(r *repository) { r.kubernetes = "1.37.9" }), nil, upstream(),
-			"there is no Kubernetes release 1.37.9"},
+		// The images a Kubernetes upgrade would pull, as the rendered configs name them.
+		{"a Kubernetes release whose images do not exist", with(func(r *repository) { r.kubernetes = "1.37.9" }), nil, upstream(),
+			"the image ghcr.io/siderolabs/kubelet:v1.37.9 does not exist"},
 		// Not knowing is not passing.
 		{"upstream cannot be asked", valid(), nil, down, "could not be checked: no route to host"},
-		{"a Talos this operator does not support", with(func(r *repository) { r.talos = "v1.15.0" }), nil, upstream(), "newer than this operator"},
+		{"a Talos this operator does not support", with(func(r *repository) { r.talos = "v1.15.0" }), nil, upstream(),
+			"newer than this operator"},
 		{"a Talos that does not run the Kubernetes named", with(func(r *repository) { r.kubernetes = "1.38.0" }), nil, upstream(),
 			"does not run Kubernetes 1.38.0"},
 		// The step from what the base asks for.
@@ -249,7 +251,8 @@ func TestProblems(t *testing.T) {
 			r.rollout = "maintenanceWindows:\n  - {schedule: \"0 2 * * *\", duration: 1h, timeZone: Europe/Atlantis}"
 		}), nil, upstream(), "Europe/Atlantis"},
 		{"a gate that does not compile", with(func(r *repository) {
-			r.rollout = "gates:\n  - name: storage\n    object: {apiVersion: v1, kind: ConfigMap, name: storage}\n    expression: object.data.health =="
+			r.rollout = "gates:\n  - name: storage\n    object: {apiVersion: v1, kind: ConfigMap, name: storage}\n" +
+				"    expression: object.data.health =="
 		}), nil, upstream(), "gate storage: the expression does not compile"},
 		// A config document Talos does not take.
 		{"a config that does not render", with(func(r *repository) {
@@ -291,9 +294,9 @@ func TestTheStepFromTheBase(t *testing.T) {
 
 	// A base that names no versions yet says nothing about the step.
 	empty := t.TempDir()
-	if err := os.WriteFile(filepath.Join(empty, "cluster.yaml"),
-		[]byte("apiVersion: talos.jarensaa.github.io/v1alpha1\nkind: TalosCluster\nmetadata: {name: my-cluster, namespace: talos-operator}\nspec: {}\n"),
-		0o600); err != nil {
+	bare := "apiVersion: talos.jarensaa.github.io/v1alpha1\nkind: TalosCluster\n" +
+		"metadata: {name: my-cluster, namespace: talos-operator}\nspec: {}\n"
+	if err := os.WriteFile(filepath.Join(empty, "cluster.yaml"), []byte(bare), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -337,7 +340,8 @@ func TestWhatCannotBeReadIsAnError(t *testing.T) {
 
 	// Files without a TalosCluster are not a cluster that passes.
 	none := t.TempDir()
-	if err := os.WriteFile(filepath.Join(none, "other.yaml"), []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x}\n"), 0o600); err != nil {
+	unrelated := []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x}\n")
+	if err := os.WriteFile(filepath.Join(none, "other.yaml"), unrelated, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -345,7 +349,8 @@ func TestWhatCannotBeReadIsAnError(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 
-	if _, err := validate.Run(ctx, validate.Options{Paths: []string{valid().write(t)}, Base: []string{filepath.Join(none, "gone")}}); err == nil {
+	gone := []string{filepath.Join(none, "gone")}
+	if _, err := validate.Run(ctx, validate.Options{Paths: []string{valid().write(t)}, Base: gone}); err == nil {
 		t.Fatal("a base that does not exist must be an error")
 	}
 }

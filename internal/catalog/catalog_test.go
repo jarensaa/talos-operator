@@ -30,7 +30,13 @@ import (
 
 const (
 	schematic = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
-	missing   = "0000000000000000000000000000000000000000000000000000000000000000"
+	// extended is a schematic that names an extension Talos v1.14.2 has and v1.14.0 does not.
+	extended = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	missing  = "0000000000000000000000000000000000000000000000000000000000000000"
+	// private is a repository the registry hands no anonymous token for.
+	private = "/v2/private/kubelet/manifests/v1.37.1"
+	// extendedSchematic is what Image Factory answers for extended.
+	extendedSchematic = "customization:\n  systemExtensions:\n    officialExtensions:\n      - siderolabs/intel-hd-audio\n"
 )
 
 // upstream is Image Factory and the Kubernetes release site in one server, answering as the
@@ -45,6 +51,13 @@ func (u *upstream) serve(t *testing.T) string {
 	t.Helper()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Whoever is asked can tell who is asking.
+		if r.Header.Get("User-Agent") != UserAgent {
+			w.WriteHeader(http.StatusForbidden)
+
+			return
+		}
+
 		u.mu.Lock()
 		u.asked = append(u.asked, r.Method+" "+r.URL.Path)
 		status := u.status
@@ -57,12 +70,44 @@ func (u *upstream) serve(t *testing.T) string {
 		}
 
 		answers := map[string]string{
-			"/versions":                `["v1.13.0","v1.13.9","v1.14.0","v1.14.2","v1.15.0-alpha.1","latest"]`,
-			"/schematics/" + schematic: "customization: {}\n",
+			"/versions":                                               `["v1.13.0","v1.13.9","v1.14.0","v1.14.2","v1.15.0-alpha.1","latest"]`,
+			"/schematics/" + schematic:                                "customization: {}\n",
+			"/schematics/" + extended:                                 extendedSchematic,
+			"/version/v1.14.2/extensions/official":                    `[{"name":"siderolabs/amazon-ena"},{"name":"siderolabs/intel-hd-audio"}]`,
+			"/version/v1.14.0/extensions/official":                    `[{"name":"siderolabs/amazon-ena"}]`,
 			"/v2/metal-installer/" + schematic + "/manifests/v1.14.2": "",
-			"/release/stable-1.36.txt":                                "v1.36.5\n",
-			"/release/stable-1.35.txt":                                "v1.37.0",
-			"/release/v1.37.1/bin/linux/amd64/kubelet.sha256":         "abc",
+			"/v2/metal-installer/" + schematic + "/manifests/v1.14.0": "",
+			"/v2/metal-installer/" + extended + "/manifests/v1.14.2":  "",
+			"/v2/siderolabs/kubelet/manifests/v1.37.1":                "",
+			"/v2/library/busybox/manifests/latest":                    "",
+			"/v2/kube-apiserver/manifests/sha256:0123":                "",
+			"/token":                   `{"token":"anonymous"}`,
+			"/release/stable-1.36.txt": "v1.36.5\n",
+			"/release/stable-1.35.txt": "v1.37.0",
+		}
+
+		// A registry that hands out anonymous tokens: the kubelet's repository wants one.
+		if strings.HasPrefix(r.URL.Path, "/v2/siderolabs/") && r.Header.Get("Authorization") != "Bearer anonymous" {
+			w.Header().Set("WWW-Authenticate",
+				`Bearer realm="http://`+r.Host+`/token",service="registry.example.com",scope="repository:siderolabs/kubelet:pull"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// And one that wants credentials nobody has.
+		if r.URL.Path == private {
+			w.Header().Set("WWW-Authenticate", `Basic realm="registry"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		query := r.URL.Query()
+		if r.URL.Path == "/token" && (query.Get("service") != "registry.example.com" || !strings.Contains(query.Get("scope"), "kubelet")) {
+			w.WriteHeader(http.StatusBadRequest)
+
+			return
 		}
 
 		body, ok := answers[r.URL.Path]
@@ -100,15 +145,23 @@ func TestHTTP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// What does not exist is a definite no, and says which part is missing.
-	err = h.Installer(ctx, base, "metal", schematic, "v1.14.99")
-	if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "no metal installer of Talos v1.14.99") {
-		t.Fatalf("got %v", err)
+	// What does not exist is a definite no, and says which part is missing: the release, the
+	// schematic, or an extension the schematic names that this release does not have.
+	for _, tt := range []struct {
+		schematic, version, want string
+	}{
+		{schematic, "v1.14.99", "Image Factory has no Talos v1.14.99"},
+		{missing, "v1.14.2", "no schematic " + missing},
+		{extended, "v1.14.0", "names the extension siderolabs/intel-hd-audio, which Talos v1.14.0 does not have"},
+	} {
+		err := h.Installer(ctx, base, "metal", tt.schematic, tt.version)
+		if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%s %s: got %v, want %q", tt.schematic[:8], tt.version, err, tt.want)
+		}
 	}
 
-	err = h.Installer(ctx, base, "metal", missing, "v1.14.2")
-	if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "no schematic "+missing) {
-		t.Fatalf("got %v", err)
+	if err := h.Installer(ctx, base, "metal", extended, "v1.14.2"); err != nil {
+		t.Fatalf("an extension the release has is no problem: %v", err)
 	}
 
 	if latest, err := h.KubernetesLatest(ctx, "1.36"); err != nil || latest != "1.36.5" {
@@ -124,15 +177,22 @@ func TestHTTP(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 
-	if err := h.Kubernetes(ctx, "1.37.1"); err != nil {
-		t.Fatal(err)
+	// Images, as a node finds them: with the anonymous token a public registry hands out.
+	registry := strings.TrimPrefix(base, "http://")
+
+	for _, image := range []string{registry + "/siderolabs/kubelet:v1.37.1", registry + "/kube-apiserver@sha256:0123"} {
+		if err := h.image(ctx, "http", image, requestTimeout); err != nil {
+			t.Errorf("%s: %v", image, err)
+		}
 	}
 
-	if err := h.Kubernetes(ctx, "1.37.99"); !errors.Is(err, ErrNotFound) {
+	if err := h.image(ctx, "http", registry+"/siderolabs/kubelet:v1.37.99", requestTimeout); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("got %v", err)
 	}
 
-	if err := h.Kubernetes(ctx, "newest"); err == nil || errors.Is(err, ErrNotFound) {
+	// A registry that wants credentials says nothing about what it holds.
+	err = h.image(ctx, "http", registry+"/private/kubelet:v1.37.1", requestTimeout)
+	if err == nil || errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), "wants credentials") {
 		t.Fatalf("got %v", err)
 	}
 
@@ -152,8 +212,8 @@ func TestHTTPTellsAnOutageFromAnAbsence(t *testing.T) {
 	ctx := context.Background()
 
 	for name, err := range map[string]error{
-		"installer":  h.Installer(ctx, base, "metal", schematic, "v1.14.2"),
-		"kubernetes": h.Kubernetes(ctx, "1.37.1"),
+		"installer": h.Installer(ctx, base, "metal", schematic, "v1.14.2"),
+		"image":     h.image(ctx, "http", strings.TrimPrefix(base, "http://")+"/siderolabs/kubelet:v1.37.1", requestTimeout),
 	} {
 		if err == nil || errors.Is(err, ErrNotFound) {
 			t.Errorf("%s: got %v", name, err)
@@ -183,7 +243,8 @@ func TestHTTPAsksOnlyOverHTTPS(t *testing.T) {
 			t.Errorf("%q: got %v", base, err)
 		}
 
-		if err := (&HTTP{KubernetesReleases: base + "/x"}).Kubernetes(ctx, "1.37.1"); base != "" && (err == nil || !strings.Contains(err.Error(), "URL")) {
+		_, err := (&HTTP{KubernetesReleases: base + "/x"}).KubernetesLatest(ctx, "1.37")
+		if base != "" && (err == nil || !strings.Contains(err.Error(), "URL")) {
 			t.Errorf("%q: got %v", base, err)
 		}
 	}
@@ -207,7 +268,7 @@ func TestHTTPAsksOnlyOverHTTPS(t *testing.T) {
 func TestCached(t *testing.T) {
 	fake := &Fake{
 		Talos: []string{"v1.14.2"}, Installers: map[string]bool{schematic + " v1.14.2": true},
-		Latest: map[string]string{"1.37": "1.37.1"}, Releases: map[string]bool{"1.37.0": true},
+		Latest: map[string]string{"1.37": "1.37.1"}, Tags: map[string]bool{"v1.37.0": true},
 	}
 	clock := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
 	c := &Cached{Source: fake, Now: func() time.Time { return clock }}
@@ -224,7 +285,7 @@ func TestCached(t *testing.T) {
 			t.Fatalf("got %q, %v", latest, err)
 		}
 
-		if err := c.Kubernetes(ctx, "1.37.0"); err != nil {
+		if err := c.Image(ctx, "ghcr.io/siderolabs/kubelet:v1.37.0"); err != nil {
 			t.Fatal(err)
 		}
 
@@ -253,7 +314,10 @@ func TestCached(t *testing.T) {
 	}
 
 	clock = clock.Add(DefaultKeep)
-	everything()
+
+	if yes, no = everything(); yes != nil || no != nil {
+		t.Fatalf("got %v, %v", yes, no)
+	}
 
 	if fake.Asked != 11 {
 		t.Fatalf("after an hour everything is asked again: %d questions", fake.Asked)
@@ -278,5 +342,28 @@ func TestCached(t *testing.T) {
 
 	if _, err := c.TalosVersions(ctx, "https://factory.example.com"); err != nil || fake.Asked != 13 {
 		t.Fatalf("got %v after %d questions", err, fake.Asked)
+	}
+}
+
+func TestSplitImage(t *testing.T) {
+	for image, want := range map[string][3]string{
+		"ghcr.io/siderolabs/kubelet:v1.37.1":                            {"ghcr.io", "siderolabs/kubelet", "v1.37.1"},
+		"registry.k8s.io/kube-apiserver:v1.37.1":                        {"registry.k8s.io", "kube-apiserver", "v1.37.1"},
+		"registry.example.com:5000/mirror/kube-scheduler:v1.37.1":       {"registry.example.com:5000", "mirror/kube-scheduler", "v1.37.1"},
+		"registry.k8s.io/kube-apiserver:v1.37.1@sha256:0123":            {"registry.k8s.io", "kube-apiserver", "sha256:0123"},
+		"registry.k8s.io/pause":                                         {"registry.k8s.io", "pause", "latest"},
+		"docker.io/library/busybox:1.36":                                {"registry-1.docker.io", "library/busybox", "1.36"},
+		"busybox":                                                       {"registry-1.docker.io", "library/busybox", "latest"},
+		"siderolabs/kubelet:v1.37.1":                                    {"registry-1.docker.io", "siderolabs/kubelet", "v1.37.1"},
+		"factory.example.com/metal-installer/" + schematic + ":v1.14.2": {"factory.example.com", "metal-installer/" + schematic, "v1.14.2"},
+	} {
+		host, repository, reference, err := splitImage(image)
+		if err != nil || [3]string{host, repository, reference} != want {
+			t.Errorf("%s: got %s %s %s (%v), want %v", image, host, repository, reference, err, want)
+		}
+	}
+
+	if _, _, _, err := splitImage("registry.example.com/"); err == nil {
+		t.Error("a registry alone is no image")
 	}
 }

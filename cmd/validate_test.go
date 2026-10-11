@@ -70,7 +70,8 @@ func TestValidateCommand(t *testing.T) {
 		stdout, stderr string
 	}{
 		{"nothing wrong", []string{"--offline", good}, false, 0, "nothing wrong", ""},
-		{"what was not checked is said", []string{"--offline", good}, false, 0, "not checked: TalosCluster talos-operator/my-cluster: offline", ""},
+		{"what was not checked is said", []string{"--offline", good}, false, 0,
+			"not checked: TalosCluster talos-operator/my-cluster: offline", ""},
 		{"a problem", []string{"--offline", unsupported}, false, 1, "problem: TalosCluster talos-operator/my-cluster: versions.talos", ""},
 		{"a problem is counted", []string{"--offline", unsupported}, false, 1, "1 problem(s)", ""},
 		{"a problem is an annotation on GitHub", []string{"--offline", unsupported}, true, 1, "::error title=talos-operator validate::", ""},
@@ -106,5 +107,35 @@ func TestValidateCommand(t *testing.T) {
 				t.Fatalf("annotations belong on GitHub only: %s", stdout.String())
 			}
 		})
+	}
+}
+
+// On GitHub Actions the run gets a summary a reviewer reads: what is asked for, and what it means.
+func TestValidateCommandWritesASummary(t *testing.T) {
+	newer := manifests(t, validCluster)
+	earlier := strings.NewReplacer("kubernetes: 1.37.1", "kubernetes: 1.36.5", "talos: v1.14.2", "talos: v1.14.1")
+	older := manifests(t, earlier.Replace(validCluster))
+
+	summary := filepath.Join(t.TempDir(), "summary.md")
+	t.Setenv("GITHUB_STEP_SUMMARY", summary)
+	t.Setenv("GITHUB_ACTIONS", "")
+
+	var stdout, stderr bytes.Buffer
+	if status := validateCommand(context.Background(), []string{"--offline", "--base", older, newer}, &stdout, &stderr); status != 0 {
+		t.Fatalf("exit status %d: %s%s", status, stdout.String(), stderr.String())
+	}
+
+	written, err := os.ReadFile(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"### TalosCluster talos-operator/my-cluster", "Asks for Talos v1.14.2 and Kubernetes 1.37.1",
+		"1. Talos v1.14.1 to v1.14.2", "2. Kubernetes 1.36.5 to 1.37.1", "Not checked:", "Nothing wrong.",
+	} {
+		if !strings.Contains(string(written), want) {
+			t.Errorf("the summary lacks %q:\n%s", want, written)
+		}
 	}
 }

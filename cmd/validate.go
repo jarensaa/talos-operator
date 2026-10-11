@@ -98,6 +98,15 @@ func validateCommand(ctx context.Context, args []string, stdout, stderr io.Write
 		opts.Source = &catalog.HTTP{KubernetesReleases: releases}
 	}
 
+	// On GitHub Actions the run gets a summary: what was asked for, and the upgrades it means.
+	if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
+		if summary, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil { //nolint:gosec // the file the runner names
+			defer summary.Close() //nolint:errcheck // a summary nobody may be reading
+
+			opts.Summary = summary
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, validateTimeout)
 	defer cancel()
 
@@ -124,7 +133,8 @@ func validateCommand(ctx context.Context, args []string, stdout, stderr io.Write
 		fmt.Fprintln(stdout, "problem:", f) //nolint:errcheck // to a terminal
 
 		if annotate {
-			fmt.Fprintf(stdout, "::error title=talos-operator validate::%s\n", strings.ReplaceAll(f.String(), "\n", " ")) //nolint:errcheck // to a terminal
+			line := strings.ReplaceAll(f.String(), "\n", " ")
+			fmt.Fprintf(stdout, "::error title=talos-operator validate::%s\n", line) //nolint:errcheck // to a terminal
 		}
 	}
 
