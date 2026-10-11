@@ -465,6 +465,8 @@ A control plane is only taken out while at least three voting members of etcd re
 
 There is no way to shrink a control plane below three with this operator, and the only control plane of a cluster cannot be removed.
 
+With the credentials Talos issues, which is the default, the operator finds the control planes by itself, the new one included. If you gave it a talosconfig of your own, take the address of the control plane that left out of its endpoints: a machine in maintenance mode, or one that came back as a worker, passes no request on.
+
 ### A machine that died
 
 A machine that does not answer is not guessed about. Its removal starts, takes nothing from the cluster, and halts after `spec.rollout.stepTimeout` with the reason `NodeUnreachable`. If the machine is only switched off, switch it on and retry. If it is gone for good, say so:

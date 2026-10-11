@@ -1771,6 +1771,13 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 				tc.Annotations[talosv1alpha1.AnnotationConfirmDead] = token
 			})
 
+			// The operation is halted until the operator has read that; from then on a halt is a new one.
+			Eventually(func(g Gomega) {
+				refresh(ctx, g)
+				g.Expect(tc.Status.Operation == nil || tc.Status.Operation.Failure == nil).To(BeTrue(),
+					"the operator has not acted on the confirmation yet")
+			}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
+
 			settled(ctx, "removal", 20*time.Minute, func(g Gomega) {
 				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(doomed), doomed)).To(Succeed())
 				g.Expect(doomed.Status.RemovedAt).NotTo(BeNil())

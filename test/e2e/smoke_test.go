@@ -27,6 +27,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -45,10 +46,12 @@ var _ = Describe("Observe smoke test", func() {
 		f := talos.NewFactory()
 		DeferCleanup(f.Close)
 
-		r, err := f.Reader(ctx, talos.Target{Key: "smoke", Credentials: c, Endpoints: c.Endpoints})
+		endpoints := controlPlanesNow(ctx, c.Endpoints)
+
+		r, err := f.Reader(ctx, talos.Target{Key: "smoke", Credentials: c, Endpoints: endpoints})
 		Expect(err).NotTo(HaveOccurred())
 
-		for _, ep := range c.Endpoints {
+		for _, ep := range endpoints {
 			v, err := r.Version(ctx, ep.Addr)
 			Expect(err).NotTo(HaveOccurred(), "version of %s", ep.Addr)
 			Expect(v.Tag).To(HavePrefix("v1.14."))
@@ -71,7 +74,7 @@ var _ = Describe("Observe smoke test", func() {
 // harnessReader reads the e2e cluster with the harness's own admin talosconfig, independently of
 // the operator, so specs can check what the operator did and did not do.
 func harnessReader(ctx context.Context) talos.Reader {
-	f, target := harnessTarget()
+	f, target := harnessTarget(ctx)
 
 	r, err := f.Reader(ctx, target)
 	Expect(err).NotTo(HaveOccurred())
@@ -82,7 +85,7 @@ func harnessReader(ctx context.Context) talos.Reader {
 // harnessWriter is the cluster admin changing a node behind the operator's back. Specs use it
 // for what the operator is then expected to notice or undo, never to help the operator along.
 func harnessWriter(ctx context.Context) talos.ConfigWriter {
-	f, target := harnessTarget()
+	f, target := harnessTarget(ctx)
 
 	w, err := f.ConfigWriter(ctx, target)
 	Expect(err).NotTo(HaveOccurred())
@@ -90,8 +93,41 @@ func harnessWriter(ctx context.Context) talos.ConfigWriter {
 	return w
 }
 
+// controlPlanesNow keeps the endpoints that are control planes of the cluster as it is now. The
+// harness's talosconfig was written when the cluster was built, and the suite replaces a control
+// plane since (adoption_test.go): the address of the one that left is then a machine in
+// maintenance mode, or a worker, and neither forwards a request.
+func controlPlanesNow(ctx context.Context, endpoints []creds.Endpoint) []creds.Endpoint {
+	GinkgoHelper()
+
+	var nodes corev1.NodeList
+	Expect(k8sClient.List(ctx, &nodes, client.HasLabels{"node-role.kubernetes.io/control-plane"})).To(Succeed())
+
+	now := map[string]bool{}
+
+	for _, node := range nodes.Items {
+		for _, addr := range node.Status.Addresses {
+			if addr.Type == corev1.NodeInternalIP {
+				now[addr.Address] = true
+			}
+		}
+	}
+
+	out := make([]creds.Endpoint, 0, len(endpoints))
+
+	for _, ep := range endpoints {
+		if now[ep.Addr.String()] {
+			out = append(out, ep)
+		}
+	}
+
+	Expect(out).NotTo(BeEmpty(), "none of the harness's endpoints is a control plane of the cluster")
+
+	return out
+}
+
 // harnessTarget is the harness cluster as its admin talosconfig reaches it.
-func harnessTarget() (*talos.Factory, talos.Target) {
+func harnessTarget(ctx context.Context) (*talos.Factory, talos.Target) {
 	data, err := os.ReadFile(talosconfigPath)
 	Expect(err).NotTo(HaveOccurred())
 
@@ -101,7 +137,7 @@ func harnessTarget() (*talos.Factory, talos.Target) {
 	f := talos.NewFactory()
 	DeferCleanup(f.Close)
 
-	return f, talos.Target{Key: "harness", Credentials: c, Endpoints: c.Endpoints}
+	return f, talos.Target{Key: "harness", Credentials: c, Endpoints: controlPlanesNow(ctx, c.Endpoints)}
 }
 
 // harnessNodes returns the addresses of every configured harness node.
