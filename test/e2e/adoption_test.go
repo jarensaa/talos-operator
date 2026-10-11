@@ -1596,8 +1596,6 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		})
 
 		It("adds a machine that waits in maintenance mode, and sends nothing to one that is not the machine declared", func(ctx context.Context) {
-			ended := rollouts(ctx)
-
 			By("declaring the machine with the identity of another")
 			wrong := declare(ctx, "e2e-added", talosv1alpha1.MachineRoleWorker, spare, "aaaaaaaa-bbbb-4ccc-8ddd-999999999999")
 
@@ -1625,7 +1623,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			added := declare(ctx, "e2e-added", talosv1alpha1.MachineRoleWorker, spare, spareUUID)
 			settled(ctx, "addition", 30*time.Minute, joined(ctx, added))
 
-			Expect(tc.Status.History).To(HaveLen(ended + 1))
+			// The history keeps the last ten operations, so its length says nothing by now.
 			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationAddMachine))
 			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
 			Expect(tc.Status.History[0].Completed).To(Equal([]string{added.Name}))
@@ -1636,7 +1634,9 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		It("refuses to take out a control plane the cluster cannot spare", func(ctx context.Context) {
 			controlPlane := lastControlPlane()
-			ended := rollouts(ctx)
+
+			refresh(ctx, Default)
+			last := tc.Status.History[0].ID
 
 			setDesiredState(ctx, controlPlane, talosv1alpha1.DesiredStateRemoved)
 
@@ -1659,7 +1659,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 			setDesiredState(ctx, controlPlane, talosv1alpha1.DesiredStatePresent)
 			inSync(ctx, 3*time.Minute)
-			Expect(rollouts(ctx)).To(Equal(ended))
+			Expect(tc.Status.History[0].ID).To(Equal(last), "no operation ran")
 		}, NodeTimeout(10*time.Minute))
 
 		It("takes the machine out again: drained, reset, waiting in maintenance mode, its Node deleted", func(ctx context.Context) {
