@@ -1040,6 +1040,18 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(blocked).NotTo(BeNil())
 		Expect(blocked.Reason).To(Equal(talosv1alpha1.ReasonOperationFailed))
 
+		// What the chart's TalosOperationHalted alert is a rule over (charts/talos-operator/files/
+		// alerts.yaml, tested on these series by `make alerts-test`): every replica says so, with
+		// the labels the alert carries to whoever it reaches.
+		By("finding the halt in the metrics of every replica")
+		Eventually(func(g Gomega) {
+			g.Expect(operatorGauge(ctx, g, "talos_operator_operation_failure_info",
+				"namespace", tc.Namespace, "taloscluster", tc.Name, "type", string(op.Type),
+				"machine", op.Failure.Machine, "step", op.Failure.Step, "reason", op.Failure.Reason,
+			)).To(Equal([]float64{1, 1}))
+			g.Expect(operatorGauge(ctx, g, "talos_operator_cluster_operation_halted", "taloscluster", tc.Name)).To(Equal([]float64{1, 1}))
+		}).WithContext(ctx).WithTimeout(8 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
 		By("checking that every node runs what it ran before: the worker reverted, the rest untouched")
 		Expect(snapshot(ctx, harness, nodes)).To(Equal(before))
 
@@ -1070,7 +1082,20 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		inSync(ctx, 5*time.Minute)
 		Expect(snapshot(ctx, harness, nodes)).To(Equal(before))
 		Expect(rejectedRPCs(ctx)).To(BeZero())
-	}, NodeTimeout(e2eTryTimeout+25*time.Minute))
+
+		By("finding nothing of the halt left in the metrics, and every machine read and ready")
+		Eventually(func(g Gomega) {
+			g.Expect(operatorGauge(ctx, g, "talos_operator_operation_failure_info")).To(BeEmpty())
+			g.Expect(operatorGauge(ctx, g, "talos_operator_cluster_operation_halted", "taloscluster", tc.Name)).To(Equal([]float64{0, 0}))
+
+			for _, tm := range machines {
+				g.Expect(operatorGauge(ctx, g, "talos_operator_machine_ready", "taloscluster", tc.Name, "machine", tm.Name)).
+					To(Equal([]float64{1, 1}), tm.Name)
+				g.Expect(operatorGauge(ctx, g, "talos_operator_machine_condition", "machine", tm.Name,
+					"condition", talosv1alpha1.ConditionNodeObserved, "status", "True")).To(Equal([]float64{1, 1}), tm.Name)
+			}
+		}).WithContext(ctx).WithTimeout(5 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+	}, NodeTimeout(e2eTryTimeout+40*time.Minute))
 
 	// The rollout policy a user declares (docs/scope.md §6.4), against a real Kubernetes: a
 	// maintenance window by the cluster's own clock, a gate read from the API with the permission

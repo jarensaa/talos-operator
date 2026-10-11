@@ -35,6 +35,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	appsv1 "k8s.io/api/apps/v1"
@@ -195,26 +196,17 @@ func metricsToken(ctx context.Context) string {
 func operatorCounter(ctx context.Context, name string) float64 {
 	GinkgoHelper()
 
-	token := metricsToken(ctx)
-
 	var total float64
 
 	Eventually(func(g Gomega) {
-		deployment := &appsv1.Deployment{}
-		g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNamespace, Name: operatorName}, deployment)).To(Succeed())
-		g.Expect(deployment.Status.ReadyReplicas).To(Equal(*deployment.Spec.Replicas), "every replica must be ready to be asked")
-
 		sum := 0.0
 
-		for _, pod := range operatorPods(ctx, g) {
-			if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
-				continue
+		for _, families := range operatorMetrics(ctx, g) {
+			if family := families[name]; family != nil {
+				for _, m := range family.GetMetric() {
+					sum += m.GetCounter().GetValue()
+				}
 			}
-
-			value, err := scrapePod(ctx, &pod, token, name)
-			g.Expect(err).NotTo(HaveOccurred(), "metrics of %s", pod.Name)
-
-			sum += value
 		}
 
 		total = sum
@@ -223,16 +215,77 @@ func operatorCounter(ctx context.Context, name string) float64 {
 	return total
 }
 
-// scrapePod reads a counter from one pod's metrics endpoint, through a port-forward to the pod.
-func scrapePod(ctx context.Context, pod *corev1.Pod, token, name string) (float64, error) {
+// operatorGauge reads a gauge from every replica: the value of the one series that has the
+// labels given, in pairs, or nothing for a replica that exports no such series. Every replica
+// exports the state of the resources, the leader or not, and an alert reads whichever is scraped.
+func operatorGauge(ctx context.Context, g Gomega, name string, pairs ...string) []float64 {
+	GinkgoHelper()
+
+	var out []float64
+
+	for _, families := range operatorMetrics(ctx, g) {
+		family := families[name]
+		if family == nil {
+			continue
+		}
+
+		for _, m := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, pair := range m.GetLabel() {
+				labels[pair.GetName()] = pair.GetValue()
+			}
+
+			matches := true
+			for i := 0; i+1 < len(pairs); i += 2 {
+				matches = matches && labels[pairs[i]] == pairs[i+1]
+			}
+
+			if matches {
+				out = append(out, m.GetGauge().GetValue())
+			}
+		}
+	}
+
+	return out
+}
+
+// operatorMetrics is what every replica exports, by pod. It expects every replica to be ready
+// and every read to succeed, and is called until they are and do.
+func operatorMetrics(ctx context.Context, g Gomega) map[string]map[string]*dto.MetricFamily {
+	GinkgoHelper()
+
+	token := metricsToken(ctx)
+
+	deployment := &appsv1.Deployment{}
+	g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: testNamespace, Name: operatorName}, deployment)).To(Succeed())
+	g.Expect(deployment.Status.ReadyReplicas).To(Equal(*deployment.Spec.Replicas), "every replica must be ready to be asked")
+
+	out := map[string]map[string]*dto.MetricFamily{}
+
+	for _, pod := range operatorPods(ctx, g) {
+		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+
+		families, err := scrapePod(ctx, &pod, token)
+		g.Expect(err).NotTo(HaveOccurred(), "metrics of %s", pod.Name)
+
+		out[pod.Name] = families
+	}
+
+	return out
+}
+
+// scrapePod reads one pod's metrics endpoint, through a port-forward to the pod.
+func scrapePod(ctx context.Context, pod *corev1.Pod, token string) (map[string]*dto.MetricFamily, error) {
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	transport, upgrader, err := spdy.RoundTripperFor(restConfig)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	url := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(pod.Namespace).Name(pod.Name).
@@ -244,7 +297,7 @@ func scrapePod(ctx context.Context, pod *corev1.Pod, token, name string) (float6
 	forwarder, err := portforward.New(spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, url),
 		[]string{"0:8443"}, stop, ready, io.Discard, io.Discard)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	failed := make(chan error, 1)
@@ -253,29 +306,29 @@ func scrapePod(ctx context.Context, pod *corev1.Pod, token, name string) (float6
 	select {
 	case <-ready:
 	case err := <-failed:
-		return 0, fmt.Errorf("port-forward: %w", err)
+		return nil, fmt.Errorf("port-forward: %w", err)
 	case <-time.After(30 * time.Second):
-		return 0, errors.New("port-forward did not become ready")
+		return nil, errors.New("port-forward did not become ready")
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return nil, ctx.Err()
 	}
 
 	ports, err := forwarder.GetPorts()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	return scrape(ctx, fmt.Sprintf("https://127.0.0.1:%d/metrics", ports[0].Local), token, name)
+	return scrape(ctx, fmt.Sprintf("https://127.0.0.1:%d/metrics", ports[0].Local), token)
 }
 
-// scrape reads a counter from a metrics endpoint as a reader the Kubernetes API authorizes.
-func scrape(ctx context.Context, url, token, name string) (float64, error) {
+// scrape reads a metrics endpoint as a reader the Kubernetes API authorizes.
+func scrape(ctx context.Context, url, token string) (map[string]*dto.MetricFamily, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -285,31 +338,18 @@ func scrape(ctx context.Context, url, token, name string) (float64, error) {
 
 	resp, err := scraper.Do(req)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	defer resp.Body.Close() //nolint:errcheck // a read-only response body
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("the metrics endpoint must serve an authorized reader, and answered %s", resp.Status)
+		return nil, fmt.Errorf("the metrics endpoint must serve an authorized reader, and answered %s", resp.Status)
 	}
 
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 
-	families, err := parser.TextToMetricFamilies(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	var total float64
-
-	if family := families[name]; family != nil {
-		for _, m := range family.GetMetric() {
-			total += m.GetCounter().GetValue()
-		}
-	}
-
-	return total, nil
+	return parser.TextToMetricFamilies(resp.Body)
 }
 
 // createCredentialsSecret stores the e2e cluster's admin talosconfig as the operator expects it.

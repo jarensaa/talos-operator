@@ -4,7 +4,7 @@ talos-operator is a Kubernetes operator that manages the [Talos Linux](https://w
 
 It is built for clusters that already exist. The operator derives its resources from the live cluster and takes ownership only after Talos's own dry-run apply reports no changes on every node.
 
-**Project status: alpha.** Observing a cluster, adopting it, applying configuration changes and upgrading Talos are implemented and tested end to end. Upgrading Kubernetes, and adding or removing machines, are planned and not implemented yet. See [Project status](#project-status).
+**Project status: alpha.** Observing a cluster, adopting it, applying configuration changes and upgrading Talos and Kubernetes are implemented and tested end to end. Adding and removing machines are planned and not implemented yet. See [Project status](#project-status).
 
 ## Features
 
@@ -15,6 +15,7 @@ It is built for clusters that already exist. The operator derives its resources 
 - **Kubernetes upgrades, one component at a time.** A new version reaches the API servers first, then the other control-plane components, then the kubelets, one minor at a time. Each change is tried and kept only once the component runs the new version. An upgrade is refused up front when a node's Talos does not run the version, or when it would strand a flag or an object of a removed API.
 - **Windows, gates and hooks.** Changes can be held to maintenance windows, made to wait on a CEL expression over any object in the cluster, such as a storage cluster's health, and wrapped in Jobs that run around an operation and around each node.
 - **Version awareness.** Status lists the Talos and Kubernetes releases that exist and the upgrades that lead to what the spec asks for. An upgrade to an installer or image that does not exist is refused before a node is asked to pull it. A `validate` command checks the manifests in a repository before they are merged.
+- **Metrics, alerts and a dashboard.** What the operator knows is exported as metrics: an operation that is halted, what holds a change back, drift, nodes that cannot be read, etcd membership. Where the cluster has the Prometheus Operator, the chart installs a ServiceMonitor, alerts and a Grafana dashboard; where it has none, nothing.
 - **Classified changes.** Changes to CAs, tokens and other cluster identity are refused. Changes to storage, and anything the operator has no rule for, wait for approval of that exact change.
 - **Machine pools and shared config.** Config is layered: cluster, then pool, then machine. Reusable `TalosMachineConfig` resources can be referenced from any layer, and report how many machines use them.
 - **Config comparison and drift.** Each machine reports whether its rendered config equals the node's live config, per document, with a diff in which secrets are redacted. A node changed by hand is reported, and put back only if the drift policy says so.
@@ -282,7 +283,9 @@ It fails when the Talos and Kubernetes versions do not go together, when the ins
 | The manifests Talos applies at bootstrap (kube-proxy, CoreDNS) | Not planned |
 | Config changes that only an install can make (kernel arguments, install disk) | Not planned |
 | Adding and removing machines | Planned |
-| Metrics, alerts and dashboards | Planned |
+| Metrics, alerts and a dashboard for what the operator knows | Implemented |
+| Metrics and logs of the cluster's own components | Planned |
+| Backups, etcd snapshots included | Not planned: they are the cluster owner's |
 
 The API is `v1alpha1` and may change incompatibly between releases.
 

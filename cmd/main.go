@@ -40,12 +40,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/catalog"
 	"github.com/jarensaa/talos-operator/internal/controller"
+	"github.com/jarensaa/talos-operator/internal/exporter"
 	"github.com/jarensaa/talos-operator/internal/talos"
 	"github.com/jarensaa/talos-operator/internal/target"
 	// +kubebuilder:scaffold:imports
@@ -262,6 +264,10 @@ func run(o *options) error {
 	if err := setupControllers(mgr, &target.Resolver{Client: mgr.GetClient(), Factory: talosFactory}, o); err != nil {
 		return err
 	}
+
+	// What the resources' status says, as metrics. Read from the cache at every scrape, so every
+	// replica exports it, the leader or not (docs/scope.md §14.2).
+	metrics.Registry.MustRegister(exporter.New(mgr.GetClient()))
 
 	if metricsCertWatcher != nil {
 		if err := mgr.Add(metricsCertWatcher); err != nil {

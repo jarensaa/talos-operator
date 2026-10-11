@@ -400,6 +400,82 @@ Three things to know when writing hooks:
 - **A node that failed gets no `postNode` hook.** What `preNode` set up for it is still set up while the operation is halted, and after a skip. Clean up in `postRollout`, which runs however the operation ends.
 - **A hook runs in the operator's namespace**, with the pod spec you wrote. Whoever may edit a TalosCluster can therefore run pods there, next to the cluster's secrets. They could already put any config on every node, so this grants nothing new, but it is one more reason to keep that permission narrow.
 
+## Monitoring
+
+The operator exports what it knows as metrics, and the chart brings alerts on them and a Grafana dashboard. An operation that has failed and waits for you is the reason to set this up: without it, a halted rollout is only visible to someone who looks at the TalosCluster.
+
+### What is installed, and when
+
+The chart installs three things, under `monitoring` in its values:
+
+| Part | What it is |
+|---|---|
+| `serviceMonitor` | A `ServiceMonitor` that has your Prometheus scrape every replica. |
+| `alerts` | The alerts below, as a `PrometheusRule`. |
+| `dashboard` | A dashboard, as a ConfigMap with the label Grafana's sidecar loads (`grafana_dashboard: "1"`). |
+
+Each is `auto` unless you say `true` or `false`. `auto` installs it if the cluster has the Prometheus Operator's API (`monitoring.coreos.com/v1`), which kube-prometheus-stack brings, and leaves it out if not. So a cluster without a Prometheus gets none of it, and nothing fails.
+
+Three things to know:
+
+- **Your Prometheus has to select them.** A Prometheus only reads ServiceMonitors and rules that match its selectors. kube-prometheus-stack, as it comes, wants the label `release: <its release name>`. Put it in `monitoring.labels`:
+
+  ```yaml
+  monitoring:
+    labels:
+      release: kube-prometheus-stack
+  ```
+
+- **The chart looks when it is installed or upgraded.** If the Prometheus Operator arrives after the operator, the next upgrade of the chart picks it up; or set the three to `true`. Rendering the chart outside a cluster (`helm template`) does not see the API unless you pass `--api-versions monitoring.coreos.com/v1/ServiceMonitor`.
+- **Grafana cannot be detected**, so the dashboard goes by the same sign as the rest. A Grafana that does not run the sidecar needs the dashboard imported by hand: it is `files/dashboard.json` in the chart.
+
+The metrics endpoint is HTTPS and asks the Kubernetes API whether the scraper may read `/metrics`. kube-prometheus-stack's Prometheus may. For another scraper, bind its ServiceAccount to the ClusterRole the chart creates for that: `talos-operator-metrics-reader`, for a release named `talos-operator`.
+
+### Alerts
+
+| Alert | Severity | When |
+|---|---|---|
+| `TalosOperationHalted` | critical | A rollout or an upgrade failed and waits for you: retry, skip the machine, or abort ([When a node doesn't come out healthy](#when-a-node-doesnt-come-out-healthy)). |
+| `TalosOperatorDown` | critical | No operator has been scraped for 10 minutes. Nothing else here can fire while that lasts. |
+| `TalosAPIUnreachable` | critical | The operator has had no working connection to the Talos API, or no credentials, for 10 minutes. |
+| `TalosRolloutBlocked` | warning | A change has waited 30 minutes for something other than a pause or its maintenance window: a closed gate, your approval, a change the operator will not make. |
+| `TalosClusterNotObserved` | warning | The operator's last finished observation is more than 10 minutes old. |
+| `TalosOperatorCannotReadState` | warning | The operator cannot read its own resources, and exports nothing about them. |
+| `TalosConfigDrift` | warning | A node no longer runs the config the operator applied, and `driftPolicy: Report` leaves it so. |
+| `TalosNodeWithoutMachine` | warning | The cluster has a node that no TalosMachine describes. |
+| `TalosVersionsUnreachable` | warning | The spec asks for versions there is no way to. |
+| `TalosClusterUnhealthy` | warning | Talos's own health check has failed for 15 minutes. |
+| `TalosMachineNotObserved` | warning | The operator has not been able to read a node for 10 minutes. |
+| `TalosMachineNotReady` | warning | A node answers and has not been ready for 15 minutes. |
+| `TalosControlPlaneNotEtcdVoter` | warning | A control plane has not been a voting member of etcd for 15 minutes. |
+
+Waiting as you told it to raises nothing: a paused cluster, or a change outside its maintenance window.
+
+Every alert names the cluster in the labels `namespace` and `taloscluster`, and where it is about one, the `machine`. Its description says where in the TalosCluster's status to read on.
+
+### Metrics
+
+All of them start with `talos_operator_`, and all of them are what the status of your resources says, read when the operator is scraped. Both replicas export the same, so take the maximum, as the alerts do:
+
+```promql
+max by (taloscluster) (talos_operator_cluster_operation_halted)
+```
+
+| Metric | Says |
+|---|---|
+| `info` | An operator is running, and which build. |
+| `cluster_phase`, `cluster_condition` | The cluster's phase, and each of its conditions with the status and reason it has now. |
+| `cluster_observed_timestamp_seconds` | When the operator last finished observing the cluster. |
+| `cluster_operation_in_progress`, `cluster_operation_halted`, `cluster_approval_pending` | 0 or 1. |
+| `operation_info`, `operation_start_timestamp_seconds`, `operation_turns` | The rollout or upgrade in flight, and how far it is. |
+| `operation_failure_info`, `operation_failure_timestamp_seconds` | Where a halted operation waits: the machine, the step, the reason. |
+| `cluster_version_info`, `cluster_version_plan_steps` | The versions asked for and run, and how many upgrades lie between them. |
+| `cluster_etcd_members`, `machine_etcd_member` | Voters and learners; for each control plane, whether it is one. |
+| `machine_info`, `machine_phase`, `machine_condition` | Each machine, what its node runs, and its conditions. |
+| `machine_ready`, `machine_hold`, `machine_config_change_info` | Whether a node was ready when last read; whether it is on hold; a config change that is pending. |
+
+What the operator does not observe, it does not export: CPU, memory and disks are a node exporter's, and the cluster's own etcd and control-plane metrics are Kubernetes's.
+
 ## Backing out
 
 Set `config` back to `Observe` and the operator stops writing to your nodes at once. A rollout in flight ends there; a config that was being tried is reverted by Talos when its window ends.

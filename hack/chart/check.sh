@@ -77,4 +77,48 @@ grep -qx -- '--version-sources=true' <<<"$asking" || fail "versionSources.enable
 grep -qx -- '--kubernetes-releases=https://releases.example.com' <<<"$asking" ||
   fail "versionSources.kubernetesReleases must reach the operator"
 
-echo "chart check: $want CRDs rendered, kept on uninstall, identical to $generated; permissions bound; nothing asked upstream by default"
+# Monitoring is installed where there is something to read it: where the cluster has the
+# Prometheus Operator's API, unless a value says otherwise.
+monitoring() {
+  helm template talos-operator "$chart" --namespace talos-operator "$@" |
+    yq -N 'select(.kind == "ServiceMonitor" or .kind == "PrometheusRule" or .metadata.name == "talos-operator-dashboard") | .kind' |
+    sort
+}
+
+prometheus=(--api-versions monitoring.coreos.com/v1/ServiceMonitor)
+all=$'ConfigMap\nPrometheusRule\nServiceMonitor'
+
+[ -z "$(monitoring)" ] || fail "no monitoring is installed on a cluster without the Prometheus Operator's API"
+[ "$(monitoring "${prometheus[@]}")" = "$all" ] || fail "monitoring must be installed where the Prometheus Operator's API is"
+[ "$(monitoring --set monitoring.serviceMonitor.enabled=true --set monitoring.alerts.enabled=true \
+  --set monitoring.dashboard.enabled=true)" = "$all" ] || fail "monitoring.*.enabled=true must install it whatever the cluster has"
+[ -z "$(monitoring "${prometheus[@]}" --set monitoring.serviceMonitor.enabled=false --set monitoring.alerts.enabled=false \
+  --set monitoring.dashboard.enabled=false)" ] || fail "monitoring.*.enabled=false must leave it out"
+[ "$(monitoring "${prometheus[@]}" --set monitoring.alerts.enabled=false)" = $'ConfigMap\nServiceMonitor' ] ||
+  fail "each part of the monitoring has its own switch"
+[ -z "$(monitoring "${prometheus[@]}" --set metrics.enabled=false)" ] || fail "without metrics there is nothing to monitor"
+! helm template talos-operator "$chart" --set monitoring.alerts.enabled=sometimes >/dev/null 2>&1 ||
+  fail "monitoring.alerts.enabled takes auto, true or false"
+! helm template talos-operator "$chart" --set monitoring.alerts.enabled=true --set metrics.enabled=false >/dev/null 2>&1 ||
+  fail "monitoring that is asked for without metrics must be refused"
+
+monitored=$(helm template talos-operator "$chart" --namespace talos-operator "${prometheus[@]}" --set monitoring.labels.release=prometheus)
+
+# The rules that are installed are the file that `make alerts-test` tests.
+diff <(yq -o json -I0 'sort_keys(..)' "$chart/files/alerts.yaml") \
+  <(yq -o json -I0 'select(.kind == "PrometheusRule") | .spec | sort_keys(..)' <<<"$monitored") >/dev/null ||
+  fail "the PrometheusRule does not carry files/alerts.yaml"
+[ "$(yq -N 'select(.kind == "ServiceMonitor" or .kind == "PrometheusRule") | .metadata.labels.release' <<<"$monitored")" = $'prometheus\nprometheus' ] ||
+  fail "monitoring.labels must reach the ServiceMonitor and the PrometheusRule"
+[ "$(yq -N 'select(.kind == "ServiceMonitor") | .spec.endpoints[0] | .port + "," + .scheme' <<<"$monitored")" = "metrics,https" ] ||
+  fail "the ServiceMonitor must scrape the metrics port over HTTPS"
+# The ServiceMonitor finds the Service by the labels the Service has.
+[ "$(yq -o json -I0 'select(.kind == "ServiceMonitor") | .spec.selector.matchLabels' <<<"$monitored")" = \
+  "$(yq -o json -I0 'select(.kind == "Service") | .spec.selector' <<<"$monitored")" ] ||
+  fail "the ServiceMonitor does not select the metrics Service"
+yq -N 'select(.metadata.name == "talos-operator-dashboard") | .data["talos-operator.json"]' <<<"$monitored" |
+  yq -p json -e '.panels | length > 0' >/dev/null || fail "the dashboard is not JSON with panels"
+[ "$(yq -N 'select(.metadata.name == "talos-operator-dashboard") | .metadata.labels.grafana_dashboard' <<<"$monitored")" = "1" ] ||
+  fail "the dashboard must carry the label Grafana's sidecar looks for"
+
+echo "chart check: $want CRDs rendered, kept on uninstall, identical to $generated; permissions bound; nothing asked upstream by default; monitoring where there is a Prometheus"

@@ -1,0 +1,188 @@
+# The alerts the chart installs as a PrometheusRule (templates/monitoring.yaml), over the metrics
+# of internal/exporter. A plain Prometheus rule file: `make alerts-test` checks and tests it.
+#
+# Every replica exports the same state, so every expression takes the maximum over them. The
+# labels namespace and taloscluster name the TalosCluster an alert is about.
+groups:
+  - name: talos-operator
+    rules:
+      - alert: TalosOperatorDown
+        expr: absent(talos_operator_info)
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: No talos-operator is being scraped.
+          description: >-
+            No replica of talos-operator has exported metrics for 10 minutes. Nothing is rolled
+            out or upgraded, and none of the other alerts about the cluster can fire while this
+            lasts.
+
+      - alert: TalosOperatorCannotReadState
+        expr: max(increase(talos_operator_state_read_errors_total[10m])) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: talos-operator cannot read its own resources.
+          description: >-
+            The operator fails to read its TalosClusters and TalosMachines when it is scraped, and
+            exports nothing about them. None of the other alerts about the cluster can fire while
+            this lasts.
+
+      - alert: TalosClusterNotObserved
+        expr: time() - max by (namespace, taloscluster) (talos_operator_cluster_observed_timestamp_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: talos-operator has stopped observing {{ $labels.taloscluster }}.
+          description: >-
+            The last observation of {{ $labels.taloscluster }} that the operator finished is
+            {{ $value | humanizeDuration }} old. Its status, and every metric and alert that comes
+            from it, is that old.
+
+      - alert: TalosOperationHalted
+        expr: max by (namespace, taloscluster, type, machine, step, reason, hook) (talos_operator_operation_failure_info) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A {{ $labels.type }} of {{ $labels.taloscluster }} has failed and waits for a person.
+          description: >-
+            The {{ $labels.type }} of {{ $labels.taloscluster }} is halted at
+            {{ $labels.step }}{{ if $labels.machine }} on {{ $labels.machine }}{{ end }}{{ if $labels.hook }} in a {{ $labels.hook }} hook{{ end }}{{ if $labels.reason }} ({{ $labels.reason }}){{ end }}.
+            It holds the cluster until someone retries it, skips the machine or aborts it:
+            status.operation.failure of the TalosCluster says what happened and what to do.
+
+      - alert: TalosRolloutBlocked
+        expr: >-
+          max by (namespace, taloscluster, reason) (
+            talos_operator_cluster_condition{condition="RolloutBlocked", status="True", reason!~"OperationFailed|Paused|OutsideWindow"}
+          ) == 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: A change to {{ $labels.taloscluster }} is not being rolled out.
+          description: >-
+            A change to {{ $labels.taloscluster }} has been waiting for 30 minutes without being
+            paused or outside its maintenance window: {{ $labels.reason }}. The RolloutBlocked
+            condition of the TalosCluster says what it waits for, a person's approval included.
+
+      - alert: TalosConfigDrift
+        expr: >-
+          max by (namespace, taloscluster) (
+            talos_operator_cluster_condition{condition="ConfigInSync", status="False", reason="Drift"}
+          ) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Nodes of {{ $labels.taloscluster }} no longer run the config the operator applied.
+          description: >-
+            The config of at least one node of {{ $labels.taloscluster }} was changed behind the
+            operator's back, and the drift policy leaves it as it is. status.config.diff of each
+            TalosMachine shows the difference.
+
+      - alert: TalosNodeWithoutMachine
+        expr: >-
+          max by (namespace, taloscluster) (
+            talos_operator_cluster_condition{condition="ConfigInSync", status="False", reason="Mismatch"}
+          ) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.taloscluster }} has a node that no TalosMachine describes."
+          description: >-
+            A member of {{ $labels.taloscluster }} has no TalosMachine, so the operator does not
+            manage its config. The ConfigInSync condition of the TalosCluster names it.
+
+      - alert: TalosVersionsUnreachable
+        expr: >-
+          max by (namespace, taloscluster) (
+            talos_operator_cluster_condition{condition="VersionsReachable", status="False"}
+          ) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.taloscluster }} is asked for versions it cannot be taken to."
+          description: >-
+            There is no sequence of upgrades from the versions {{ $labels.taloscluster }} runs to
+            the ones its spec asks for. The VersionsReachable condition of the TalosCluster says
+            why; nothing is upgraded until the spec changes.
+
+      - alert: TalosAPIUnreachable
+        expr: >-
+          max by (namespace, taloscluster, reason) (
+            talos_operator_cluster_condition{condition=~"TalosAPIReachable|CredentialsValid", status="False"}
+          ) == 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: talos-operator cannot talk to the Talos API of {{ $labels.taloscluster }}.
+          description: >-
+            The operator has had no working connection to the Talos API of
+            {{ $labels.taloscluster }} for 10 minutes: {{ $labels.reason }}. It observes nothing
+            and rolls out nothing until it has one.
+
+      - alert: TalosClusterUnhealthy
+        expr: >-
+          max by (namespace, taloscluster) (
+            talos_operator_cluster_condition{condition="Healthy", status="False"}
+          ) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Talos's health check of {{ $labels.taloscluster }} fails.
+          description: >-
+            Talos's own cluster health check of {{ $labels.taloscluster }} has been failing for 15
+            minutes. The Healthy condition of the TalosCluster says which check; no node is
+            touched while it lasts.
+
+      - alert: TalosMachineNotObserved
+        expr: >-
+          max by (namespace, taloscluster, machine) (
+            talos_operator_machine_condition{condition="NodeObserved", status!="True"}
+          ) == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: talos-operator cannot read {{ $labels.machine }}.
+          description: >-
+            The operator has not been able to read the node of {{ $labels.machine }} in
+            {{ $labels.taloscluster }} for 10 minutes. What is not read is not known: no other
+            node is touched while it lasts.
+
+      - alert: TalosMachineNotReady
+        expr: >-
+          max by (namespace, taloscluster, machine) (talos_operator_machine_ready) == 0
+          and on (namespace, taloscluster, machine)
+          max by (namespace, taloscluster, machine) (
+            talos_operator_machine_condition{condition="NodeObserved", status="True"}
+          ) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.machine }} is not ready."
+          description: >-
+            The node of {{ $labels.machine }} in {{ $labels.taloscluster }} answers and has
+            reported itself not ready for 15 minutes.
+
+      - alert: TalosControlPlaneNotEtcdVoter
+        expr: max by (namespace, taloscluster, machine) (talos_operator_machine_etcd_member{role="voter"}) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.machine }} is a control plane and not a voting member of etcd."
+          description: >-
+            The control plane {{ $labels.machine }} of {{ $labels.taloscluster }} has not been a
+            voting member of etcd for 15 minutes: it is no member, or still a learner. The cluster
+            tolerates one control plane fewer than it should.
