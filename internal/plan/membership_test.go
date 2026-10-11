@@ -98,9 +98,9 @@ func TestRemovalGateKeepsThreeVoters(t *testing.T) {
 
 func TestPlanRemoval(t *testing.T) {
 	machines := []RemoveMachine{
-		{Name: "cp-d", Node: "d", ControlPlane: true},
-		{Name: "w-2", Node: "worker-2", HostsOperator: true},
-		{Name: "w-1", Node: "worker-1"},
+		{Name: "cp-d", Node: "d", Reachable: true, ControlPlane: true},
+		{Name: "w-2", Node: "worker-2", Reachable: true, HostsOperator: true},
+		{Name: "w-1", Node: "worker-1", Reachable: true},
 	}
 
 	got := PlanRemoval(machines, RemovalSettings{}, passOf("a", "b", "c", "d"))
@@ -141,6 +141,20 @@ func TestPlanRemoval(t *testing.T) {
 	got = PlanRemoval(machines, RemovalSettings{Held: []string{"w-1"}}, passOf("a", "b", "c", "d"))
 	if !slices.Equal(got.Pending, []string{"w-2", "cp-d"}) || !slices.Equal(got.Held, []string{"w-1"}) {
 		t.Fatalf("got %+v", got)
+	}
+
+	// A machine that does not answer is not judged by a pass that could not read it: its removal
+	// begins, and its own turn is where it waits, halts, and asks a human.
+	silent := []RemoveMachine{{Name: "cp-d", Node: "d", ControlPlane: true}}
+	incomplete := passOf("a", "b", "c", "d")
+	incomplete.Incomplete = "d: not reachable"
+
+	if got := PlanRemoval(silent, RemovalSettings{}, incomplete); !got.MayStart() {
+		t.Fatalf("got %+v", got)
+	}
+
+	if got := PlanRemoval(silent, RemovalSettings{Paused: true}, incomplete); got.MayStart() {
+		t.Fatalf("a pause holds it like any other: %+v", got)
 	}
 
 	if got := PlanRemoval(nil, RemovalSettings{}, passOf("a")); got.MayStart() || len(got.Pending) != 0 {

@@ -735,9 +735,8 @@ spec:
                       - ConfigRollout
                       - TalosUpgrade
                       - KubernetesUpgrade
-                      - AddControlPlane
+                      - AddMachine
                       - RemoveMachine
-                      - Bootstrap
                       type: string
                   required:
                   - finishedAt
@@ -748,6 +747,27 @@ spec:
                   type: object
                 maxItems: 10
                 type: array
+              membership:
+                description: Membership records what a human decided about machines
+                  that were to be added or removed.
+                properties:
+                  add:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Add maps a machine to the config it was to be handed when a human skipped it, or aborted
+                      the operation that was adding it. It is not added with that config again; with any other
+                      it is.
+                    type: object
+                  remove:
+                    description: |-
+                      Remove lists the machines whose removal a human skipped or aborted. They are not removed
+                      until their spec asks for it anew: desiredState back to Present, and to Removed again.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: set
+                type: object
               observed:
                 description: Observed is the last observed live state.
                 properties:
@@ -831,6 +851,11 @@ spec:
                           Cordoned is set before the operator cordons the node, so that it later uncordons a node it
                           cordoned itself and leaves alone one that someone else did.
                         type: boolean
+                      dead:
+                        description: |-
+                          Dead is set when a human confirmed that the machine being removed is gone for good: it is
+                          taken out of etcd and Kubernetes from the outside, and never asked anything again.
+                        type: boolean
                       deadline:
                         description: Deadline is the step's timeout, e.g. the end
                           of a TRY window.
@@ -838,6 +863,11 @@ spec:
                         type: string
                       desiredHash:
                         description: DesiredHash is the hash of the config being applied.
+                        type: string
+                      etcdMember:
+                        description: |-
+                          EtcdMember is the etcd member ID, in hex, that a control plane had when its removal began:
+                          what has to be gone from the member list before the removal is done.
                         type: string
                       healthySince:
                         description: |-
@@ -1004,9 +1034,8 @@ spec:
                     - ConfigRollout
                     - TalosUpgrade
                     - KubernetesUpgrade
-                    - AddControlPlane
+                    - AddMachine
                     - RemoveMachine
-                    - Bootstrap
                     type: string
                 required:
                 - id

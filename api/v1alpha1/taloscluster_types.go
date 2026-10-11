@@ -473,6 +473,20 @@ type UpgradeHolds struct {
 	Kubernetes string `json:"kubernetes,omitempty"`
 }
 
+// MembershipHolds records what a human decided about machines that were to be added or removed.
+type MembershipHolds struct {
+	// Add maps a machine to the config it was to be handed when a human skipped it, or aborted
+	// the operation that was adding it. It is not added with that config again; with any other
+	// it is.
+	// +optional
+	Add map[string]string `json:"add,omitempty"`
+	// Remove lists the machines whose removal a human skipped or aborted. They are not removed
+	// until their spec asks for it anew: desiredState back to Present, and to Removed again.
+	// +listType=set
+	// +optional
+	Remove []string `json:"remove,omitempty"`
+}
+
 // VersionStep is one upgrade on the way from the versions a cluster runs to the versions its spec
 // asks for.
 type VersionStep struct {
@@ -786,6 +800,9 @@ type TalosClusterStatus struct {
 	// Versions is what the cluster runs, what exists, and the way to what the spec asks for.
 	// +optional
 	Versions *VersionsStatus `json:"versions,omitempty"`
+	// Membership records what a human decided about machines that were to be added or removed.
+	// +optional
+	Membership *MembershipHolds `json:"membership,omitempty"`
 
 	// History holds the most recent finished operations, newest first.
 	// +kubebuilder:validation:MaxItems=10

@@ -290,6 +290,13 @@ spec:
                   systemUUID:
                     type: string
                 type: object
+              joinedAt:
+                description: |-
+                  JoinedAt is when the machine was first found to be a member of the cluster: its node
+                  answered with the cluster's credentials and carried the pinned identity. Until then it is
+                  a machine that is to be added, and no rollout or upgrade waits for it. It is never unset.
+                format: date-time
+                type: string
               kubelet:
                 description: KubeletState is the observed kubelet state.
                 properties:
@@ -311,7 +318,14 @@ spec:
                 - Draining
                 - Rebooting
                 - Removing
+                - Removed
                 - Failed
+                type: string
+              removedAt:
+                description: |-
+                  RemovedAt is when the operator finished taking the machine out of the cluster (docs/scope.md
+                  §7.7). It is unset again when the machine is added once more.
+                format: date-time
                 type: string
               talos:
                 description: TalosState is the observed Talos runtime state.

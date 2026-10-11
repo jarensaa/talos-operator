@@ -45,16 +45,20 @@ func (r *TalosClusterReconciler) manage(ctx context.Context, tc *talosv1alpha1.T
 	st := &tc.Status
 	gen := tc.Generation
 
-	pools, machines, err := membersOf(ctx, r.Client, tc.Namespace, tc.Name)
+	pools, all, err := membersOf(ctx, r.Client, tc.Namespace, tc.Name)
 	if err != nil {
 		return err
 	}
+
+	// What is rolled out to, upgraded and proven are the cluster's members. A machine that is
+	// declared and has not joined, or has left, is the business of adding and removing alone.
+	machines := members(all)
 
 	if obs.facts == nil || obs.reader == nil {
 		// The cluster was not reached, so nothing can be compared or planned. A node step in flight
 		// still has deadlines to keep: it goes on, with its node counted as unreachable.
 		if st.Operation != nil {
-			return r.operate(ctx, tc, obs, pools, machines)
+			return r.operate(ctx, tc, obs, pools, machines, all)
 		}
 
 		return nil
@@ -86,7 +90,7 @@ func (r *TalosClusterReconciler) manage(ctx context.Context, tc *talosv1alpha1.T
 		meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionRolloutBlocked)
 	}
 
-	return r.operate(ctx, tc, obs, pools, machines)
+	return r.operate(ctx, tc, obs, pools, machines, all)
 }
 
 // operate carries the one disruptive operation of the cluster a step further, or plans the next
@@ -97,10 +101,21 @@ func (r *TalosClusterReconciler) manage(ctx context.Context, tc *talosv1alpha1.T
 // An upgrade that is due but may not start does not keep the other from starting. They wait for
 // each other where they must: a Talos version that does not run the cluster's Kubernetes waits
 // for the Kubernetes upgrade, and the other way round (docs/scope.md §7.3, §7.4).
+//
+// Machines leave before anything else is considered, and join after everything else (docs/scope.md
+// §7.6, §7.7). A node that is to go is not upgraded first, and one that ails is taken out without
+// waiting for a rollout it would hold up. A machine that is added joins a cluster that runs what
+// its spec asks for. A replacement falls out of the two: the removal of a control plane that
+// would leave too few is refused, the new one is added, and the old one then goes.
 func (r *TalosClusterReconciler) operate(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation,
-	pools map[string]*talosv1alpha1.TalosMachinePool, machines []talosv1alpha1.TalosMachine,
+	pools map[string]*talosv1alpha1.TalosMachinePool, machines, all []talosv1alpha1.TalosMachine,
 ) error {
-	upgrading, held, err := r.upgrade(ctx, tc, obs, pools, machines)
+	removing, held, err := r.removal(ctx, tc, obs, pools, all)
+	if err != nil || removing {
+		return err
+	}
+
+	upgrading, heldUpgrade, err := r.upgrade(ctx, tc, obs, pools, machines)
 	if err != nil || upgrading {
 		return err
 	}
@@ -110,19 +125,25 @@ func (r *TalosClusterReconciler) operate(ctx context.Context, tc *talosv1alpha1.
 		return err
 	}
 
-	if held == nil {
-		held = heldKubernetes
-	}
-
 	if err := r.rollout(ctx, tc, obs, pools, machines); err != nil {
 		return err
 	}
 
-	// An upgrade that is due and may not start is what really holds things up: the config that
-	// names its installer waits for it.
-	if held != nil && tc.Status.Operation == nil {
-		setCondition(&tc.Status, tc.Generation, held.Type, held.Status, held.Reason, held.Message)
+	// A removal or an upgrade that is due and may not start is what really holds things up: the
+	// config that names an upgrade's installer waits for it.
+	for _, cond := range []*metav1.Condition{held, heldUpgrade, heldKubernetes} {
+		if cond != nil && tc.Status.Operation == nil {
+			setCondition(&tc.Status, tc.Generation, cond.Type, cond.Status, cond.Reason, cond.Message)
+
+			break
+		}
 	}
+
+	if err := r.join(ctx, tc, obs, pools, all); err != nil {
+		return err
+	}
+
+	reportMembership(tc, obs, all)
 
 	return nil
 }

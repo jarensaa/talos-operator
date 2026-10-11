@@ -54,6 +54,10 @@ const (
 	// ConditionVersionsReachable reports whether there is a sequence of upgrades from the versions
 	// the cluster runs to the versions its spec asks for (docs/scope.md §7.5).
 	ConditionVersionsReachable = "VersionsReachable"
+	// ConditionMembershipCurrent reports whether the cluster's machines are the ones that are
+	// declared: every TalosMachine that is Present is a member, and none that is Removed still is
+	// (docs/scope.md §7.6, §7.7).
+	ConditionMembershipCurrent = "MembershipCurrent"
 	// ConditionRolloutBlocked reports that a disruptive operation is halted and needs attention.
 	ConditionRolloutBlocked = "RolloutBlocked"
 )
@@ -172,6 +176,10 @@ const (
 	ReasonIdentityMismatch = "IdentityMismatch"
 	// ReasonConfigDoesNotFit: the rendered config names a disk or a link the machine does not have.
 	ReasonConfigDoesNotFit = "ConfigDoesNotFit"
+	// Reasons of MembershipCurrent.
+	ReasonAdding          = "Adding"
+	ReasonRemoving        = "Removing"
+	ReasonAwaitingMachine = "AwaitingMachine"
 	// Reasons of RolloutBlocked for machines to be added or removed (docs/scope.md §7.6, §7.7).
 	ReasonNotAtRest        = "NotAtRest"
 	ReasonQuorumAtRisk     = "QuorumAtRisk"

@@ -387,6 +387,14 @@ func (s *Scenario) Maintenance(addr netip.Addr) talos.Maintenance {
 	return &maintenance{s: s, addr: addr}
 }
 
+// Add puts another node on the network.
+func (s *Scenario) Add(n Node) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.nodes[n.Addr] = &n
+}
+
 // Forget takes a node out of the scenario altogether, as when its machine is switched off for
 // good and the cluster's discovery has dropped it.
 func (s *Scenario) Forget(addr netip.Addr) {

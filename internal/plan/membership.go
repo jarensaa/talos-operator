@@ -371,8 +371,10 @@ func settle(healthy bool, reason string, since, healthySince time.Time, t Timing
 // RemoveMachine is what the planner needs to know about a machine that is to be removed.
 type RemoveMachine struct {
 	Name string
-	// Node is the hostname of the machine's live node; empty if none answered.
+	// Node is the hostname the machine's node is known under; Reachable whether it answered in
+	// this pass.
 	Node         string
+	Reachable    bool
 	ControlPlane bool
 	// HostsOperator is true for the node this operator runs on, which goes last.
 	HostsOperator bool
@@ -447,6 +449,15 @@ func PlanRemoval(machines []RemoveMachine, s RemovalSettings, p Pass) Removal {
 		return out
 	}
 
+	// A machine that does not answer cannot be judged, and neither can the cluster around it: a
+	// pass that could not read a member is not complete. Its removal begins all the same, takes
+	// nothing from the cluster, and halts once the machine has not answered for long enough
+	// (NextRemovalStep): what happens to a machine that is gone is for a human to say, and that
+	// is where they are asked.
+	if !pending[0].Reachable {
+		return out
+	}
+
 	if gate := RemovalGate(p, pending[0].Node, false).And(s.Policy.Gates()); !gate.Open {
 		out.BlockReason, out.BlockMessage = cmp.Or(gate.block, BlockGateClosed), gate.Reason
 	}
@@ -468,6 +479,10 @@ func PlanRemoval(machines []RemoveMachine, s RemovalSettings, p Pass) Removal {
 // of a dead node's removal is one that leaves the node out (it cannot be read, by definition).
 func RemovalGate(p Pass, node string, dead bool) Gate {
 	gate := TouchGate(p, node)
+	if dead {
+		gate = withoutTheDead(p)
+	}
+
 	if !gate.Open {
 		return gate
 	}
@@ -503,6 +518,32 @@ func RemovalGate(p Pass, node string, dead bool) Gate {
 	}
 
 	return gate
+}
+
+// withoutTheDead is the gate before what is left of a dead machine is taken out of the cluster:
+// every member that is there is healthy by its own facts, by Kubernetes and by etcd. Talos's own
+// health checks are not asked. They count the Nodes Kubernetes has, the dead machine's among
+// them, and cannot pass until the removal they would be asked about is done.
+func withoutTheDead(p Pass) Gate {
+	if gate := observed(p); !gate.Open {
+		return gate
+	}
+
+	c := *p.Cluster
+
+	gate := holds(
+		checkAllMembersRunning(c, ""),
+		checkAllNodesReady(c, ""),
+		checkEtcdHealthy(c, ""),
+		checkEtcdMatchesControlPlanes(c),
+		checkNoPendingConfig(c),
+	)
+	if !gate.Open {
+		return gate
+	}
+
+	return Gate{Open: true, Note: "the machine is dead, so Talos's cluster-wide health checks were not asked: " +
+		"every member that is left is healthy by its own report, by Kubernetes and by etcd"}
 }
 
 // RemovalStep is the persisted state of the step of a machine that is being removed.
