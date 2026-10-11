@@ -31,11 +31,15 @@ Dependabot proposes the bumps (`.github/dependabot.yml`): weekly, a few days aft
 
 | | Merges by itself | Waits for a person |
 |---|---|---|
-| Go modules | patch releases | a new minor or major |
-| GitHub Actions, release tooling | patch and minor releases | a new major |
+| The Talos libraries: machinery, go-kubernetes, the COSI runtime | patch releases | a new minor or major |
+| Every other Go module | every release | |
+| GitHub Actions, release tooling | every release | |
+
+The checks are the judge of a bump, whatever its size (decided by the owner, 2026-10-11). The one exception is what the checks cannot judge: a new minor of machinery is a new Talos to support, and the operator would start saying it knows a Talos release that no test here has run.
 
 - The checks are the ones every pull request needs, the e2e on one control plane included. Three control planes run weekly, after the fact.
-- A pull request's checks never run the steps that publish. A bump of an action that only publishing uses is first tried by the next release.
+- A pull request's checks never run the steps that publish. A bump of an action that only publishing uses, a new major included, is first tried by the next release, and is fixed there if it breaks it.
+- Nobody reads a bump that merges by itself, and the next release ships it. What stands between a release of a dependency that should not have been made and the operator's image is the five days Dependabot waits before proposing one, and the checks.
 - **The merge starts no workflow on `main`.** GitHub starts none for what a workflow's own token does. Nothing is lost: the checks ran on the pull request on top of `main` as it was, and the bump is released with the next merge a person makes. Until a cluster depends on a bump being released promptly, that is soon enough; when one does, the merge needs an identity of its own (a GitHub App), which is a credential in a job on pull requests and a decision for the owner.
 
 Not covered, and bumped by hand: the Go toolchain, the tools the `Makefile` pins (golangci-lint, which `lint.yml` names too, controller-gen and kustomize), promtool (`hack/tools/promtool.sh`, a version and the checksums of its release archives), and the `talosctl`, Talos and Kubernetes versions of the e2e (docs/dev/e2e.md).
