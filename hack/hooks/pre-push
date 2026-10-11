@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Before a push: what CI's quick jobs check, short of the tests that need an API server (about
+# half a minute with warm caches). Install with `make hooks`. It checks the working tree, so
+# commit or set aside what is not meant to be pushed.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+# shellcheck source=hack/hooks/generated.sh
+. hack/hooks/generated.sh
+
+fail() { printf '\npre-push: %s\n' "$*" >&2; exit 1; }
+step() { printf 'pre-push: %s\n' "$*" >&2; }
+
+# quietly runs a command and shows what it printed only if it fails.
+quietly() {
+  local out
+  if ! out=$("$@" 2>&1); then
+    printf '%s\n' "$out" >&2
+    return 1
+  fi
+}
+
+# Deleting a branch pushes nothing to check.
+pushes=false
+while read -r _ local_sha _ _; do
+  [[ "$local_sha" =~ ^0+$ ]] || pushes=true
+done
+"$pushes" || exit 0
+
+step "modules, generated files and formatting"
+regenerate
+stale=$(git diff --name-only HEAD -- "${generated_paths[@]}")
+[ -z "$stale" ] || fail "these are not what the tree generates, or are not committed:"$'\n'"$stale"
+
+unformatted=$(git ls-files '*.go' | xargs gofmt -l)
+[ -z "$unformatted" ] || fail "not formatted; run 'make fmt':"$'\n'"$unformatted"
+
+step "lint"
+quietly make --no-print-directory lint || fail "'make lint' fails"
+
+step "chart"
+quietly make --no-print-directory helm-lint || fail "'make helm-lint' fails"
+
+if command -v pnpm >/dev/null 2>&1 && [ -d node_modules ]; then
+  step "release tooling"
+  quietly pnpm --silent test:release || fail "'pnpm test:release' fails"
+fi
+
+# The packages that need no API server: the planners, the classifier and what renders config.
+step "unit tests"
+quietly go test ./internal/plan/ ./internal/classify/ ./internal/gates/ ./internal/render/ ./internal/adopt/... ||
+  fail "unit tests fail; 'make test-unit' runs all of them"

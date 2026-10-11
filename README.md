@@ -292,6 +292,7 @@ No cluster other than those depends on the operator yet. That is on purpose: unt
 ```bash
 make test    # unit and API-server tests
 make lint
+make hooks   # git hooks: quick checks before a commit, lint and unit tests before a push
 ```
 
 Releases are created automatically from [Conventional Commits](https://www.conventionalcommits.org) on `main`.
