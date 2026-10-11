@@ -108,6 +108,11 @@ jobs:
           helm lint charts/talos-operator
           hack/chart/check.sh charts/talos-operator
 
+      # The chart's alerts, checked and tested by promtool on what the exporter exports
+      # (internal/exporter writes the test; the unit tests fail when it is stale).
+      - name: Test alert rules
+        run: make alerts-test
+
   release-metadata:
     name: Release metadata
     runs-on: ubuntu-latest

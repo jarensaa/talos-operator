@@ -73,8 +73,10 @@ func healthy() *fixture {
 					condition(talosv1alpha1.ConditionVersionsReachable, metav1.ConditionTrue, talosv1alpha1.ReasonUpToDate),
 				},
 				Observed: &talosv1alpha1.ObservedState{
-					EtcdMembers: []talosv1alpha1.EtcdMember{{ID: "a1", Hostname: "node-a"}, {ID: "b2", Hostname: "node-b"}, {ID: "c3", Hostname: "node-c"}},
-					ObservedAt:  &epoch,
+					EtcdMembers: []talosv1alpha1.EtcdMember{
+						{ID: "a1", Hostname: "node-a"}, {ID: "b2", Hostname: "node-b"}, {ID: "c3", Hostname: "node-c"},
+					},
+					ObservedAt: &epoch,
 				},
 				Versions: &talosv1alpha1.VersionsStatus{Talos: "v1.14.2", Kubernetes: "1.37.1"},
 			},
@@ -128,6 +130,11 @@ func (f *fixture) machine(name string) *talosv1alpha1.TalosMachine {
 	panic("no machine " + name)
 }
 
+// is gives the cluster a condition, in place of the one of that type it had.
+func (f *fixture) is(kind string, status metav1.ConditionStatus, reason string) {
+	set(&f.cluster.Status.Conditions, condition(kind, status, reason))
+}
+
 // set replaces the condition of the same type.
 func set(list *[]metav1.Condition, c metav1.Condition) {
 	for i := range *list {
@@ -142,7 +149,8 @@ func set(list *[]metav1.Condition, c metav1.Condition) {
 }
 
 func (f *fixture) objects() []client.Object {
-	out := []client.Object{f.cluster}
+	out := make([]client.Object, 0, 1+len(f.pools)+len(f.machines))
+	out = append(out, f.cluster)
 
 	for _, pool := range f.pools {
 		out = append(out, pool)

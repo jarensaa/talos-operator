@@ -76,8 +76,8 @@ func scenarios() []scenario {
 			Plan: []string{"node-d", "node-a", "node-b", "node-c"}, Completed: []string{"node-d"},
 			Failure: &talosv1alpha1.OperationFailure{Machine: "node-a", Step: "Verifying", Reason: "RolledBack", At: &epoch},
 		}
-		set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed))
-		set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonOperationFailed))
+		f.is(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed)
+		f.is(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonOperationFailed)
 	}
 
 	haltedAlert := fired{
@@ -91,8 +91,8 @@ func scenarios() []scenario {
 
 	blocked := func(reason string) func(f *fixture) {
 		return func(f *fixture) {
-			set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, reason))
-			set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, reason))
+			f.is(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, reason)
+			f.is(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, reason)
 		}
 	}
 
@@ -160,10 +160,12 @@ func scenarios() []scenario {
 			change: func(f *fixture) {
 				f.cluster.Status.Operation = &talosv1alpha1.Operation{
 					ID: "op-2", Type: talosv1alpha1.OperationTalosUpgrade, Target: "v1.14.2", StartedAt: epoch,
-					Plan:    []string{"node-d", "node-a", "node-b", "node-c"},
-					Failure: &talosv1alpha1.OperationFailure{Step: "preRollout/announce", Reason: "HookFailed", Hook: talosv1alpha1.HookPreRollout, At: &epoch},
+					Plan: []string{"node-d", "node-a", "node-b", "node-c"},
+					Failure: &talosv1alpha1.OperationFailure{
+						Step: "preRollout/announce", Reason: "HookFailed", Hook: talosv1alpha1.HookPreRollout, At: &epoch,
+					},
 				}
-				set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed))
+				f.is(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed)
 			},
 			fires: []fired{{
 				alert: "TalosOperationHalted", severity: "critical",
@@ -202,8 +204,9 @@ func scenarios() []scenario {
 		{
 			name: "drift that the policy leaves as it is",
 			change: func(f *fixture) {
-				set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonDrift))
-				set(&f.machine("node-d").Status.Conditions, condition(talosv1alpha1.ConditionConfigMatchesLive, metav1.ConditionFalse, talosv1alpha1.ReasonMismatch))
+				f.is(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonDrift)
+				set(&f.machine("node-d").Status.Conditions,
+					condition(talosv1alpha1.ConditionConfigMatchesLive, metav1.ConditionFalse, talosv1alpha1.ReasonMismatch))
 			},
 			fires: []fired{{
 				alert: "TalosConfigDrift", severity: "warning",
@@ -215,7 +218,7 @@ func scenarios() []scenario {
 		{
 			name: "a node that no TalosMachine describes",
 			change: func(f *fixture) {
-				set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonMismatch))
+				f.is(talosv1alpha1.ConditionConfigInSync, metav1.ConditionFalse, talosv1alpha1.ReasonMismatch)
 			},
 			fires: []fired{{
 				alert: "TalosNodeWithoutMachine", severity: "warning",
@@ -227,7 +230,7 @@ func scenarios() []scenario {
 		{
 			name: "a spec that asks for versions there is no way to",
 			change: func(f *fixture) {
-				set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionVersionsReachable, metav1.ConditionFalse, talosv1alpha1.ReasonIncompatible))
+				f.is(talosv1alpha1.ConditionVersionsReachable, metav1.ConditionFalse, talosv1alpha1.ReasonIncompatible)
 			},
 			fires: []fired{{
 				alert: "TalosVersionsUnreachable", severity: "warning",
@@ -239,8 +242,8 @@ func scenarios() []scenario {
 		{
 			name: "a Talos API that cannot be reached",
 			change: func(f *fixture) {
-				set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionTalosAPIReachable, metav1.ConditionFalse, talosv1alpha1.ReasonUnreachable))
-				set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionHealthy, metav1.ConditionUnknown, talosv1alpha1.ReasonUnreachable))
+				f.is(talosv1alpha1.ConditionTalosAPIReachable, metav1.ConditionFalse, talosv1alpha1.ReasonUnreachable)
+				f.is(talosv1alpha1.ConditionHealthy, metav1.ConditionUnknown, talosv1alpha1.ReasonUnreachable)
 
 				for _, tm := range f.machines {
 					unobserved(tm)
@@ -259,10 +262,8 @@ func scenarios() []scenario {
 		{
 			name: "credentials that Talos does not issue",
 			change: func(f *fixture) {
-				set(&f.cluster.Status.Conditions,
-					condition(talosv1alpha1.ConditionCredentialsValid, metav1.ConditionFalse, talosv1alpha1.ReasonAwaitingCredentials))
-				set(&f.cluster.Status.Conditions,
-					condition(talosv1alpha1.ConditionTalosAPIReachable, metav1.ConditionUnknown, talosv1alpha1.ReasonPreconditionUnmet))
+				f.is(talosv1alpha1.ConditionCredentialsValid, metav1.ConditionFalse, talosv1alpha1.ReasonAwaitingCredentials)
+				f.is(talosv1alpha1.ConditionTalosAPIReachable, metav1.ConditionUnknown, talosv1alpha1.ReasonPreconditionUnmet)
 			},
 			fires: []fired{{
 				alert: "TalosAPIUnreachable", severity: "critical", labels: []string{"reason", "AwaitingCredentials"},
@@ -274,7 +275,7 @@ func scenarios() []scenario {
 		{
 			name: "a health check of Talos that fails",
 			change: func(f *fixture) {
-				set(&f.cluster.Status.Conditions, condition(talosv1alpha1.ConditionHealthy, metav1.ConditionFalse, talosv1alpha1.ReasonFailed))
+				f.is(talosv1alpha1.ConditionHealthy, metav1.ConditionFalse, talosv1alpha1.ReasonFailed)
 			},
 			fires: []fired{{
 				alert: "TalosClusterUnhealthy", severity: "warning",
