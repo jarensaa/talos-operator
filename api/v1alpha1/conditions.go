@@ -58,6 +58,9 @@ const (
 	// declared: every TalosMachine that is Present is a member, and none that is Removed still is
 	// (docs/scope.md §7.6, §7.7).
 	ConditionMembershipCurrent = "MembershipCurrent"
+	// ConditionEtcdMaintained reports on the upkeep of etcd: whether it is fragmented enough to be
+	// defragmented, and whether it has raised an alarm (docs/scope.md §14.6).
+	ConditionEtcdMaintained = "EtcdMaintained"
 	// ConditionRolloutBlocked reports that a disruptive operation is halted and needs attention.
 	ConditionRolloutBlocked = "RolloutBlocked"
 )
@@ -176,6 +179,11 @@ const (
 	ReasonIdentityMismatch = "IdentityMismatch"
 	// ReasonConfigDoesNotFit: the rendered config names a disk or a link the machine does not have.
 	ReasonConfigDoesNotFit = "ConfigDoesNotFit"
+	// Reasons of EtcdMaintained.
+	ReasonDefragmenting       = "Defragmenting"
+	ReasonFragmented          = "Fragmented"
+	ReasonEtcdAlarm           = "EtcdAlarm"
+	ReasonMaintenanceDisabled = "MaintenanceDisabled"
 	// Reasons of MembershipCurrent.
 	ReasonAdding          = "Adding"
 	ReasonRemoving        = "Removing"

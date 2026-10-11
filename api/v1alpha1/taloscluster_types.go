@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -45,6 +46,7 @@ const (
 // and apply it (docs/scope.md §7.1 stage 4).
 // +kubebuilder:validation:XValidation:rule="!has(self.upgrades) || self.upgrades != 'Enabled' || (has(self.config) && self.config == 'Manage')",message="upgrades can be Enabled only with config: Manage"
 // +kubebuilder:validation:XValidation:rule="!has(self.membership) || self.membership != 'Enabled' || (has(self.config) && self.config == 'Manage')",message="membership can be Enabled only with config: Manage"
+// +kubebuilder:validation:XValidation:rule="!has(self.maintenance) || self.maintenance != 'Enabled' || (has(self.config) && self.config == 'Manage')",message="maintenance can be Enabled only with config: Manage"
 type Management struct {
 	// Config is Observe (read-only) or Manage (the operator owns the rendered machine config).
 	// +kubebuilder:default=Observe
@@ -60,6 +62,47 @@ type Management struct {
 	// +kubebuilder:default=Disabled
 	// +optional
 	Membership CapabilityState `json:"membership,omitempty"`
+
+	// Maintenance enables the upkeep the operator does by itself: defragmenting etcd, and
+	// disarming the alarm etcd raises when it runs out of space (docs/scope.md §14.6).
+	// +kubebuilder:default=Disabled
+	// +optional
+	Maintenance CapabilityState `json:"maintenance,omitempty"`
+}
+
+// Maintenance tunes the upkeep that spec.management.maintenance enables.
+type Maintenance struct {
+	// Etcd is the upkeep of etcd.
+	// +optional
+	Etcd EtcdMaintenance `json:"etcd,omitempty"`
+}
+
+// EtcdMaintenance says when etcd is defragmented. A member's database file only ever grows;
+// defragmenting gives the space back that deleted and compacted data left in it.
+type EtcdMaintenance struct {
+	// FreePercent is how much of a member's database file must be free space before etcd is
+	// defragmented. Defaults to 50.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=99
+	// +optional
+	FreePercent *int32 `json:"freePercent,omitempty"`
+	// MinimumSize is the size a member's database file must have before it is worth
+	// defragmenting. Defaults to 100Mi.
+	// +optional
+	MinimumSize *resource.Quantity `json:"minimumSize,omitempty"`
+	// Interval is the least time between two defragmentations. Defaults to 24h.
+	// +optional
+	Interval *metav1.Duration `json:"interval,omitempty"`
+}
+
+// Observability is what the cluster is asked to expose for a Prometheus to read.
+type Observability struct {
+	// ControlPlaneMetrics makes etcd, the controller manager and the scheduler serve their
+	// metrics where a Prometheus in the cluster can reach them: on every interface instead of on
+	// localhost only. It is a config change to every control plane, rolled out like any other.
+	// +kubebuilder:default=Disabled
+	// +optional
+	ControlPlaneMetrics CapabilityState `json:"controlPlaneMetrics,omitempty"`
 }
 
 // Versions declares the desired Talos and Kubernetes versions.
@@ -363,6 +406,14 @@ type TalosClusterSpec struct {
 	// Paused stops all mutating actions immediately.
 	// +optional
 	Paused bool `json:"paused,omitempty"`
+
+	// Maintenance tunes the upkeep that management.maintenance enables.
+	// +optional
+	Maintenance Maintenance `json:"maintenance,omitempty"`
+
+	// Observability is what the cluster exposes for a Prometheus to read.
+	// +optional
+	Observability Observability `json:"observability,omitempty"`
 }
 
 // ClusterPhase summarises where the cluster is in its lifecycle. It only moves forward
@@ -390,6 +441,30 @@ type EtcdMember struct {
 	IsLearner bool `json:"isLearner,omitempty"`
 }
 
+// EtcdAlarm is an alarm etcd has raised for one member.
+type EtcdAlarm struct {
+	// MemberID is the etcd member ID in hex.
+	MemberID string `json:"memberID"`
+	// Type is NOSPACE or CORRUPT.
+	Type string `json:"type"`
+}
+
+// Certificate is a certificate the cluster depends on, and when it stops being valid.
+type Certificate struct {
+	// Name says which: operator for the client certificate the operator reaches the Talos API
+	// with, and os, kubernetes and etcd for the cluster's certificate authorities.
+	Name string `json:"name"`
+	// ExpiresAt is the end of the certificate's validity.
+	ExpiresAt metav1.Time `json:"expiresAt"`
+}
+
+// MaintenanceStatus records the upkeep the operator did.
+type MaintenanceStatus struct {
+	// EtcdDefragmentedAt is when etcd was last defragmented by the operator.
+	// +optional
+	EtcdDefragmentedAt *metav1.Time `json:"etcdDefragmentedAt,omitempty"`
+}
+
 // ObservedState is what the operator last observed on the live cluster.
 type ObservedState struct {
 	// TalosVersions counts nodes per running Talos version.
@@ -405,6 +480,12 @@ type ObservedState struct {
 	// +listMapKey=id
 	// +optional
 	EtcdMembers []EtcdMember `json:"etcdMembers,omitempty"`
+
+	// EtcdAlarms are the alarms etcd has raised: NOSPACE when a member's database reached its
+	// quota, which makes etcd refuse writes, and CORRUPT when members disagree about the data.
+	// Empty when there are none; nil when they could not be read.
+	// +optional
+	EtcdAlarms *[]EtcdAlarm `json:"etcdAlarms,omitempty"`
 
 	// ObservedAt is when this observation completed.
 	// +optional
@@ -532,7 +613,7 @@ type VersionsStatus struct {
 }
 
 // OperationType is the kind of disruptive operation holding the cluster lock.
-// +kubebuilder:validation:Enum=ConfigRollout;TalosUpgrade;KubernetesUpgrade;AddMachine;RemoveMachine
+// +kubebuilder:validation:Enum=ConfigRollout;TalosUpgrade;KubernetesUpgrade;AddMachine;RemoveMachine;EtcdDefragment
 type OperationType string
 
 const (
@@ -550,6 +631,9 @@ const (
 	// OperationRemoveMachine takes machines out of the cluster, one at a time: drained, out of
 	// etcd, reset, and their Node deleted (docs/scope.md §7.7).
 	OperationRemoveMachine OperationType = "RemoveMachine"
+	// OperationEtcdDefragment defragments etcd, one member at a time, the leader last
+	// (docs/scope.md §14.6).
+	OperationEtcdDefragment OperationType = "EtcdDefragment"
 )
 
 // Stages at which hooks run (docs/scope.md §6.4).
@@ -667,6 +751,11 @@ type OperationFailure struct {
 	// Hook is the stage of the hook that failed, if a hook did.
 	// +optional
 	Hook string `json:"hook,omitempty"`
+	// Bundle names the Secret that holds what was collected from the machine when the operation
+	// failed: the state of its services, and the last of their logs and of the kernel's. It is
+	// empty until that was tried, and says so when nothing could be collected.
+	// +optional
+	Bundle string `json:"bundle,omitempty"`
 	// Token identifies this failure. The retry, skip-machine and abort annotations must carry it,
 	// so an annotation left behind never acts on a later failure.
 	// +optional
@@ -803,6 +892,15 @@ type TalosClusterStatus struct {
 	// Membership records what a human decided about machines that were to be added or removed.
 	// +optional
 	Membership *MembershipHolds `json:"membership,omitempty"`
+	// Certificates lists the certificates the cluster depends on with the end of their validity:
+	// the operator's own client certificate, and the cluster's certificate authorities.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Certificates []Certificate `json:"certificates,omitempty"`
+	// Maintenance records the upkeep the operator did.
+	// +optional
+	Maintenance *MaintenanceStatus `json:"maintenance,omitempty"`
 
 	// History holds the most recent finished operations, newest first.
 	// +kubebuilder:validation:MaxItems=10

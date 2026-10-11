@@ -272,10 +272,126 @@ spec:
               etcd:
                 description: EtcdState is the machine's observed etcd membership.
                 properties:
+                  dbSize:
+                    description: |-
+                      DBSize is the size of the member's database file in bytes, and DBSizeInUse how much of it
+                      holds data. The difference is what a defragmentation gives back. Zero unless read in the
+                      last pass.
+                    format: int64
+                    type: integer
+                  dbSizeInUse:
+                    format: int64
+                    type: integer
                   isLearner:
+                    type: boolean
+                  leader:
+                    description: Leader is true when the member led etcd when it was
+                      last read.
                     type: boolean
                   memberID:
                     type: string
+                type: object
+              health:
+                description: 'Health is what Talos says about the node: its services,
+                  its clock, its links and volumes.'
+                properties:
+                  diagnostics:
+                    description: Diagnostics are the warnings Talos raises about the
+                      node's own configuration.
+                    items:
+                      description: Diagnostic is a warning Talos raises about a node.
+                      properties:
+                        id:
+                          description: ID names the warning, e.g. address-overlap.
+                          type: string
+                        message:
+                          description: Message is what Talos says about it.
+                          maxLength: 512
+                          type: string
+                      required:
+                      - id
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - id
+                    x-kubernetes-list-type: map
+                  links:
+                    description: Links are the node's physical network links.
+                    items:
+                      description: LinkHealth is the state of one physical network
+                        link.
+                      properties:
+                        bond:
+                          description: Bond names the bond the link is a member of,
+                            if it is one.
+                          type: string
+                        name:
+                          type: string
+                        speedMbps:
+                          description: SpeedMbps is the link's speed in megabits per
+                            second, if it reports one.
+                          format: int64
+                          type: integer
+                        up:
+                          description: Up is whether the link is operational.
+                          type: boolean
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  services:
+                    description: Services are the Talos services of the node.
+                    items:
+                      description: ServiceHealth is the state of one Talos service.
+                      properties:
+                        healthy:
+                          type: boolean
+                        name:
+                          type: string
+                        running:
+                          description: |-
+                            Running is whether the service runs, and Healthy whether its health check passes. A
+                            service without a health check counts as healthy while it runs.
+                          type: boolean
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  timeSynced:
+                    description: |-
+                      TimeSynced is whether the node's clock is synchronised. A clock that drifts breaks etcd
+                      and every certificate check.
+                    type: boolean
+                  volumes:
+                    description: Volumes are Talos's own volumes on the node, such
+                      as STATE and EPHEMERAL.
+                    items:
+                      description: VolumeHealth is the state of one of Talos's volumes.
+                      properties:
+                        error:
+                          description: Error is what Talos says went wrong with it,
+                            if anything.
+                          maxLength: 512
+                          type: string
+                        name:
+                          type: string
+                        phase:
+                          description: Phase is the volume's phase as Talos reports
+                            it; ready is the one that is fine.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                 type: object
               identity:
                 description: ObservedIdentity is the identity read from the live node.
