@@ -120,6 +120,16 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Every commit of the pull request, for the check below.
+          fetch-depth: 0
+
+      # A release is decided from the commits that are merged, not from the pull request's title.
+      - name: Check that every commit says what it is
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: origin/${{ github.base_ref }}
+        run: hack/release/commits.sh "$BASE"
 
       - uses: actions/setup-node@v7
         with:
