@@ -181,7 +181,8 @@ func (k ActionKind) String() string {
 		Wait: "Wait", Advance: "Advance", MarkHealthy: "MarkHealthy", MarkUnhealthy: "MarkUnhealthy", Try: "Try", Rearm: "Rearm",
 		Confirm: "Confirm", Complete: "Complete", Fail: "Fail",
 		Pull: "Pull", Install: "Install", MarkCordoned: "MarkCordoned", Cordon: "Cordon", Evict: "Evict", Reboot: "Reboot",
-		Uncordon: "Uncordon",
+		Uncordon:  "Uncordon",
+		Provision: "Provision", Reset: "Reset", RemoveMember: "RemoveMember", DeleteNode: "DeleteNode", Defrag: "Defrag",
 	}
 
 	return names[k]
