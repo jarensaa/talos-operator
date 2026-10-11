@@ -278,7 +278,7 @@ func proveSpecs(p *Proposal, nodes []LiveNode, parsed map[string]config.Provider
 		poolIdx := slices.IndexFunc(p.Pools, func(pool *talosv1alpha1.TalosMachinePool) bool { return pool.Name == tm.Spec.PoolRef.Name })
 		pool := &p.Pools[poolIdx].Spec
 
-		in, err := RenderInput(&p.Cluster.Spec, pool, &tm.Spec, p.Bundle, InlineDocuments(ConfigSources(&p.Cluster.Spec, pool, &tm.Spec)))
+		in, err := RenderInput(&p.Cluster.Spec, pool, p.Bundle, InlineDocuments(ConfigSources(&p.Cluster.Spec, pool, &tm.Spec)))
 		if err != nil {
 			return fmt.Errorf("%s: %w", n.Hostname, err)
 		}

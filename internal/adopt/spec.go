@@ -22,7 +22,6 @@ package adopt
 import (
 	"errors"
 	"fmt"
-	"net/netip"
 	"net/url"
 	"strings"
 
@@ -108,8 +107,8 @@ func ParseInstallerImage(ref string) (talosv1alpha1.Installer, string, error) {
 
 // RenderInput builds the render input for one machine from its cluster and pool specs. Documents
 // are the resolved config sources in layer order (cluster, pool, machine; see ConfigSources).
-func RenderInput(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.TalosMachinePoolSpec, m *talosv1alpha1.TalosMachineSpec,
-	bundle *secrets.Bundle, documents [][]byte,
+func RenderInput(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.TalosMachinePoolSpec, bundle *secrets.Bundle,
+	documents [][]byte,
 ) (render.Input, error) {
 	var missing []string
 
@@ -161,14 +160,7 @@ func RenderInput(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.Talos
 	}
 
 	// What the spec switches on becomes config of the machine before any layer of the user's.
-	if spec.Observability.ControlPlaneMetrics == talosv1alpha1.CapabilityEnabled && pool.Role == talosv1alpha1.MachineRoleControlPlane {
-		addr, err := netip.ParseAddr(m.Address)
-		if err != nil {
-			return render.Input{}, fmt.Errorf("the machine's address %q is not an IP address", m.Address)
-		}
-
-		in.MetricsAddress = addr
-	}
+	in.ControlPlaneMetrics = spec.Observability.ControlPlaneMetrics == talosv1alpha1.CapabilityEnabled
 
 	return in, nil
 }

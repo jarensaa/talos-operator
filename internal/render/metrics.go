@@ -17,39 +17,23 @@ limitations under the License.
 package render
 
 import (
-	"fmt"
-	"net"
-	"net/netip"
-	"strconv"
-
 	"github.com/siderolabs/talos/pkg/machinery/config"
 )
 
-// EtcdMetricsPort is where etcd serves its metrics in plain HTTP once a control plane is asked
-// to expose them. Talos's own listeners are 2379 and 2380, and 2383 for what needs a client
-// certificate.
-const EtcdMetricsPort = 2381
-
-// metricsPatch is the config that makes a control plane serve the metrics of etcd, the
-// controller manager and the scheduler where a Prometheus in the cluster can reach them
-// (docs/scope.md §14.2). Talos binds the two components to localhost, and serves etcd's metrics
-// only to who holds an etcd client certificate.
-//
-// etcd's are served without authentication, so on the node's own address and no other. The
-// components check who asks, and their probes ask on localhost: they listen everywhere.
+// metricsPatch is the config that makes a control plane serve the metrics of the controller
+// manager and the scheduler where a Prometheus in the cluster can reach them (docs/scope.md
+// §14.2). Talos binds both to localhost. They check who asks, and their probes ask on localhost,
+// so they listen on every interface.
 //
 // The components are configured where the contract has their config: in their own documents
 // from 1.14 on, in the v1alpha1 config before. A config must not have both.
-func metricsPatch(contract *config.VersionContract, node netip.Addr) []byte {
-	url := "http://" + net.JoinHostPort(node.String(), strconv.Itoa(EtcdMetricsPort))
-
+//
+// etcd is not part of it. Its metrics take an argument too, and Talos hands etcd its arguments
+// only when it starts it (internal/app/machined/pkg/system/services/etcd.go:111 in v1.14): a
+// config that names another one changes nothing until etcd is restarted, which no rollout does.
+func metricsPatch(contract *config.VersionContract) []byte {
 	if contract.MultidocKubernetesConfigSupported() {
-		return fmt.Appendf(nil, `cluster:
-  etcd:
-    extraArgs:
-      listen-metrics-urls: %s
----
-apiVersion: v1alpha1
+		return []byte(`apiVersion: v1alpha1
 kind: KubeControllerManagerConfig
 extraArgs:
   bind-address: 0.0.0.0
@@ -58,18 +42,15 @@ apiVersion: v1alpha1
 kind: KubeSchedulerConfig
 extraArgs:
   bind-address: 0.0.0.0
-`, url)
+`)
 	}
 
-	return fmt.Appendf(nil, `cluster:
-  etcd:
-    extraArgs:
-      listen-metrics-urls: %s
+	return []byte(`cluster:
   controllerManager:
     extraArgs:
       bind-address: 0.0.0.0
   scheduler:
     extraArgs:
       bind-address: 0.0.0.0
-`, url)
+`)
 }

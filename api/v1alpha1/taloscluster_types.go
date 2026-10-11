@@ -97,12 +97,13 @@ type EtcdMaintenance struct {
 
 // Observability is what the cluster is asked to expose for a Prometheus to read.
 type Observability struct {
-	// ControlPlaneMetrics makes every control plane serve the metrics of etcd, the controller
-	// manager and the scheduler where a Prometheus in the cluster can reach them. Talos binds the
-	// two components to localhost and serves etcd's metrics only to a client certificate; with
-	// this they listen on every interface, and etcd serves its metrics in plain HTTP on port
-	// 2381 of the machine's address. It is a config change, rolled out like any other, and a
-	// layer of the spec that sets the same arguments wins over it (docs/scope.md §14.2).
+	// ControlPlaneMetrics makes every control plane serve the metrics of the controller manager
+	// and the scheduler where a Prometheus in the cluster can reach them: Talos binds both to
+	// localhost, and with this they listen on every interface. It is a config change, rolled out
+	// like any other, and a layer of the spec that sets the same argument wins over it.
+	//
+	// etcd's metrics are not part of it: etcd takes a changed argument only when it is
+	// restarted, which a rollout does not do (docs/scope.md §14.2).
 	// +kubebuilder:default=Disabled
 	// +optional
 	ControlPlaneMetrics CapabilityState `json:"controlPlaneMetrics,omitempty"`

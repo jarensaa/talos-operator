@@ -17,7 +17,6 @@ limitations under the License.
 package render_test
 
 import (
-	"net/netip"
 	"slices"
 	"testing"
 
@@ -27,39 +26,27 @@ import (
 	"github.com/jarensaa/talos-operator/internal/render"
 )
 
-const (
-	argBind    = "bind-address"
-	argMetrics = "listen-metrics-urls"
-)
+const argBind = "bind-address"
 
-// The metrics of etcd, the controller manager and the scheduler are served where a Prometheus
-// reaches them, in the form of config the contract has: a 1.14 config keeps the components in
-// documents of their own and may not also name them in the v1alpha1 config, an older one has
-// nothing else.
+// The metrics of the controller manager and the scheduler are served where a Prometheus reaches
+// them, in the form of config the contract has: a 1.14 config keeps the components in documents
+// of their own and may not also name them in the v1alpha1 config, an older one has nothing else.
 func TestControlPlaneMetricsAreSwitchedOnInTheFormTheContractHas(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
 		contract *config.VersionContract
-		node     string
-		etcd     string
 	}{
-		{"documents", config.TalosVersion1_14, "10.0.0.11", "http://10.0.0.11:2381"},
-		{"v1alpha1", config.TalosVersion1_13, "10.0.0.11", "http://10.0.0.11:2381"},
-		{"an IPv6 node", config.TalosVersion1_14, "fd00::11", "http://[fd00::11]:2381"},
+		{"documents", config.TalosVersion1_14},
+		{"v1alpha1", config.TalosVersion1_13},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			in := input(t)
 			in.Contract = tt.contract
-			in.MetricsAddress = netip.MustParseAddr(tt.node)
+			in.ControlPlaneMetrics = true
 
 			cfg, err := render.Generate(in)
 			if err != nil {
 				t.Fatal(err)
-			}
-
-			// etcd's metrics need no credentials: they are served on the node's address only.
-			if got := cfg.Cluster().Etcd().ExtraArgs()[argMetrics]; !slices.Equal(got, []string{tt.etcd}) {
-				t.Fatalf("etcd serves its metrics on %v, want %s", got, tt.etcd)
 			}
 
 			if got := cfg.K8sControllerManagerConfig().ExtraArgs()[argBind]; !slices.Equal(got, []string{"0.0.0.0"}) {
@@ -75,6 +62,12 @@ func TestControlPlaneMetricsAreSwitchedOnInTheFormTheContractHas(t *testing.T) {
 				t.Fatal("switching the metrics on lost a component's image")
 			}
 
+			// etcd takes a changed argument only when it is restarted, which no rollout does: a
+			// config that named one would say something the node does not do.
+			if len(cfg.Cluster().Etcd().ExtraArgs()) != 0 {
+				t.Fatalf("etcd was given arguments: %v", cfg.Cluster().Etcd().ExtraArgs())
+			}
+
 			plain := input(t)
 			plain.Contract = tt.contract
 
@@ -86,39 +79,34 @@ func TestControlPlaneMetricsAreSwitchedOnInTheFormTheContractHas(t *testing.T) {
 }
 
 func TestControlPlaneMetricsLeaveTheUsersOwnSettingAlone(t *testing.T) {
-	in := input(t, `cluster:
-  etcd:
-    extraArgs:
-      listen-metrics-urls: http://127.0.0.1:2381
----
-apiVersion: v1alpha1
+	in := input(t, `apiVersion: v1alpha1
 kind: KubeSchedulerConfig
 extraArgs:
   bind-address: 10.0.0.11
 `)
-	in.MetricsAddress = netip.MustParseAddr("10.0.0.11")
+	in.ControlPlaneMetrics = true
 
 	cfg, err := render.Generate(in)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if got := cfg.Cluster().Etcd().ExtraArgs()[argMetrics]; !slices.Equal(got, []string{"http://127.0.0.1:2381"}) {
-		t.Fatalf("the user's layer must win for etcd: %v", got)
-	}
-
 	if got := cfg.K8sSchedulerConfig().ExtraArgs()[argBind]; !slices.Equal(got, []string{"10.0.0.11"}) {
 		t.Fatalf("the user's layer must win for the scheduler: %v", got)
 	}
+
+	if got := cfg.K8sControllerManagerConfig().ExtraArgs()[argBind]; !slices.Equal(got, []string{"0.0.0.0"}) {
+		t.Fatalf("the controller manager binds to %v", got)
+	}
 }
 
-// A worker runs none of the three.
+// A worker runs neither.
 func TestControlPlaneMetricsChangeNothingOnAWorker(t *testing.T) {
 	plain := input(t)
 	plain.Role = machine.TypeWorker
 
 	switched := plain
-	switched.MetricsAddress = netip.MustParseAddr("10.0.0.21")
+	switched.ControlPlaneMetrics = true
 
 	if mustRender(t, switched).Hash != mustRender(t, plain).Hash {
 		t.Fatal("a worker's config must not change")
