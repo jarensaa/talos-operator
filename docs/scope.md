@@ -952,6 +952,7 @@ Task beads under a milestone are cut when the milestone starts, for the same rea
 | **M4c Rollout policy** | Maintenance windows, gates on objects in the cluster, and hook Jobs around an operation and around each node, for every kind of operation (§6.4) | v0.8.0 |
 | **M5 Kubernetes upgrades** | A version change takes the components Talos runs there, one component on one node at a time, every API server first, a minor at a time; refused up front when the nodes' Talos does not run the version or when it would strand a flag or an object (§7.4) | v0.8.0 |
 | **M6 Version awareness** | Status plans the upgrades to what the spec asks for and, where the operator is told to ask upstream, says which Talos and Kubernetes releases exist; an upgrade to an installer or image that does not exist is then refused before a node pulls; a `validate` command checks a repository's manifests before they are merged; an example bot configuration (§7.5) | v0.9.0 |
+| **M10a The operator's state as metrics** | What status says, exported at every scrape by every replica: an operation in flight or halted, what holds a change back, drift, nodes that cannot be read, etcd membership. The chart installs a ServiceMonitor, alerts and a Grafana dashboard where the cluster has the Prometheus Operator's API (§14.2) | v0.10.0 |
 
 ### What every remaining milestone builds on
 
@@ -1001,12 +1002,12 @@ Marking a machine as removed takes it out of the cluster cleanly. A control plan
 
 ### M10 Observability
 
-**M10a: the operator's own state.** Metrics for what the operator already knows: a rollout in flight or halted, drift, nodes it cannot read, etcd and node state. With alerts and a dashboard in the chart. It depends on nothing after M3 and should come before upgrades are trusted on the real cluster: a halted rollout should reach someone.
+**M10a: the operator's own state** is delivered (§14.2): metrics for what the operator already knows, alerts on them, and a dashboard, installed by the chart where there is a Prometheus to read them.
+- **Shown for M10a:** the alert rules are tested by promtool on the series the exporter really exports, a halted rollout among them, each rule broken once to see its test fail; on QEMU the halted rollout is found in the metrics of both replicas, with the labels the alert carries, and is gone from them once it is aborted. The QEMU cluster has no Prometheus, so no alert was seen to fire there, and the dashboard has not been looked at on any cluster.
 
 **M10b: the cluster's own metrics and logs.** Exposing etcd and control-plane metrics, and shipping Talos's logs, are config changes that a user can declare since M3.
 - **To decide:** whether this is an operator feature at all (the earlier plan was a `spec.observability` profile) or documented config that the e2e proves. The second is less to own.
-
-- **Done when:** a halted rollout raises an alert on QEMU; the dashboard shows a real cluster.
+- Also here if wanted: metrics only the Talos API can give and the operator does not read today (time sync, links and bonds, volumes, Talos's own diagnostics), listed in §14.2.
 
 ### M11 Maintenance
 
@@ -1029,9 +1030,8 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 ### Suggested order
 
 1. The real cluster, when its owner decides the API has settled enough to depend on.
-2. M10a: small, independent, and wanted before upgrades touch a real control plane.
-3. M7, then M8.
-4. M10b, M11, and whatever of M9 has earned it.
+2. M7, then M8.
+3. M10b, M11, and whatever of M9 has earned it.
 
 R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
 
@@ -1110,6 +1110,7 @@ Decided 2026-10-08:
 21. **A Kubernetes upgrade applies its own configs, and a larger jump goes through `.0`** (decided 2026-10-10, with M5). `talosctl upgrade-k8s` patches each node's config component by component; an operator that owns the config has to do the same itself, or the two would fight (§3.8). The patch is taken from the node's live config, not from the rendered one, so that the upgrade changes one image and leaves every other difference to the config rollout that owns it. The config rollout in turn leaves the images alone: it applies the rendered config with the images the node has. An earlier cut blocked a rollout whenever an image differed, and so a refused upgrade blocked the removal of the very flag it was refused for. Each patched config is tried and confirmed like any other change, which upstream does not do: a component that does not come up goes back to its previous image without anyone reaching the node. Kubernetes does not skip minors, so a spec that is further away is reached through the first release of each minor in between. The operator knows no newer release of those minors without asking the network, which is M6's business; until then, `.0` is the one version of a minor that is sure to exist.
 22. **The operator may ask upstream what exists, only that, and only when told to** (decided 2026-10-11, with M6). Knowing which releases exist is what turns "the image could not be pulled" on the first node into a refusal before any node, and what lets a hop over several Kubernetes minors use a release with its fixes. The price is that the operator talks to something other than its cluster, and to services that are not this project's. How others do it: Omni lists the releases of Image Factory and scans a registry for Kubernetes tags every fifteen minutes, by default, and filters them with the compiled-in compatibility rules; OpenShift's version operator and the k3s upgrade controller ask an update service or a channel server; kubeadm asks the Kubernetes release site. Each of them asks a service its own project runs. tuppr, the one that like this operator is a third party to Talos, asks nothing: the version is what the resource says, a bot proposes it, and a release that does not exist fails at the pull. So asking is **off by default** (`versionSources.enabled`), and switching it on is the cluster owner's decision to use those services. Where it is on it is kept small: reads only, HTTPS only, a handful of requests every six hours, identified by a User-Agent, never during an operation. What it learns can refuse an upgrade and can choose a release on the way to the version asked for; it can never choose the version. The services asked are Image Factory, the Kubernetes release site and the registries the cluster's nodes pull from anyway. Image Factory's API reference documents the routes used as public; neither it nor the Kubernetes release site publishes terms for its use that were found, `registry.k8s.io` is a volunteer-run service that asks heavy users to mirror, and GitHub's acceptable use policy forbids burdening its servers by automation without naming a limit. Nothing was found that forbids these requests, and nothing that grants them either. The `validate` check asks the same services by default: it runs once for a pull request, beside the bot that proposed the change by asking them too. It is a subcommand of the operator's own binary, so that the image a cluster runs is the image that checks its manifests. **Not kept: a compatibility matrix of this project's own.** The rules (what runs what, which steps are allowed, what a release removed) are machinery's and go-kubernetes's, compiled in, and the removed kubelet flag the e2e uses is found by them. A table of the newest release of each minor, built in and refreshed by a bot, would let an operator that asks nothing go through a better release than `.0`; it is not built.
 23. **Backups are the owner's** (decided 2026-10-11). The earlier plan had the operator take etcd snapshots on a schedule and before every control-plane operation, encrypt them and ship them to object storage. That is a backup product inside an upgrade operator: storage, credentials from outside the cluster, encryption keys that must outlive the cluster, retention, and a restore that has to be rehearsed to be worth anything, which the operator cannot perform on the cluster it runs in. Whoever runs a cluster already answers for backing up what is on it, and has tools for it; a second, partial answer in the operator would be the one nobody tests. So the operator takes no snapshot and no other backup. What it owes the owner is not to cause the loss (§8), and a place to hang their own snapshot before an operation: a `preRollout` hook (§6.4).
+24. **Metrics are the status, read when scraped, and monitoring is installed where there is a Prometheus** (decided 2026-10-11, with M10a). The operator keeps no metric of the cluster's state beside the status it writes: a collector reads the resources at every scrape. Gauges set by the controllers would be the leader's alone, would outlive the resource they describe, and could drift from the status. The price is that nothing is exported that is not in status. The chart cannot ask whether a Prometheus is running, but it can see whether the cluster has the Prometheus Operator's API, and installs its ServiceMonitor, rules and dashboard exactly then (`auto`); a cluster without it gets none of the three, and a value forces either way. A chart finds this out when it is installed or upgraded, so a Prometheus that arrives later is picked up by the next upgrade. Grafana has no API to be told by, so the dashboard goes by the same sign: it is a ConfigMap, which does no harm unread. A Prometheus only reads what its selectors match, which the chart cannot know: `monitoring.labels` is where the owner says it.
 
 ## 13. Prior art summary
 
@@ -1126,7 +1127,7 @@ Decided 2026-10-08:
 
 ## 14. Day-2 operations
 
-> **Not built**, except §14.4 and §14.5. This section is the earlier plan for M6, M10 and M11. §10 says what those milestones have to deliver, and leaves open some of what is decided here (whether cluster metrics are an operator feature, for one).
+> **Not built**, except the operator's own metrics in §14.2, and §14.4 and §14.5. This section is the earlier plan for M6, M10 and M11. §10 says what those milestones have to deliver, and leaves open some of what is decided here (whether cluster metrics are an operator feature, for one).
 
 Beyond R1–R4, a self-managed cluster needs four things:
 - the ability to see what Talos is doing;
@@ -1168,32 +1169,50 @@ spec:
 - Binding to the node IP rather than `0.0.0.0` keeps it off other interfaces. Cilium host policies can restrict access further.
 - The matching kube-prometheus-stack values (`kubeEtcd` port 2381, controller-manager/scheduler endpoints, `kubeProxy` disabled) stay in Flux. The operator docs give the values snippet.
 
-**Operator exporter.** These are metrics only the Talos API can provide, built from state the operator already observes (COSI watches, not polling where possible):
+**The operator's own state (M10a, built).** `internal/exporter` exports what the operator has written into the status of its resources. It is a collector that reads TalosClusters, TalosMachinePools and TalosMachines from the manager's cache when it is scraped, and keeps nothing itself:
+- every replica exports the same, the leader or not, so a rule takes the maximum over them and an alert does not depend on which replica is scraped;
+- a resource that is deleted takes its series with it;
+- no metric can say anything else than the status a person reads, and no node is asked anything for a scrape;
+- a scrape that cannot read everything exports nothing about the resources and counts it (`talos_operator_state_read_errors_total`): half of a state would look like a state.
 
-| Metric family | Source | Why |
-|---------------|--------|-----|
-| `talos_machine_stage`, `talos_machine_ready`, `talos_machine_unmet_conditions` | `MachineStatus` | Top-level node health |
-| `talos_service_healthy{service}` | `Services.v1alpha1.talos.dev` | etcd, kubelet, apid, trustd, containerd, … |
-| `talos_diagnostic{id}` | `Diagnostics.runtime.talos.dev` (`address-overlap`, `kubelet-csr`) | Talos's own misconfiguration warnings |
-| `talos_time_synced`, `talos_time_offset_seconds`, `talos_ntp_spikes` | `TimeStatus`, `AdjtimeStatus`, `NTPStatus` | Clock drift breaks etcd and certificates |
-| `talos_etcd_db_size_bytes`, `…_in_use_bytes`, `…_is_leader`, `…_alarm{type}`, `…_raft_index` | `EtcdStatus`, `EtcdAlarmList` API | Fragmentation, NOSPACE, leader churn |
-| `talos_link_up`, `talos_link_speed_mbits`, `talos_bond_member_up` | `LinkStatus` | **with an LACP bond over two links, a single link failing is silent** |
-| `talos_volume_phase`, `talos_volume_error`, `talos_fs_scrub_last_success` | `VolumeStatus`, `FSScrubStatus` | EPHEMERAL/STATE health |
-| `talos_oom_action_total` | `OOMActions` | Talos userspace OOM handler fired |
-| `talos_info{version,schematic,boot_entry,secure_boot,…}` | `Version`, `ImageFactorySchematic`, `BootedEntry`, `SecurityState` | Inventory; detects silent A/B fallback |
-| `talos_operator_operation{type,phase}`, `…_rollout_blocked`, `…_config_drift`, `…_upgrade_available{component,type}`, `…_spec_path_valid`, `…_client_cert_expiry_seconds` | Operator state | Rollouts, drift and upgrade intelligence |
+Every series of a cluster carries `namespace` and `taloscluster`, and of a machine also `machine`. The label is not called `cluster`, which a Prometheus that watches several clusters uses for itself.
 
-CPU, memory, disk and network counters are **not** duplicated; they are node-exporter's job. The closest prior art is `yuriy-kovalchuk/talos-monitoring` (MIT, ideas only).
+| Metric (`talos_operator_…`) | Says |
+|---|---|
+| `info{version,revision}` | An operator is running. No series means none is scraped. |
+| `cluster_phase{phase}`, `cluster_condition{condition,status,reason}` | The phase, and every condition as it is now. Messages are not exported: they are prose, and can quote a node. |
+| `cluster_observed_timestamp_seconds` | When the last observation finished: how old everything else is. |
+| `cluster_operation_in_progress`, `cluster_operation_halted`, `cluster_approval_pending` | 0 or 1, always there. |
+| `operation_info{type,target}`, `operation_start_timestamp_seconds`, `operation_turns{state}` | The operation that holds the cluster, and how far it is. |
+| `operation_failure_info{type,machine,step,reason,hook}`, `operation_failure_timestamp_seconds` | Where a halted operation waits. There only while it is halted. |
+| `cluster_version_info{component,desired,running}`, `cluster_version_plan_steps` | Versions asked for and run, and the upgrades between them (§7.5). |
+| `cluster_etcd_members{role}`, `machine_etcd_member{role}` | Voters and learners, as last observed; for each control plane, whether it is one. |
+| `machine_info{pool,role,node,talos_version,kubelet_version,schematic}`, `machine_phase{phase}`, `machine_condition{…}` | A machine, what its node runs, and its conditions: `NodeObserved` is whether it can be read. |
+| `machine_ready`, `machine_hold`, `machine_config_change_info{class}` | Ready when last read; on hold; a config change that is pending, by class. |
 
-**Shipped in the Helm chart:**
-- a `ServiceMonitor`;
-- a Grafana dashboard ConfigMap labelled for the kube-prometheus-stack sidecar, with panels for cluster overview, per-node Talos health, etcd, time, links and bonds, rollouts and upgrades;
-- a `PrometheusRule` with these alerts:
-  - `TalosMachineNotReady`, `TalosServiceUnhealthy`, `TalosDiagnosticActive`;
-  - `TalosEtcdAlarm` (critical for CORRUPT), `TalosEtcdFragmented`, `TalosEtcdLeaderChurn`;
-  - `TalosClockUnsynced`, `TalosBondDegraded`, `TalosVolumeError`;
-  - `TalosConfigDrift`, `TalosRolloutBlocked`, `TalosOperatorCredentialsExpiring`;
-  - `TalosUpgradeAvailable` (info).
+Beside them are `talos_operator_rejected_rpcs_total`, the Talos calls the operator's own allowlist refused, and what controller-runtime exports of itself.
+
+**What the chart installs** (`monitoring` in its values): a `ServiceMonitor`, the alerts as a `PrometheusRule`, and a Grafana dashboard as a ConfigMap labelled for Grafana's sidecar. Each is `auto`, `true` or `false`, and `auto` installs it where the cluster has the Prometheus Operator's API, which is how a chart can tell that there is a Prometheus to read it (§12.24).
+
+**Alerts** (`charts/talos-operator/files/alerts.yaml`):
+
+| Alert | Severity | When |
+|---|---|---|
+| `TalosOperatorDown` | critical | No operator has been scraped for 10 minutes. |
+| `TalosOperatorCannotReadState` | warning | The operator cannot read its own resources. |
+| `TalosClusterNotObserved` | warning | The last finished observation is more than 10 minutes old. |
+| `TalosOperationHalted` | critical | An operation failed and waits for a person. |
+| `TalosRolloutBlocked` | warning | A change has waited 30 minutes for anything but a pause or its maintenance window: a closed gate, an approval, a protected change. |
+| `TalosConfigDrift`, `TalosNodeWithoutMachine` | warning | A node does not run what the operator applied and is left so; a node has no TalosMachine. |
+| `TalosVersionsUnreachable` | warning | The spec asks for versions there is no way to. |
+| `TalosAPIUnreachable` | critical | No working connection to the Talos API, or no credentials, for 10 minutes. |
+| `TalosClusterUnhealthy` | warning | Talos's own health check has failed for 15 minutes. |
+| `TalosMachineNotObserved`, `TalosMachineNotReady` | warning | A node cannot be read; a node answers and is not ready. |
+| `TalosControlPlaneNotEtcdVoter` | warning | A control plane is no voting member of etcd. |
+
+A rule that names a series or a label wrongly is silent for good, so the rules are tested on what the exporter exports: `internal/exporter` holds scenarios, each a state of the resources and the alerts it has to raise, and writes from them a test for promtool whose input is the collector's own output (`make alerts`, `make alerts-test`). Every alert is asked about in every scenario, the ones that must stay quiet included, and an alert that no scenario raises fails the unit tests.
+
+**Not built:** metrics that only the Talos API can give and that the operator does not observe today. The earlier plan listed service health, Talos's diagnostics, time sync, links and bonds, volumes, the OOM handler and the size of the etcd database. They would make every scrape, or every observation, ask every node more; they belong to M10b if they are wanted. CPU, memory, disk and network are a node exporter's.
 
 ### 14.3 Logs (optional, needs a log backend)
 

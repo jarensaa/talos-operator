@@ -38,7 +38,7 @@ Dependabot proposes the bumps (`.github/dependabot.yml`): weekly, a few days aft
 - A pull request's checks never run the steps that publish. A bump of an action that only publishing uses is first tried by the next release.
 - **The merge starts no workflow on `main`.** GitHub starts none for what a workflow's own token does. Nothing is lost: the checks ran on the pull request on top of `main` as it was, and the bump is released with the next merge a person makes. Until a cluster depends on a bump being released promptly, that is soon enough; when one does, the merge needs an identity of its own (a GitHub App), which is a credential in a job on pull requests and a decision for the owner.
 
-Not covered, and bumped by hand: the Go toolchain, the tools the `Makefile` pins (golangci-lint, which `lint.yml` names too, controller-gen and kustomize), and the `talosctl`, Talos and Kubernetes versions of the e2e (docs/dev/e2e.md).
+Not covered, and bumped by hand: the Go toolchain, the tools the `Makefile` pins (golangci-lint, which `lint.yml` names too, controller-gen and kustomize), promtool (`hack/tools/promtool.sh`, a version and the checksums of its release archives), and the `talosctl`, Talos and Kubernetes versions of the e2e (docs/dev/e2e.md).
 
 ## Notes
 
