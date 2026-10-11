@@ -1,0 +1,62 @@
+# Lets a pull request from Dependabot merge by itself once every required check has passed.
+#
+# This is the one job that runs on a pull request with a token that may write. It is safe to
+# because it runs nothing from the pull request: no checkout, no build, only a question about the
+# pull request and a request to GitHub to merge it when the checks are green. It runs for pull
+# requests Dependabot opened in this repository and for no others; a pull request from a fork gets
+# a read-only token whatever a workflow asks for. There is still no pull_request_target and no
+# stored secret here.
+#
+# What merges by itself (docs/dev/dependencies.md):
+#   Go modules                      patch releases
+#   GitHub Actions, release tooling patch and minor releases
+# Everything else waits for a person: every major, and a new minor of a Go module, which for
+# machinery is a new Talos to support and for k8s.io a new Kubernetes to build against.
+#
+# A merge made with the workflow's own token starts no workflow on main, so nothing is tested
+# again, released or published by it. The checks ran on the pull request, on top of main as it
+# was; the release comes with the next merge a person makes.
+name: Dependabot merge
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  merge:
+    name: Merge when the checks pass
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'jarensaa/talos-operator'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Fails when a commit of the pull request is not Dependabot's own.
+      - id: bump
+        uses: dependabot/fetch-metadata@v3
+
+      - name: Merge by itself, or wait for a person
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          BRANCH: ${{ github.head_ref }}
+          UPDATE: ${{ steps.bump.outputs.update-type }}
+        run: |
+          # Anything this does not recognise waits for a person, an update without a type included.
+          case "$BRANCH $UPDATE" in
+            "dependabot/go_modules/"*" version-update:semver-patch") ;;
+            "dependabot/github_actions/"*" version-update:semver-patch") ;;
+            "dependabot/github_actions/"*" version-update:semver-minor") ;;
+            "dependabot/npm_and_yarn/"*" version-update:semver-patch") ;;
+            "dependabot/npm_and_yarn/"*" version-update:semver-minor") ;;
+            *)
+              # A pull request Dependabot rebuilt may have been one that merges by itself before.
+              gh pr merge --disable-auto "$PR_URL" || true
+              echo "Waits for a person: ${UPDATE:-an update of no known type} on $BRANCH." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+              ;;
+          esac
+
+          gh pr merge --auto --merge "$PR_URL"
+          echo "Merges once the required checks pass: $UPDATE on $BRANCH." >> "$GITHUB_STEP_SUMMARY"
