@@ -79,7 +79,7 @@ type TalosMachineSpec struct {
 }
 
 // MachinePhase summarises the machine's lifecycle position.
-// +kubebuilder:validation:Enum=Pending;AwaitingIdentity;Provisioning;Joining;Ready;Updating;Draining;Rebooting;Removing;Failed
+// +kubebuilder:validation:Enum=Pending;AwaitingIdentity;Provisioning;Joining;Ready;Updating;Draining;Rebooting;Removing;Removed;Failed
 type MachinePhase string
 
 // ObservedIdentity is the identity read from the live node.
@@ -183,6 +183,15 @@ type TalosMachineStatus struct {
 	Config *ConfigState `json:"config,omitempty"`
 	// +optional
 	Etcd *EtcdState `json:"etcd,omitempty"`
+	// JoinedAt is when the machine was first found to be a member of the cluster: its node
+	// answered with the cluster's credentials and carried the pinned identity. Until then it is
+	// a machine that is to be added, and no rollout or upgrade waits for it. It is never unset.
+	// +optional
+	JoinedAt *metav1.Time `json:"joinedAt,omitempty"`
+	// RemovedAt is when the operator finished taking the machine out of the cluster (docs/scope.md
+	// §7.7). It is unset again when the machine is added once more.
+	// +optional
+	RemovedAt *metav1.Time `json:"removedAt,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -518,7 +518,7 @@ type VersionsStatus struct {
 }
 
 // OperationType is the kind of disruptive operation holding the cluster lock.
-// +kubebuilder:validation:Enum=ConfigRollout;TalosUpgrade;KubernetesUpgrade;AddControlPlane;RemoveMachine;Bootstrap
+// +kubebuilder:validation:Enum=ConfigRollout;TalosUpgrade;KubernetesUpgrade;AddMachine;RemoveMachine
 type OperationType string
 
 const (
@@ -530,6 +530,12 @@ const (
 	// OperationKubernetesUpgrade brings the Kubernetes components Talos runs to another version,
 	// one component on one node at a time (docs/scope.md §7.4).
 	OperationKubernetesUpgrade OperationType = "KubernetesUpgrade"
+	// OperationAddMachine gives machines that wait in maintenance mode their config, one at a
+	// time, and sees each join the cluster (docs/scope.md §7.6).
+	OperationAddMachine OperationType = "AddMachine"
+	// OperationRemoveMachine takes machines out of the cluster, one at a time: drained, out of
+	// etcd, reset, and their Node deleted (docs/scope.md §7.7).
+	OperationRemoveMachine OperationType = "RemoveMachine"
 )
 
 // Stages at which hooks run (docs/scope.md §6.4).
@@ -617,6 +623,14 @@ type OperationStep struct {
 	// Deadline is the step's timeout, e.g. the end of a TRY window.
 	// +optional
 	Deadline *metav1.Time `json:"deadline,omitempty"`
+	// Dead is set when a human confirmed that the machine being removed is gone for good: it is
+	// taken out of etcd and Kubernetes from the outside, and never asked anything again.
+	// +optional
+	Dead bool `json:"dead,omitempty"`
+	// EtcdMember is the etcd member ID, in hex, that a control plane had when its removal began:
+	// what has to be gone from the member list before the removal is done.
+	// +optional
+	EtcdMember string `json:"etcdMember,omitempty"`
 	// Since is when the step started.
 	Since metav1.Time `json:"since"`
 }
