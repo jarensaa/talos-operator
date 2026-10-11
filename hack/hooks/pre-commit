@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Before a commit is made: the checks that take seconds and that CI refuses first. Install with
+# `make hooks`. The hook reports and stops; it never stages anything itself.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+# shellcheck source=hack/hooks/generated.sh
+. hack/hooks/generated.sh
+
+fail() { printf '\npre-commit: %s\n' "$*" >&2; exit 1; }
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -n "$staged" ] || exit 0
+
+# Formatting, of the Go files in this commit.
+go_files=$(grep '\.go$' <<<"$staged" || true)
+if [ -n "$go_files" ]; then
+  unformatted=$(xargs gofmt -l <<<"$go_files")
+  [ -z "$unformatted" ] || fail "not formatted; run 'make fmt' and stage the result:"$'\n'"$unformatted"
+fi
+
+# Modules and generated files, when the commit touches what they are generated from.
+if grep -qE '\.go$|^go\.(mod|sum)$|^config/|^charts/' <<<"$staged"; then
+  regenerate
+  stale=$(git diff --name-only -- "${generated_paths[@]}")
+  [ -z "$stale" ] || fail "these are not what the tree generates, or are not staged; stage them:"$'\n'"$stale"
+fi

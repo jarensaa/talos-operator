@@ -78,6 +78,14 @@ test: tidy manifests generate fmt vet test-unit ## Tidy, regenerate, format, vet
 committed: tidy manifests generate fmt ## Check that modules, generated code and formatting are committed.
 	git diff --exit-code
 
+.PHONY: hooks
+hooks: ## Install the git hooks: `make committed`'s checks before a commit, lint and unit tests before a push.
+	hack/hooks/install.sh
+
+.PHONY: hooks-remove
+hooks-remove: ## Remove the git hooks again.
+	hack/hooks/install.sh remove
+
 # CI runs test-unit directly: it checks modules, generated code and formatting with `make committed`,
 # and golangci-lint already runs vet.
 .PHONY: test-unit

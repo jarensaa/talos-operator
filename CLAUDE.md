@@ -123,6 +123,8 @@ Go 1.26.5 (required by machinery v1.14; `GOTOOLCHAIN=auto` fetches it). Builds n
 make build            # manager binary
 make test             # tidy, regenerate, fmt, vet, then unit + envtest
 make committed        # what CI checks first: go.mod tidy, generated files and formatting committed
+make hooks            # git hooks (hack/hooks): that check before a commit; lint, chart and the pure
+                      # packages' tests before a push. Install them in every checkout you commit from.
 make test-unit        # unit + envtest only (what CI runs)
 make lint             # golangci-lint, including e2e-tagged code
 make manifests        # CRDs + RBAC; also syncs them and config/admission into charts/talos-operator
