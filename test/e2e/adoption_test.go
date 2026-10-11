@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -39,6 +40,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -226,6 +228,40 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tc), tc)).To(Succeed())
 
 		return len(tc.Status.History)
+	}
+
+	// lastEnded is the operation that ended last, or nothing. The history keeps only the most
+	// recent ones, so its length does not say whether another has ended.
+	lastEnded := func(ctx context.Context) string {
+		GinkgoHelper()
+
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tc), tc)).To(Succeed())
+
+		if len(tc.Status.History) == 0 {
+			return ""
+		}
+
+		return tc.Status.History[0].ID
+	}
+
+	// endedSince waits for an operation to end after the one named, and returns its record. One
+	// that halts instead ends the wait.
+	endedSince := func(ctx context.Context, previous, what string, timeout time.Duration) talosv1alpha1.OperationRecord {
+		GinkgoHelper()
+
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			halted(tc.Status.Operation, what)
+			g.Expect(tc.Status.Operation).To(BeNil(), "still in flight: %+v", tc.Status.Operation)
+			g.Expect(tc.Status.History).NotTo(BeEmpty())
+			g.Expect(tc.Status.History[0].ID).NotTo(Equal(previous), "the %s has not run", what)
+		}).WithContext(ctx).WithTimeout(timeout).WithPolling(5 * time.Second).Should(Succeed())
+
+		return tc.Status.History[0]
+	}
+
+	isControlPlane := func(tm *talosv1alpha1.TalosMachine) bool {
+		return tm.Spec.PoolRef.Name == pools[talosv1alpha1.MachineRoleControlPlane].Name
 	}
 
 	with := func(config []talosv1alpha1.ConfigSource, documents string) []talosv1alpha1.ConfigSource {
@@ -439,6 +475,96 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(snapshot(ctx, harness, nodes)).To(Equal(untouched))
 		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(15*time.Minute))
+
+	// What only the Talos API says about a node (docs/scope.md §14.2), read from real nodes: the
+	// alerts on it assume that a node in order has every service running and healthy, its clock
+	// synchronised and its volumes ready, and this is where that is seen to be so.
+	It("reports what Talos says about every node, and how long the cluster's certificates last", func(ctx context.Context) {
+		Eventually(func(g Gomega) {
+			leaders := 0
+
+			for _, tm := range machines {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tm), tm)).To(Succeed())
+
+				health := tm.Status.Health
+				g.Expect(health).NotTo(BeNil(), tm.Name)
+				g.Expect(health.Services).NotTo(BeEmpty(), tm.Name)
+
+				for _, service := range health.Services {
+					g.Expect(service.Running && service.Healthy).To(BeTrue(), "%s: service %s", tm.Name, service.Name)
+				}
+
+				g.Expect(health.TimeSynced).To(HaveValue(BeTrue()), tm.Name)
+				g.Expect(health.Links).To(ContainElement(HaveField("Up", BeTrue())), tm.Name)
+
+				for _, volume := range []string{"STATE", "EPHEMERAL"} {
+					g.Expect(health.Volumes).To(ContainElement(And(HaveField("Name", volume), HaveField("Phase", talos.VolumeReady))),
+						"%s: volume %s", tm.Name, volume)
+				}
+
+				if !isControlPlane(tm) {
+					g.Expect(tm.Status.Etcd).To(BeNil(), tm.Name)
+
+					continue
+				}
+
+				g.Expect(tm.Status.Etcd).NotTo(BeNil(), tm.Name)
+				g.Expect(tm.Status.Etcd.DBSize).To(BeNumerically(">", 0), tm.Name)
+				g.Expect(tm.Status.Etcd.DBSizeInUse).To(And(BeNumerically(">", 0), BeNumerically("<=", tm.Status.Etcd.DBSize)), tm.Name)
+
+				if tm.Status.Etcd.Leader {
+					leaders++
+				}
+			}
+
+			g.Expect(leaders).To(Equal(1), "exactly one control plane leads etcd")
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+		By("reading the validity of the operator's certificate and of the cluster's authorities")
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+
+			validity := map[string]time.Duration{}
+
+			for _, cert := range tc.Status.Certificates {
+				g.Expect(cert.ExpiresAt.After(time.Now())).To(BeTrue(), cert.Name)
+				validity[cert.Name] = cert.ExpiresAt.Sub(cert.IssuedAt.Time)
+			}
+
+			g.Expect(validity).To(HaveLen(5))
+
+			// Talos issues the operator's certificate for hours, and an authority for years: one
+			// alert covers both by what is left of each (charts/talos-operator/files/alerts.yaml).
+			g.Expect(validity["operator"]).To(And(BeNumerically(">", 0), BeNumerically("<=", 24*time.Hour)))
+
+			for _, authority := range []string{"os", "kubernetes", "kubernetes-aggregator", "etcd"} {
+				g.Expect(validity[authority]).To(BeNumerically(">", 365*24*time.Hour), authority)
+			}
+
+			g.Expect(meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionEtcdMaintained)).NotTo(BeNil())
+		}).WithContext(ctx).WithTimeout(2 * time.Minute).Should(Succeed())
+
+		By("finding it in the metrics of every replica")
+		Eventually(func(g Gomega) {
+			for _, tm := range machines {
+				g.Expect(operatorGauge(ctx, g, "talos_operator_machine_service_healthy", "taloscluster", tc.Name, "machine", tm.Name,
+					"service", "kubelet")).To(Equal([]float64{1, 1}), tm.Name)
+				g.Expect(operatorGauge(ctx, g, "talos_operator_machine_time_synced", "taloscluster", tc.Name, "machine", tm.Name)).
+					To(Equal([]float64{1, 1}), tm.Name)
+				g.Expect(operatorGauge(ctx, g, "talos_operator_machine_volume_ready", "machine", tm.Name, "volume", "STATE",
+					"phase", talos.VolumeReady)).To(Equal([]float64{1, 1}), tm.Name)
+
+				if isControlPlane(tm) {
+					g.Expect(operatorGauge(ctx, g, "talos_operator_machine_etcd_db_size_bytes", "machine", tm.Name)).
+						To(HaveExactElements(BeNumerically(">", 0), BeNumerically(">", 0)), tm.Name)
+				}
+			}
+
+			g.Expect(operatorGauge(ctx, g, "talos_operator_cluster_certificate_expiry_timestamp_seconds", "taloscluster", tc.Name,
+				"certificate", "operator")).To(HaveExactElements(
+				BeNumerically(">", float64(time.Now().Unix())), BeNumerically(">", float64(time.Now().Unix()))))
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+	}, NodeTimeout(10*time.Minute))
 
 	// A Talos upgrade (docs/scope.md §7.3): every node gets the new system installed, is drained
 	// and rebooted, and comes back on it, one at a time. The operator runs on these very nodes, one
@@ -1060,6 +1186,27 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(k8sClient.List(ctx, &labelled, client.MatchingLabels{rolloutLabel: "never"})).To(Succeed())
 		Expect(labelled.Items).To(BeEmpty(), "no control plane was touched")
 
+		// The worker answers again once Talos took the config back, and is asked what it has to
+		// say about the time it was cut off (docs/scope.md §14.6).
+		By("finding what the worker said when the rollout halted")
+		Eventually(func(g Gomega) {
+			refresh(ctx, g)
+			g.Expect(tc.Status.Operation).NotTo(BeNil())
+			g.Expect(tc.Status.Operation.Failure.Bundle).To(Equal(tc.Name+"-support-bundle"), "no bundle yet")
+		}).WithContext(ctx).WithTimeout(7 * time.Minute).WithPolling(10 * time.Second).Should(Succeed())
+
+		bundle := &corev1.Secret{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: tc.Namespace, Name: tc.Name + "-support-bundle"}, bundle)).To(Succeed())
+		Expect(metav1.IsControlledBy(bundle, tc)).To(BeTrue(), "the bundle goes when the TalosCluster does")
+
+		// Only what is there is looked at, never what it says: a log is not for a public CI log.
+		for _, key := range []string{"failure.txt", "services.txt", "machined.log.gz", "kubelet.log.gz", "dmesg.log.gz"} {
+			Expect(len(bundle.Data[key])).To(BeNumerically(">", 0), "the bundle has no %s", key)
+		}
+
+		_, hasEtcd := bundle.Data["etcd.log.gz"]
+		Expect(hasEtcd).To(BeFalse(), "a worker has no etcd to ask")
+
 		By("aborting, and taking the change back")
 		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
 			if tc.Annotations == nil {
@@ -1437,6 +1584,129 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}).WithContext(ctx).WithTimeout(5 * time.Minute).Should(Succeed())
 		Expect(rejectedRPCs(ctx)).To(BeZero())
 	}, NodeTimeout(150*time.Minute))
+
+	// The switch of spec.observability (docs/scope.md §14.2), on real control planes: Talos binds
+	// the controller manager and the scheduler to localhost, and a Prometheus is not there.
+	It("makes the controller manager and the scheduler answer from outside their node, once asked to", func(ctx context.Context) {
+		controlPlanes, workers := addrsOf("E2E_CONTROLPLANES"), addrsOf("E2E_WORKERS")
+		before := snapshot(ctx, harness, nodes)
+		previous := lastEnded(ctx)
+
+		// The secure ports of the two components. Without a token they refuse to say anything,
+		// which is an answer; behind localhost nobody answers at all.
+		components := map[string]uint16{"kube-controller-manager": 10257, "kube-scheduler": 10259}
+
+		By("finding that nobody answers before")
+		for _, cp := range controlPlanes {
+			for name, port := range components {
+				_, err := answers(ctx, "https://"+netip.AddrPortFrom(cp, port).String()+"/metrics")
+				Expect(err).To(HaveOccurred(), "%s on %s must not be reachable from outside yet", name, cp)
+			}
+		}
+
+		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
+			tc.Spec.Observability.ControlPlaneMetrics = talosv1alpha1.CapabilityEnabled
+		})
+
+		record := endedSince(ctx, previous, "rollout of the metrics switch", time.Duration(len(controlPlanes))*10*time.Minute)
+		Expect(record.Type).To(Equal(talosv1alpha1.OperationConfigRollout))
+		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		Expect(record.Completed).To(HaveLen(len(controlPlanes)), "the control planes, and nobody else")
+		inSync(ctx, 2*time.Minute)
+
+		By("asking both components on every control plane, from outside the node")
+		Eventually(func(g Gomega) {
+			for _, cp := range controlPlanes {
+				for name, port := range components {
+					status, err := answers(ctx, "https://"+netip.AddrPortFrom(cp, port).String()+"/metrics")
+					g.Expect(err).NotTo(HaveOccurred(), "%s on %s", name, cp)
+					g.Expect(status).To(BeElementOf(http.StatusUnauthorized, http.StatusForbidden), "%s on %s", name, cp)
+				}
+			}
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+		By("checking that nothing rebooted and no worker changed")
+		after := snapshot(ctx, harness, nodes)
+
+		for _, n := range nodes {
+			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
+
+			if slices.Contains(workers, n) {
+				Expect(after[n].ConfigHash).To(Equal(before[n].ConfigHash), "%s is a worker and must not change", n)
+			} else {
+				Expect(after[n].ConfigHash).NotTo(Equal(before[n].ConfigHash), "%s must run the new config", n)
+			}
+		}
+
+		Expect(rejectedRPCs(ctx)).To(BeZero())
+	}, NodeTimeout(45*time.Minute))
+
+	// The upkeep of etcd (docs/scope.md §14.6). A database on a cluster this young is small and
+	// not half empty, so the spec asks for it at a threshold every database is over: what is
+	// shown is the operation, on real members, not the arithmetic that starts it.
+	It("defragments etcd, one member at a time and the leader last", func(ctx context.Context) {
+		before := snapshot(ctx, harness, nodes)
+		previous := lastEnded(ctx)
+
+		var (
+			members []string
+			leader  string
+		)
+
+		Eventually(func(g Gomega) {
+			members, leader = nil, ""
+
+			for _, tm := range machines {
+				if !isControlPlane(tm) {
+					continue
+				}
+
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tm), tm)).To(Succeed())
+				g.Expect(tm.Status.Etcd).NotTo(BeNil(), tm.Name)
+
+				members = append(members, tm.Name)
+
+				if tm.Status.Etcd.Leader {
+					g.Expect(leader).To(BeEmpty(), "two control planes say they lead etcd")
+
+					leader = tm.Name
+				}
+			}
+
+			g.Expect(leader).NotTo(BeEmpty(), "no control plane is known to lead etcd")
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+
+		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
+			tc.Spec.Maintenance.Etcd = talosv1alpha1.EtcdMaintenance{FreePercent: new(int32(1)), MinimumSize: new(resource.MustParse("1"))}
+			tc.Spec.Management.Maintenance = talosv1alpha1.CapabilityEnabled
+		})
+
+		record := endedSince(ctx, previous, "defragmentation", time.Duration(len(members))*8*time.Minute)
+		Expect(record.Type).To(Equal(talosv1alpha1.OperationEtcdDefragment))
+		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		Expect(record.Completed).To(ConsistOf(members))
+		Expect(record.Completed[len(record.Completed)-1]).To(Equal(leader), "the member that led etcd goes last")
+
+		refresh(ctx, Default)
+		Expect(tc.Status.Maintenance).NotTo(BeNil())
+		Expect(tc.Status.Maintenance.EtcdDefragmentedAt).NotTo(BeNil())
+
+		By("leaving it alone again: nothing rebooted, no config changed, and it is not started again")
+		updateCluster(ctx, func(tc *talosv1alpha1.TalosCluster) {
+			tc.Spec.Management.Maintenance = talosv1alpha1.CapabilityDisabled
+			tc.Spec.Maintenance = talosv1alpha1.Maintenance{}
+		})
+		inSync(ctx, 2*time.Minute)
+
+		Expect(snapshot(ctx, harness, nodes)).To(Equal(before))
+		Expect(lastEnded(ctx)).To(Equal(record.ID))
+		Expect(rejectedRPCs(ctx)).To(BeZero())
+
+		Eventually(func(g Gomega) {
+			g.Expect(operatorGauge(ctx, g, "talos_operator_cluster_etcd_defragmented_timestamp_seconds", "taloscluster", tc.Name)).
+				To(HaveExactElements(BeNumerically(">", 0), BeNumerically(">", 0)))
+		}).WithContext(ctx).WithTimeout(3 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
+	}, NodeTimeout(45*time.Minute))
 
 	// Adding and removing machines (docs/scope.md §7.6, §7.7), on the machine the harness left in
 	// maintenance mode. The specs hand that one machine on to each other: added as a worker, taken

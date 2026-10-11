@@ -352,6 +352,30 @@ func scrape(ctx context.Context, url, token string) (map[string]*dto.MetricFamil
 	return parser.TextToMetricFamilies(resp.Body)
 }
 
+// answers asks a URL on a node from where the suite runs, outside the cluster's nodes, and
+// returns the HTTP status of whatever answers: an error is nobody accepting the connection.
+// Nothing is sent but the request, so the component's own certificate is taken as it is.
+func answers(ctx context.Context, url string) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+
+	asker := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec // see above
+
+	resp, err := asker.Do(req)
+	if err != nil {
+		return 0, err
+	}
+
+	defer resp.Body.Close() //nolint:errcheck // a response nobody reads
+
+	return resp.StatusCode, nil
+}
+
 // createCredentialsSecret stores the e2e cluster's admin talosconfig as the operator expects it.
 func createCredentialsSecret(ctx context.Context, name string) *corev1.Secret {
 	data, err := os.ReadFile(talosconfigPath)

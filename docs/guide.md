@@ -109,6 +109,19 @@ kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github
 
 After an abort the same change isn't started again. Change the spec, or revert it, and the operator rolls out whatever it renders then.
 
+**What the node said.** When an operation halts at a machine, the operator asks that machine for the state of its Talos services and the end of their logs and of the kernel's, and keeps them in a Secret. `status.operation.failure.bundle` names it:
+
+```bash
+kubectl -n talos-operator get secret my-cluster-support-bundle -o jsonpath='{.data.kubelet\.log\.gz}' | base64 -d | gunzip
+```
+
+It holds `failure.txt` (what failed, and what could not be read), `services.txt`, `dmesg.log.gz`, and a log each of `machined`, `apid`, `kubelet` and `cri`, and of `etcd` on a control plane. Each log is its last 500 lines. A few things to know:
+
+- There is one bundle per cluster. The next failure overwrites it, and it goes when the TalosCluster does.
+- A node that does not answer has nothing to say. The operator tries for five minutes after the failure, and `bundle` then says why there is none (`not collected: ...`).
+- It is a Secret because a log can quote what a config holds. The operator never prints it.
+- A Secret of that name that the operator did not write is left alone, and `bundle` says so.
+
 ### Changes the operator won't make, or asks about first
 
 | `RolloutBlocked` reason | Means |
@@ -481,7 +494,9 @@ The token is in `status.operation.failure`. The operator then takes the machine'
 
 ## Monitoring
 
-The operator exports what it knows as metrics, and the chart brings alerts on them and a Grafana dashboard. An operation that has failed and waits for you is the reason to set this up: without it, a halted rollout is only visible to someone who looks at the TalosCluster.
+The operator exports what it knows as metrics, and the chart brings alerts on them and two Grafana dashboards. An operation that has failed and waits for you is the reason to set this up: without it, a halted rollout is only visible to someone who looks at the TalosCluster.
+
+It also exports what Talos says about each node: its services, the warnings Talos raises about its configuration, whether its clock is synchronised, its links and bonds, its volumes, and the size of each etcd database. Talos has no metrics endpoint for any of that, so without the operator it is only there for someone who asks with `talosctl`.
 
 ### What is installed, and when
 
@@ -491,7 +506,7 @@ The chart installs three things, under `monitoring` in its values:
 |---|---|
 | `serviceMonitor` | A `ServiceMonitor` that has your Prometheus scrape every replica. |
 | `alerts` | The alerts below, as a `PrometheusRule`. |
-| `dashboard` | A dashboard, as a ConfigMap with the label Grafana's sidecar loads (`grafana_dashboard: "1"`). |
+| `dashboard` | Two dashboards, as a ConfigMap with the label Grafana's sidecar loads (`grafana_dashboard: "1"`): **Talos operator**, what the operator does, and **Talos nodes**, what Talos says about the nodes. |
 
 Each is `auto` unless you say `true` or `false`. `auto` installs it if the cluster has the Prometheus Operator's API (`monitoring.coreos.com/v1`), which kube-prometheus-stack brings, and leaves it out if not. So a cluster without a Prometheus gets none of it, and nothing fails.
 
@@ -506,7 +521,7 @@ Three things to know:
   ```
 
 - **The chart looks when it is installed or upgraded.** If the Prometheus Operator arrives after the operator, the next upgrade of the chart picks it up; or set the three to `true`. Rendering the chart outside a cluster (`helm template`) does not see the API unless you pass `--api-versions monitoring.coreos.com/v1/ServiceMonitor`.
-- **Grafana cannot be detected**, so the dashboard goes by the same sign as the rest. A Grafana that does not run the sidecar needs the dashboard imported by hand: it is `files/dashboard.json` in the chart.
+- **Grafana cannot be detected**, so the dashboards go by the same sign as the rest. A Grafana that does not run the sidecar needs them imported by hand: they are `files/dashboard.json` and `files/dashboard-nodes.json` in the chart.
 
 The metrics endpoint is HTTPS and asks the Kubernetes API whether the scraper may read `/metrics`. kube-prometheus-stack's Prometheus may. For another scraper, bind its ServiceAccount to the ClusterRole the chart creates for that: `talos-operator-metrics-reader`, for a release named `talos-operator`.
 
@@ -527,8 +542,19 @@ The metrics endpoint is HTTPS and asks the Kubernetes API whether the scraper ma
 | `TalosMachineNotObserved` | warning | The operator has not been able to read a node for 10 minutes. |
 | `TalosMachineNotReady` | warning | A node answers and has not been ready for 15 minutes. |
 | `TalosControlPlaneNotEtcdVoter` | warning | A control plane has not been a voting member of etcd for 15 minutes. |
+| `TalosEtcdDatabaseLarge` | critical | An etcd database is over 1.6 GiB, four fifths of the 2 GiB etcd allows unless you told it otherwise. At the quota etcd refuses every write ([Defragmenting etcd](#defragmenting-etcd)). |
+| `TalosCertificateExpired` | critical | A certificate the cluster depends on is past its end. |
+| `TalosCertificateExpiring` | warning | Less than a tenth of a certificate's validity is left ([Certificates](#certificates)). |
+| `TalosEtcdFragmented` | warning | An etcd database has been due for defragmenting for an hour and the operator has not done it: it is not allowed to, or a gate is closed. |
+| `TalosServiceUnhealthy` | warning | A Talos service of a node has not been running, or has failed its health check, for 15 minutes. |
+| `TalosNodeDiagnostic` | warning | Talos has raised a warning about a node's configuration for 15 minutes, such as two links with overlapping addresses. |
+| `TalosNodeClockNotSynced` | warning | A node's clock has not been synchronised for 10 minutes. |
+| `TalosBondMemberDown` | warning | A link that is a member of a bond has been down for 5 minutes. |
+| `TalosVolumeNotReady` | warning | One of Talos's volumes on a node, such as `STATE` or `EPHEMERAL`, has not been ready for 15 minutes. |
 
-Waiting as you told it to raises nothing: a paused cluster, or a change outside its maintenance window.
+Waiting as you told it to raises nothing: a paused cluster, a change outside its maintenance window, an etcd that waits for its interval.
+
+The alerts about a node are about nodes that answer. A node that cannot be read exports nothing of what Talos said about it before, and raises `TalosMachineNotObserved` instead. A link that is down and in no bond raises nothing either: it may be a port nothing is plugged into. The dashboard shows it.
 
 Every alert names the cluster in the labels `namespace` and `taloscluster`, and where it is about one, the `machine`. Its description says where in the TalosCluster's status to read on.
 
@@ -552,8 +578,111 @@ max by (taloscluster) (talos_operator_cluster_operation_halted)
 | `cluster_etcd_members`, `machine_etcd_member` | Voters and learners; for each control plane, whether it is one. |
 | `machine_info`, `machine_phase`, `machine_condition` | Each machine, what its node runs, and its conditions. |
 | `machine_ready`, `machine_hold`, `machine_config_change_info` | Whether a node was ready when last read; whether it is on hold; a config change that is pending. |
+| `machine_service_healthy`, `machine_diagnostic_info`, `machine_time_synced` | For a node that answers: each Talos service, each warning Talos raises, the clock. |
+| `machine_link_up`, `machine_link_speed_mbps`, `machine_volume_ready` | Each physical link, with the bond it is in and its speed; each of Talos's volumes, with its phase. |
+| `machine_etcd_leader`, `machine_etcd_db_size_bytes`, `machine_etcd_db_size_in_use_bytes` | For a control plane: whether its member leads etcd, the size of its database file, and how much of it holds data. |
+| `cluster_certificate_issued_timestamp_seconds`, `cluster_certificate_expiry_timestamp_seconds` | The validity of each certificate in `status.certificates`. |
+| `cluster_etcd_defragmented_timestamp_seconds` | When the operator last began to defragment etcd. |
+
+The sizes of the etcd databases are coarse on purpose: the number follows the file once that has moved by a twentieth of its size. A database changes with every write to the cluster, and the operator writes nothing to a cluster that is at rest.
 
 What the operator does not observe, it does not export: CPU, memory and disks are a node exporter's, and the cluster's own etcd and control-plane metrics are Kubernetes's.
+
+### The controller manager and the scheduler
+
+Talos binds `kube-controller-manager` and `kube-scheduler` to localhost, so a Prometheus in the cluster finds nothing to scrape, and kube-prometheus-stack shows both as down. One field of the TalosCluster makes them listen on every interface:
+
+```yaml
+spec:
+  observability:
+    controlPlaneMetrics: Enabled
+```
+
+It is a config change to every control plane, rolled out like any other, one control plane at a time. Both components still ask who is scraping. If one of your own config layers sets `bind-address` for either, yours wins.
+
+**etcd is not part of it.** etcd serves its metrics only to a client certificate, and making it serve them in plain HTTP takes an argument (`cluster.etcd.extraArgs.listen-metrics-urls`). You can declare that in a config layer, but Talos hands etcd its arguments only when it starts it: the operator applies the config and reports it in sync, and etcd goes on as it was until its node next reboots. The operator does not restart etcd for it yet.
+
+### Talos's logs
+
+The logs of Talos's own services (etcd, the kubelet, `apid`) and of the kernel are not pod logs, and a log collector in the cluster does not see them. Talos can send them to one. That is config you declare, and the operator rolls it out like any other; it has no switch for it, because it needs a collector that listens on every node, which is yours to run:
+
+```yaml
+# A layer of the TalosCluster's config: every node sends its service logs and its kernel log
+# to a collector that listens on the node itself.
+machine:
+  logging:
+    destinations:
+      - endpoint: udp://127.0.0.1:6051
+        format: json_lines
+---
+apiVersion: v1alpha1
+kind: KmsgLogConfig
+name: collector
+url: udp://127.0.0.1:6050
+```
+
+Without a collector, the end of the logs of a node at which an operation failed is in the [support bundle](#when-a-node-doesnt-come-out-healthy).
+
+## Upkeep
+
+### Defragmenting etcd
+
+An etcd database file only grows. What is deleted and compacted leaves free space inside it, and etcd counts the whole file against its quota: 2 GiB unless you told it otherwise. At the quota etcd refuses every write, and the Kubernetes API with it. Defragmenting gives the free space back.
+
+```yaml
+spec:
+  management:
+    config: Manage
+    maintenance: Enabled
+```
+
+With that, the operator defragments etcd when a member's database is at least 100 MiB and half of it is free space. It is an operation like a rollout, and holds the cluster like one:
+
+- every member is defragmented, one at a time: the followers first, and the one that leads etcd last, after it gave the lead away;
+- a member is only defragmented while the whole cluster is healthy, and the next one only after the cluster was seen healthy again for the soak. A member answers nobody while it is defragmented;
+- no member begins while the cluster is paused, outside a maintenance window, or while a gate is closed. Your hooks run around it;
+- it is not started again within a day of the last one.
+
+On a cluster with fewer than three control planes, etcd cannot agree on anything while one member is defragmented, so the Kubernetes API stalls for as long as that takes: a moment for a small database.
+
+The three numbers are yours to change:
+
+```yaml
+spec:
+  maintenance:
+    etcd:
+      freePercent: 50     # how much of the file must be free space
+      minimumSize: 100Mi  # how big the file must be to be worth it
+      interval: 24h       # the least time between two defragmentations
+```
+
+The condition `EtcdMaintained` says where things stand, and `status.maintenance.etcdDefragmentedAt` when it last happened. With `maintenance: Disabled`, which is the default, the operator only says that a database is fragmented.
+
+**What the operator does not do** is deal with an alarm of etcd. When etcd raises `NOSPACE` it refuses writes, and an operator that lives in the cluster can then write nothing down: no status, no event, no step of an operation. So what it does is defragment before that, and warn while there is still room (`TalosEtcdDatabaseLarge`). If etcd does get there, the way out is yours: `talosctl etcd defrag` on each control plane, then `talosctl etcd alarm disarm`.
+
+### Certificates
+
+`status.certificates` lists the certificates the cluster depends on, with the start and the end of their validity:
+
+- `operator`, the client certificate the operator reaches the Talos API with. Talos issues it for six hours and renews it; one you supplied yourself in a Secret lasts as long as you made it;
+- `os`, `kubernetes`, `kubernetes-aggregator` and `etcd`, the cluster's certificate authorities, which last ten years.
+
+The alert goes by what is left of each: less than a tenth is a certificate nobody renewed, or an authority with a year to go. Replacing an authority is a rotation of the cluster's PKI, which the operator does not do; `talosctl` does.
+
+The operator does not keep credentials for people. A talosconfig or a kubeconfig for an administrator is made with `talosctl`, by whoever holds the cluster's secrets.
+
+### A hardware watchdog
+
+A node whose kernel hangs is not rebooted by anything in the cluster. On bare metal, a watchdog timer does that, and it is one document in a config layer:
+
+```yaml
+apiVersion: v1alpha1
+kind: WatchdogTimerConfig
+device: /dev/watchdog0
+timeout: 5m
+```
+
+It covers a hang after boot. It does not cover a config that cuts a node off the network, which is what trying a config first is for.
 
 ## Backing out
 

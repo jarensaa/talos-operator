@@ -186,12 +186,13 @@ metadata:
   name: my-cluster
 spec:
   # Management is enabled per capability, so trust grows gradually (§7.1 stage 4).
-  # config: Manage is refused at admission unless status says ConfigProven=True (§5.2); upgrades and
-  # membership need config: Manage.
+  # config: Manage is refused at admission unless status says ConfigProven=True (§5.2); upgrades,
+  # membership and maintenance need config: Manage.
   management:
     config: Observe                # Observe | Manage
     upgrades: Disabled             # Disabled | Enabled   (Talos + Kubernetes rollouts)
     membership: Disabled           # Disabled | Enabled   (add / remove / replace machines)
+    maintenance: Disabled          # Disabled | Enabled   (defragmenting etcd, §14.6)
   credentials: { source: TalosServiceAccount }       # default: Talos issues the operator's certificate (§9)
   secretsRef: { name: my-cluster-talos-secrets }    # secrets bundle; written by the operator during adoption if absent
 
@@ -242,9 +243,14 @@ spec:
 
   paused: false                       # stops all mutating actions immediately
 
+  maintenance:                        # when the upkeep that management.maintenance enables is due (§14.6)
+    etcd: { freePercent: 50, minimumSize: 100Mi, interval: 24h }
+  observability:
+    controlPlaneMetrics: Disabled     # Enabled: the controller manager and the scheduler listen beyond localhost (§14.2)
+
 status:
   phase: Adopting | Adopted | Managed | Degraded   # only moves forward (§12.14)
-  conditions:                         # ResourcesDerived, ConfigProven, ConfigHandover, ConfigInSync, TalosUpToDate, KubernetesUpToDate, VersionsReachable, Healthy, RolloutBlocked, ...
+  conditions:                         # ResourcesDerived, ConfigProven, ConfigHandover, ConfigInSync, TalosUpToDate, KubernetesUpToDate, VersionsReachable, Healthy, RolloutBlocked, EtcdMaintained, ...
   observed:
     talosVersions: { v1.14.0: 3 }
     kubernetesVersion: 1.37.0
@@ -260,7 +266,7 @@ status:
     provenAt: …
   operation:                          # THE disruption lock; at most one at a time
     id: 3f1c…
-    type: TalosUpgrade                # ConfigRollout | TalosUpgrade | KubernetesUpgrade | AddMachine | RemoveMachine
+    type: TalosUpgrade                # ConfigRollout | TalosUpgrade | KubernetesUpgrade | AddMachine | RemoveMachine | EtcdDefragment
     target: 9c1e…                     # the hash of the change: which machines go from what to what (§6.3, §7.3)
     plan: [talos-cp-2, talos-cp-3, talos-cp-1]   # KubernetesUpgrade: one component on one machine each, "kube-apiserver/talos-cp-1"
     targets: { talos-cp-2: sha256:… } # ConfigRollout: the rendered config each machine is to reach,
@@ -278,7 +284,8 @@ status:
     completed: [talos-cp-2]
     skipped: []
     failure: null                     # set => halted until a human acts (§8.3): machine, step, reason,
-                                      #   message, remediation, token
+                                      #   message, remediation, token, and bundle: the Secret with what the
+                                      #   machine said when it failed (§14.6)
   approval: { hash: 9c1e…, machines: [ … ] }   # a change waiting for a human (§6.3)
   abortedTargets: {}                  # what an aborted rollout was applying; not started again (§8.3)
   upgrades: { skipped: {}, aborted: {}, kubernetes: "" }   # machine -> installer image a human took out of an upgrade (§7.3);
@@ -288,6 +295,10 @@ status:
     kubernetes: 1.36.5
     plan: [ { kind: Talos, from: v1.14.1, to: v1.14.2 }, { kind: Kubernetes, from: 1.36.5, to: 1.37.1 } ]
     available: { talos: [v1.14.2], kubernetes: [1.36.5, 1.37.1], problem: "" }
+  certificates:                       # from when until when each is valid (§14.6): the operator's client
+    - { name: operator, issuedAt: …, expiresAt: … }   # certificate, and the authorities os, kubernetes,
+                                      #   kubernetes-aggregator and etcd
+  maintenance: { etcdDefragmentedAt: … }
   history: []                         # the last 10 operations: outcome Succeeded | Aborted | Superseded
 ```
 
@@ -384,19 +395,25 @@ status:
     changeReasons: [v1alpha1/KubeNodeConfig]
     diff: |                           # redacted, per document; this is what an approval is reviewed against
       …
-  etcd: { memberID, isLearner }
+  etcd: { memberID, isLearner, leader, dbSize, dbSizeInUse }
+  health:                             # what Talos itself says about the node (§14.2)
+    services: [ { name, running, healthy } ]
+    diagnostics: [ { id, message } ]
+    timeSynced: true
+    links: [ { name, up, speedMbps, bond } ]
+    volumes: [ { name, phase, error } ]
   conditions: […]                     # Matched, ConfigMatchesLive, NodeObserved, Provisionable
 ```
 
 A machine is a **member** from `joinedAt` until `removedAt`. Only members are rolled out to, upgraded, and counted by the adoption proof. A machine that is declared and has not joined, or has left, holds nothing up: for it the conditions above say `NotAMember`, and `Provisionable` says whether it could be added and, if not, what it waits for (§7.6).
 
-`NodeObserved` says whether the node's state was read in the last pass, and names what was not. Status never shows a moment that has passed as the present: `talos.stage`, `talos.ready`, `talos.bootID` and `config.liveHash` are empty unless they were read in the last pass, and a machine is `Ready` only on what its node said in that pass. A boot ID that survived a failed read would say that no reboot happened. Facts that rarely change (version, schematic, identity, etcd member) keep their last value, which is more use than nothing while a node is away.
+`NodeObserved` says whether the node's state was read in the last pass, and names what was not. Status never shows a moment that has passed as the present: `talos.stage`, `talos.ready`, `talos.bootID`, `config.liveHash`, `health` and what `etcd` says besides which member it is are empty unless they were read in the last pass, and a machine is `Ready` only on what its node said in that pass. A boot ID that survived a failed read would say that no reboot happened. Facts that rarely change (version, schematic, identity, etcd member) keep their last value, which is more use than nothing while a node is away.
 
 `poolRef` may change between pools of the same role; that is a config change like any other. A pool of the other role cannot match the live node, which keeps reporting its own machine type. The machine then stays `Matched=False` (`RoleMismatch`) and is never acted on.
 
 **Validation.** There is no webhook. Rules on one object are CEL in the CRDs. Rules that need the stored object or a DELETE are **ValidatingAdmissionPolicies** (`config/admission/policies.yaml`, shipped by the chart). The API server evaluates them itself, so they hold while the operator is down; a self-hosted operator's webhook would be unavailable during the very node drains it runs (§12.8).
 - Immutable fields stay immutable: a pool's `clusterRef` and `role` cannot change (CRD CEL).
-- `upgrades` and `membership` can be `Enabled` only with `config: Manage` (CRD CEL).
+- `upgrades`, `membership` and `maintenance` can be `Enabled` only with `config: Manage` (CRD CEL).
 - `config` may become `Manage` only while the **stored** status shows `ConfigProven=True` (policy `…-management-gate`). A spec update cannot carry its own status, so the gate reads `oldObject.status`. `Adopted` is kept current by the proof (§7.1 stage 3): any live or spec change since the proof sets it False. Once managed, a later invalidated proof does not lock the spec.
 - A TalosMachine cannot be **deleted while its node is in the cluster** unless annotated `talos.jarensaa.github.io/orphan: "true"` (policy `…-deletion-guard`). That is while it is `Present`, and while it is `Removed` and a member still: `status.joinedAt` without `status.removedAt`. This guards against a GitOps prune or a namespace deletion silently dropping a machine, and against a commit that asks for a removal and deletes the resource at once, which would leave a node nobody describes. `desiredState: Removed` is how a node leaves (§7.7). There is no finalizer: the API server keeps the resource by itself, the operator running or not.
 - **In-use objects are protected by the finalizer `talos.jarensaa.github.io/in-use`**, the way Kubernetes protects bound PVCs. Their `InUse` condition says what holds them. A TalosMachineConfig stays while anything references it, and a pool while it has members. Deletion completes once they are unreferenced. If the operator is down, the deletion waits, which is the safe direction.
@@ -447,7 +464,7 @@ Implemented in `internal/classify` (what kind of change), `internal/plan` (what 
 | Unknown | any document kind or field the classifier has no rule for | Requires approval, so a kind Talos adds later is never treated as safe by default. |
 | Storage | `VolumeConfig`, `UserVolumeConfig`, `RawVolumeConfig`, LVM, RAID | Requires approval. |
 | Connectivity | `BondConfig`, `LinkConfig`, `VLANConfig`, `DHCPv*Config`, resolvers, routes, firewall rules, `KubePrismConfig`, `DiscoveryServiceConfig` | Applied. |
-| Control-plane restart | etcd `extraArgs`, control-plane component documents | Applied. |
+| Control-plane restart | etcd `extraArgs`, control-plane component documents | Applied. A component's change takes effect at once: Talos renders its static pod again. **etcd's does not:** Talos hands etcd its arguments when it starts it (`T/internal/app/machined/pkg/system/services/etcd.go:111`) and restarts it for no config change, so the config is applied, verified and in sync while etcd runs with what it started with until its node reboots. Nothing restarts it yet, and nothing says so (§12.27). |
 | Live-safe | kubelet config, labels/taints, sysctls, registries, time, what the config says about kube-proxy besides its image (§12.20) | Applied. |
 
 One blocked machine blocks the rollout for every machine: a rollout either applies the whole change or none of it.
@@ -944,14 +961,15 @@ We considered running a DaemonSet that watches local connectivity and reverts th
 | `<cluster>-talos-secrets` | secrets bundle (`secrets.yaml` format) | Operator-created during adoption (or user-supplied, then verified). Needed to render configs. **No ownerRef**, so deleting the TalosCluster never deletes the PKI. An off-cluster copy is optional break-glass (§12.7). |
 | Operator Talos client cert | Requested through a `talos.dev/v1alpha1` `ServiceAccount` `<cluster>-talos-operator` (roles `[os:admin]`, owned by the TalosCluster) in the TalosCluster's namespace. Talos answers with a Secret of the same name, key `config`. | Issued by Talos from the cluster's current CA: 6 h TTL, renewed 1 h before expiry (`kubeaccess/serviceaccount/crd_controller.go:49-50,90` in Talos v1.14). Nothing is stored outside the cluster, so it survives a rebuild with fresh PKI. Needs a `KubeTalosAPIAccessConfig` on the control planes allowing `os:admin` for the namespace; Talos then installs the CRD (`controllers/k8s/manifest.go:264`). The operator reads the CRD unstructured and never watches it, so a missing CRD is reported (`TalosAPIAccessDisabled`) instead of breaking startup; Talos's `status.failureReason` is reported as `TalosAPIAccessDenied`. The issued talosconfig names the in-cluster Service `talos.default`, which the operator never dials: endpoints are the control-plane Nodes' InternalIPs (§4.2). |
 | Supplied talosconfig (`credentials.source: Secret`) | An admin talosconfig whose endpoints are node IPs | Alternative for clusters where workload API access cannot be enabled. Expires with its certificate (talosctl's default is 1 year); `CredentialsValid` reports the expiry. |
-| `<cluster>-talosconfig` / `-kubeconfig` (optional) | Short-lived admin credentials for humans | Opt-in, refreshed on a timer. |
+| `<cluster>-support-bundle` | What the machine of a failed operation said: the state of its services and the end of their logs and of the kernel's (§14.6) | Written by the operator when an operation halts, overwritten by the next failure, owned by the TalosCluster. A Secret because a log can quote a config. |
 | `<cluster>-adoption-backup` | Live configs captured during adoption | Created once and kept. |
 | `<cluster>-state` (considered) | Copy of critical `status` (bootstrapped, operation) with no ownerRef, so a CR re-create does not re-bootstrap | Prior art: alperencelik. M9. |
 
 Other rules:
 - Rendered configs, dry-run diffs and Events are **redacted**: secret-bearing fields are replaced by a hash. Diffs of documents that take values from a Secret-sourced patch are withheld entirely, and so are render errors when such a patch is involved.
 - Configs are never logged.
-- RBAC: the operator reads Secrets and writes `talos.dev` ServiceAccounts only in its own namespace. Anyone who can create a `talos.dev` ServiceAccount there obtains the allowed Talos roles, so that namespace is dedicated to the operator.
+- The operator keeps no credentials for people: no talosconfig and no kubeconfig for an administrator (§12.27).
+- RBAC: the operator reads Secrets, creates them and updates them (the support bundle is the one it updates), and writes `talos.dev` ServiceAccounts, only in its own namespace. Anyone who can create a `talos.dev` ServiceAccount there obtains the allowed Talos roles, so that namespace is dedicated to the operator.
 - An off-cluster copy of the bundle is optional. `SecretsBackedUp` reports whether one is confirmed, and never blocks.
 
 ---
@@ -980,6 +998,8 @@ Task beads under a milestone are cut when the milestone starts, for the same rea
 | **M10a The operator's state as metrics** | What status says, exported at every scrape by every replica: an operation in flight or halted, what holds a change back, drift, nodes that cannot be read, etcd membership. The chart installs a ServiceMonitor, alerts and a Grafana dashboard where the cluster has the Prometheus Operator's API (§14.2) | v0.10.0 |
 | **M7 Adding machines** | A declared machine that waits in maintenance mode joins as a worker or a control plane, once it says it is the hardware that was declared and its config fits it; one at a time, on a cluster at rest (§7.6) | v0.11.0 |
 | **M8 Removing and replacing machines** | A machine marked `Removed` is drained, reset, seen to have forgotten the cluster, and its Node deleted; a control plane only while three voters remain, which makes a replacement an addition followed by a removal; a dead machine after a human confirms it (§7.7) | v0.11.0 |
+| **M10b The cluster's own health** | What Talos says about each node, in status, as metrics, with alerts and a second dashboard: services, Talos's warnings, clocks, links and bonds, volumes, the size of each etcd database, and how long the cluster's certificates last. A switch that makes the controller manager and the scheduler scrapable (§14.2) | v0.12.0 |
+| **M11 Maintenance** | etcd defragmented before a database reaches its quota, as an operation behind the same gates as every other; the machine of a failed operation asked for its logs, kept in a Secret the failure names (§14.6) | v0.12.0 |
 
 ### What every remaining milestone builds on
 
@@ -1016,24 +1036,12 @@ It is postponed on purpose (decided 2026-10-10). While no cluster depends on the
 - **The identity pin stays the trust** (§12.3, §12.25). What was added to it: the config goes out on the connection, and to the key, that the identity was read from.
 - **Out of both:** getting a machine to boot; finding machines; shrinking the control plane; wiping other disks; taking storage out of service (the user's hooks).
 
-### M10 Observability
+### M10 and M11, as delivered
 
-**M10a: the operator's own state** is delivered (§14.2): metrics for what the operator already knows, alerts on them, and a dashboard, installed by the chart where there is a Prometheus to read them.
-- **Shown for M10a:** the alert rules are tested by promtool on the series the exporter really exports, a halted rollout among them, each rule broken once to see its test fail; on QEMU the halted rollout is found in the metrics of both replicas, with the labels the alert carries, and is gone from them once it is aborted. The QEMU cluster has no Prometheus, so no alert was seen to fire there. Off any cluster, a Prometheus loaded with the chart's rules and scraping the exporter's output for a halted rollout fired `TalosOperationHalted`, and a Grafana showed the dashboard filled from it; neither has been seen on a cluster yet.
-
-**M10b: the cluster's own health, beside the operator's.** The operator already integrates with a Prometheus and a Grafana where there are any (M10a). This puts the cluster itself there too:
-- what only the Talos API can say about a node, exported like the operator's own state: its services, Talos's own diagnostics, time sync, links and bonds, volumes, the size of the etcd database (§14.2 lists them);
-- the metrics of etcd and of the control-plane components, made scrapable, which is a config change a user could declare since M3 and the operator can offer as a switch;
-- a Talos dashboard, and alerts on what it shows.
-- **To decide:** whether shipping Talos's logs belongs here. It needs a log backend, which a cluster often does not have.
-- **Done when:** the dashboard shows the nodes of a QEMU cluster, and a node whose clock is off, or whose link is down, raises an alert in the rule test.
-
-### M11 Maintenance
-
-Defragmenting etcd and handling its alarms; a support bundle attached to a failed rollout; keeping human credentials fresh.
-
-- Out: snapshots of etcd and every other backup (§12.23).
-- **Done when:** a fragmented etcd is defragmented with the cluster healthy between members; a failed rollout has a bundle.
+- **M10a** (§14.2). **Shown:** the alert rules are tested by promtool on the series the exporter really exports, a halted rollout among them, each rule broken once to see its test fail; on QEMU the halted rollout is found in the metrics of both replicas, with the labels the alert carries, and is gone from them once it is aborted. The QEMU cluster has no Prometheus, so no alert was seen to fire there. Off any cluster, a Prometheus loaded with the chart's rules and scraping the exporter's output for a halted rollout fired `TalosOperationHalted`, and a Grafana showed the dashboard filled from it; neither has been seen on a cluster yet.
+- **M10b** (§14.2). **Shown:** every new alert has a scenario in the rule test, a clock that is off and a bond that lost a member among them, and scenarios for what must stay quiet (a port nothing is plugged into, an etcd that waits for its interval, a node that can no longer be read); each rule was broken once to see its test fail. Both dashboards are held against what the exporter describes, so a panel cannot ask for a series or a label that nobody exports. On QEMU every node reports every service healthy, its clock synchronised and its volumes ready, exactly one control plane leads etcd, and both replicas export it; the controller manager and the scheduler refuse a connection from outside their node before the switch and answer after it, with no reboot and no worker touched. **Not shown:** the dashboard in a Grafana on a cluster.
+- **M11** (§14.6). **Shown:** the planner's rules as tables (who is defragmented, in what order, what blocks it); against the fake, every member defragmented with the leader last and not again within the interval, nothing started while the cluster is unhealthy or paused, the next member not begun before the last was verified, a halt at a member that cannot be defragmented with the node's logs kept, and nothing written over a Secret that is not the operator's. On QEMU, a defragmentation of every member with the leader last, and a bundle for the rollout that Talos reverted.
+- **Out of both**, each for a reason (§12.27): handling an alarm of etcd, keeping credentials for people, a switch for etcd's metrics, and a switch for shipping Talos's logs.
 
 ### Later, unscheduled
 
@@ -1051,15 +1059,16 @@ What the earlier plan kept under "M9, later" and is no longer planned (§12.26):
 
 ### Owned by no milestone, and needing a decision
 
+- **A changed etcd argument takes effect only when etcd restarts** (§6.3, §12.27). Restarting etcd one control plane at a time, behind the etcd gates, is an operation the operator does not have. Until it has, a change under `cluster.etcd` waits for the node's next reboot without anything saying so, and the metrics switch leaves etcd out.
+
 - **Upgrading the operator itself.** The API is `v1alpha1` and may change between releases, but nothing says what a release may change in it, or how stored objects get from one shape to the next. How the CRDs themselves are upgraded is settled (§12.15). The rest needs a rule before a real cluster depends on it.
 - **Scale.** Nodes are read one after the other and workers roll one at a time. Both are right for a handful of nodes and wrong for a hundred.
 
 ### Suggested order
 
 1. The real cluster, when its owner decides the API has settled enough to depend on.
-2. M10b, then M11.
 
-R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7 and M8.
+R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7 and M8. No milestone is open: what is left is under "Later" and under "Owned by no milestone".
 
 ### Testing strategy
 - **Pure unit tests** for planners (invariant tables), render/diff/patch derivation (golden files from real-shaped multi-doc configs with throwaway secrets), and compatibility ordering.
@@ -1140,6 +1149,15 @@ Decided 2026-10-08:
 25. **Machines are added and removed like everything else is done, and a machine that left has to be seen to have left** (decided 2026-10-11, with M7 and M8). The earlier plan let workers join in parallel, outside the lock; one machine at a time through the one driver is the rule (§12.19), and a second way of doing things would have been a second set of invariants. The identity pin remains what a new machine is trusted by (3): a machine in maintenance mode can prove nothing, so what can be had is that the pinned identity is read in the very pass, and over the very connection and key, that the config then goes out on. A removal resets with a reboot and is done when the machine answers in maintenance mode again: a machine that was only asked to wipe itself may not have, and it holds the cluster's CA keys. For the same reason a machine that does not answer is never guessed about; a human says it is dead, with the token of that one failure. A control plane leaves only while three voters remain and there is no override: shrinking a control plane is rare, and an annotation that makes a quorum loss a typo away is not worth having for it. A TalosMachine is kept from deletion by the API server until `removedAt`, where the plan had a finalizer: a finalizer needs the operator to be there to let go. Only Talos's own two partitions are wiped.
 26. **The operator manages a cluster that exists, and what was parked as "later" is mostly not coming** (decided 2026-10-11). With R1 to R4 delivered, the list of things for some later milestone was looked at again. Bootstrapping is out: an operator that runs inside its cluster has nowhere to run before there is one, and building a cluster is a solved problem that is not this project's. A management-cluster mode, machine discovery, the operator choosing versions, a planner CLI and a last-known-good watchdog go with it; each either served bootstrapping, duplicates what a tool beside the operator already does, or would be a second mechanism on every node. Monitoring stays and grows (M10b), because the operator already speaks to a Prometheus and a Grafana, and a cluster's own health belongs on the same page. Rotating the PKI is the one thing kept for later: adoption leaves the old keys with whoever built the cluster, and nothing else in the list answers that.
 
+27. **Upkeep prevents what an operator inside the cluster cannot repair, and four things the earlier plan had are not built** (decided 2026-10-12, with M10b and M11).
+   - **An alarm of etcd is not handled, and not even read.** The plan was to defragment and disarm on `NOSPACE` and to alert on `CORRUPT`. With either alarm raised etcd refuses writes, and with them every way an operator inside the cluster has of saying or doing anything: status, Events, the step it must persist before a side effect. A metric of the alarm would have to be a gauge beside the status (§12.24), exported by a process that can do nothing else. So the upkeep is to never get there: etcd is defragmented while it accepts writes, and an alert fires on a database at four fifths of the default quota. Getting out of an alarm is `talosctl`, and no connection of the operator can list or disarm one (`internal/talos/health_test.go`).
+   - **Defragmentation is an operation, not a background task.** A member answers nobody while it is defragmented, which is a disruption like any other: it takes the lock, goes through the driver (§6.4), and each member waits for the gates and is verified before the next. Every member is defragmented when one is over the threshold, because what fragments one fragments them all, and the leader goes last. The time of the last one is recorded when it starts, so one that fails or is aborted is not tried again before the interval has passed.
+   - **Status follows a number that always changes at a distance.** The size of an etcd database changes with every write to the cluster, and a status that followed it would be written in every pass, which breaks the rule that a cluster at rest is not written to. Status follows it once it has moved by a twentieth of the file. What decides a defragmentation is read where it is decided, not from status.
+   - **The support bundle is what the node says, in a Secret, and nothing more.** The plan named `go-talos-support` and a PVC or an object store. That library collects for a person at a terminal: hundreds of resources, a controller graph, logs of every pod, as an archive of tens of megabytes. What explains a node that did not come up is the state of its services and the end of their logs and of the kernel's, a few hundred kilobytes compressed, and a Secret needs no storage that could be missing. One per cluster, overwritten: it is for the failure somebody is looking at.
+   - **No credentials for people.** The plan had optional talosconfig and kubeconfig Secrets for administrators, refreshed on a timer. The operator holds the cluster's authorities and could mint them, and that is the reason not to: an administrator's credential lying in a Secret is readable by whatever can read Secrets in that namespace, renewed forever, and revoked by nothing. Whoever holds the cluster's secrets makes one with `talosctl` when needed. What the operator does is say when the certificates it knows end, by how much of each is left: Talos issues the operator's own for six hours and renews it, an authority lasts ten years, and one rule has to cover both.
+   - **The metrics switch covers the controller manager and the scheduler, not etcd.** Reading Talos's source for this showed that etcd is handed its arguments only when it is started and is restarted for no config change. A switch that named a metrics address for etcd would be rolled out, verified and in sync, and change nothing until the node reboots. The same is true of any etcd argument a user declares, which §6.3 had wrong. The fix is an operation that restarts etcd member by member; it is not built (§10).
+   - **Shipping Talos's logs is config the user declares.** It needs a collector listening on every node, which is the owner's to run, and with that it is three lines of config that roll out like any other. A field of the spec that renders those three lines adds a name to learn and nothing else. The guide has the lines.
+
 ## 13. Prior art summary
 
 | Project | License | Take | Avoid |
@@ -1155,7 +1173,7 @@ Decided 2026-10-08:
 
 ## 14. Day-2 operations
 
-> **Not built**, except the operator's own metrics in §14.2, and §14.4 and §14.5. This section is the earlier plan for M6, M10 and M11. §10 says what those milestones have to deliver, and leaves open some of what is decided here (whether cluster metrics are an operator feature, for one).
+> Built with M6, M10 and M11. The section began as the plan for them; it now says what was built, and where that departs from the plan it says why (§12.27).
 
 Beyond R1–R4, a self-managed cluster needs four things:
 - the ability to see what Talos is doing;
@@ -1182,22 +1200,13 @@ This section scopes those. Findings are verified against the Talos 1.14.0 source
 - **kubelet** :10250 and **kube-apiserver**: standard.
 - **machined, apid, trustd and containerd have no Prometheus endpoint** (verified: no `promhttp` handler anywhere). Talos state is only available through the API, which is why the operator exports it (below).
 
-**Metrics profile.** A feature flag rendered by the operator, rather than a patch for users to copy:
+**The switch for the control-plane components (M10b, built).** `spec.observability.controlPlaneMetrics: Enabled` makes the controller manager and the scheduler of every control plane listen on every interface (`bind-address: 0.0.0.0`). Both authenticate and authorize whoever asks, and their probes ask on localhost, so the node's own address alone would not do.
+- It is rendered before the user's layers (`render.Input.ControlPlaneMetrics`), in the form of config the version contract has: the components' own documents from 1.14 on, the v1alpha1 fields before. A config must not have both. A layer of the spec that sets the same argument wins.
+- It goes through a config rollout like any other change, classified as a control-plane restart, and shows up in the diff.
+- **etcd is not part of it** (§12.27): Talos hands etcd its arguments only when it starts it (`T/internal/app/machined/pkg/system/services/etcd.go:111`), and restarts it for no config change. `cluster.etcd.extraArgs.listen-metrics-urls` in a user's layer is applied and takes effect at the node's next reboot.
+- The matching values of kube-prometheus-stack (its controller-manager and scheduler endpoints, `kubeProxy` where there is none) stay with whoever deploys it.
 
-```yaml
-spec:
-  observability:
-    metrics:
-      etcd: { listenAddress: node }     # renders cluster.etcd.extraArgs.listen-metrics-urls=http://<node-ip>:2381
-      controlPlane: true                # renders bind-address=0.0.0.0 for controller-manager + scheduler
-```
-
-- It expands into an operator-managed config layer. It goes through the normal ConfigRollout and shows up in the dry-run diff.
-- The etcd argument change restarts etcd. A new change class, **control-plane-restart**, rolls this out one CP at a time behind the etcd gates (§6.3, §8.1).
-- Binding to the node IP rather than `0.0.0.0` keeps it off other interfaces. Cilium host policies can restrict access further.
-- The matching kube-prometheus-stack values (`kubeEtcd` port 2381, controller-manager/scheduler endpoints, `kubeProxy` disabled) stay in Flux. The operator docs give the values snippet.
-
-**The operator's own state (M10a, built).** `internal/exporter` exports what the operator has written into the status of its resources. It is a collector that reads TalosClusters, TalosMachinePools and TalosMachines from the manager's cache when it is scraped, and keeps nothing itself:
+**What is exported (M10a and M10b, built).** `internal/exporter` exports what the operator has written into the status of its resources, and that includes what it read from Talos about each node (below). It is a collector that reads TalosClusters, TalosMachinePools and TalosMachines from the manager's cache when it is scraped, and keeps nothing itself:
 - every replica exports the same, the leader or not, so a rule takes the maximum over them and an alert does not depend on which replica is scraped;
 - a resource that is deleted takes its series with it;
 - no metric can say anything else than the status a person reads, and no node is asked anything for a scrape;
@@ -1217,10 +1226,21 @@ Every series of a cluster carries `namespace` and `taloscluster`, and of a machi
 | `cluster_etcd_members{role}`, `machine_etcd_member{role}` | Voters and learners, as last observed; for each control plane, whether it is one. |
 | `machine_info{pool,role,node,talos_version,kubelet_version,schematic}`, `machine_phase{phase}`, `machine_condition{…}` | A machine, what its node runs, and its conditions: `NodeObserved` is whether it can be read. |
 | `machine_ready`, `machine_hold`, `machine_config_change_info{class}` | Ready when last read; on hold; a config change that is pending, by class. |
+| `machine_service_healthy{service}`, `machine_diagnostic_info{id}`, `machine_time_synced` | What Talos says about a node: each of its services, each warning it raises about the node's configuration, the clock. |
+| `machine_link_up{link,bond}`, `machine_link_speed_mbps{link}`, `machine_volume_ready{volume,phase}` | The physical links with the bond they are in, and Talos's volumes. |
+| `machine_etcd_leader`, `machine_etcd_db_size_bytes`, `machine_etcd_db_size_in_use_bytes` | For a control plane: whether it leads etcd, and its database. |
+| `cluster_certificate_issued_timestamp_seconds{certificate}`, `cluster_certificate_expiry_timestamp_seconds{certificate}`, `cluster_etcd_defragmented_timestamp_seconds` | The validity of the certificates in status; when etcd was last defragmented. |
+
+**What Talos says about a node (M10b).** machined, apid, trustd and containerd have no metrics endpoint, so this state exists nowhere a Prometheus could read it. The TalosMachine controller reads it in the pass it already makes over its node, through `nodeReads`, into `status.health` and `status.etcd`:
+- **It describes a moment.** Each part is in status only when it was read in the last pass, and a node that does not answer has none of it: nothing of it is exported then, and nothing says the node is fine. `TalosMachineNotObserved` is the alert for that node.
+- **It costs five reads of a node per pass**, and no read at a scrape.
+- **A quiet cluster is still not written to.** Services, links, volumes and the clock change when something happens. The size of an etcd database changes all the time, so status follows it only once it moved by a twentieth of the file (`followedSize`).
+- **It is bounded:** 64 entries of each list, and 512 bytes of what Talos says in prose, which is in status and never a label.
+- Links are the physical ones. Volumes are Talos's own, user volumes included.
 
 Beside them are `talos_operator_rejected_rpcs_total`, the Talos calls the operator's own allowlist refused, and what controller-runtime exports of itself.
 
-**What the chart installs** (`monitoring` in its values): a `ServiceMonitor`, the alerts as a `PrometheusRule`, and a Grafana dashboard as a ConfigMap labelled for Grafana's sidecar. Each is `auto`, `true` or `false`, and `auto` installs it where the cluster has the Prometheus Operator's API, which is how a chart can tell that there is a Prometheus to read it (§12.24).
+**What the chart installs** (`monitoring` in its values): a `ServiceMonitor`, the alerts as a `PrometheusRule`, and two Grafana dashboards in a ConfigMap labelled for Grafana's sidecar: what the operator does (`files/dashboard.json`), and what Talos says about the nodes (`files/dashboard-nodes.json`). A unit test holds every expression of both against the series and labels the exporter describes. Each is `auto`, `true` or `false`, and `auto` installs it where the cluster has the Prometheus Operator's API, which is how a chart can tell that there is a Prometheus to read it (§12.24).
 
 **Alerts** (`charts/talos-operator/files/alerts.yaml`):
 
@@ -1237,24 +1257,27 @@ Beside them are `talos_operator_rejected_rpcs_total`, the Talos calls the operat
 | `TalosClusterUnhealthy` | warning | Talos's own health check has failed for 15 minutes. |
 | `TalosMachineNotObserved`, `TalosMachineNotReady` | warning | A node cannot be read; a node answers and is not ready. |
 | `TalosControlPlaneNotEtcdVoter` | warning | A control plane is no voting member of etcd. |
+| `TalosServiceUnhealthy`, `TalosNodeDiagnostic`, `TalosVolumeNotReady` | warning | For 15 minutes: a Talos service does not run or fails its health check; Talos raises a warning about a node; a volume of Talos is not ready. |
+| `TalosNodeClockNotSynced` | warning | A node's clock has not been synchronised for 10 minutes. |
+| `TalosBondMemberDown` | warning | A link that is a member of a bond has been down for 5 minutes. A link in no bond raises nothing: it may be a port nothing is plugged into, and a node whose only link is down cannot be read at all. |
+| `TalosEtcdDatabaseLarge` | critical | An etcd database is over four fifths of etcd's default quota of 2 GiB. A quota set through `extraArgs` is not known to the rule. |
+| `TalosEtcdFragmented` | warning | A database has been due for defragmenting for an hour, and what holds it back is not a pause, a window or the interval. |
+| `TalosCertificateExpiring`, `TalosCertificateExpired` | warning, critical | Less than a tenth of a certificate's validity is left; none is. A tenth is half an hour of the six hours Talos issues the operator's certificate for, and a year of an authority's ten. |
 
 A rule that names a series or a label wrongly is silent for good, so the rules are tested on what the exporter exports: `internal/exporter` holds scenarios, each a state of the resources and the alerts it has to raise, and writes from them a test for promtool whose input is the collector's own output (`make alerts`, `make alerts-test`). Every alert is asked about in every scenario, the ones that must stay quiet included, and an alert that no scenario raises fails the unit tests.
 
-**Not built:** metrics that only the Talos API can give and that the operator does not observe today. The earlier plan listed service health, Talos's diagnostics, time sync, links and bonds, volumes, the OOM handler and the size of the etcd database. They would make every scrape, or every observation, ask every node more; they belong to M10b if they are wanted. CPU, memory, disk and network are a node exporter's.
+**Not built:** the OOM handler's events, which the earlier plan listed with the rest. CPU, memory, disk and network are a node exporter's.
 
-### 14.3 Logs (optional, needs a log backend)
+### 14.3 Logs
 
 Talos can push its logs to a collector:
 - **Service logs:** `machine.logging.destinations`, which is v1alpha1 only. JSON lines over `tcp://` or `udp://` (`T/internal/app/machined/pkg/runtime/logging/sender_jsonlines.go:53-77`), with fields `msg`, `talos-time`, `talos-level`, `talos-service`.
 - **Kernel logs:** the `KmsgLogConfig` document.
 - **Machine events:** `EventSinkConfig` (gRPC), or pulled via `MachineService.Events`.
 
-These cover etcd, kubelet, apid and containerd logs, which are not pod logs and are invisible to normal Kubernetes log collection. They are exactly what is needed to debug a rollout that went wrong.
+These cover etcd, kubelet, apid and containerd logs, which are not pod logs and are invisible to normal Kubernetes log collection.
 
-Scope:
-- The owner deploys a log backend plus a host-network collector DaemonSet (Vector `socket` source or Alloy) listening on a node-local port.
-- The operator renders `spec.observability.logs.endpoint: udp://127.0.0.1:<port>` into the logging config.
-- Without a backend, nothing is rendered.
+**The operator has no feature for it** (§12.27). Shipping them needs a collector that listens on every node, and with one it is a few lines of config in a layer of the spec, which the guide gives. What the operator does for the case that matters most, a rollout that went wrong on a cluster with no log backend at all, is the support bundle (§14.6).
 
 ### 14.4 Upgrade-path awareness
 
@@ -1271,21 +1294,31 @@ Out of scope: a `render` command that prints machine configs from the manifests 
 
 One conflict to watch for where the check is a required one: automation that commits straight to the main branch, such as an image update bot, is blocked by it unless the rule is scoped to the paths that hold the cluster's manifests.
 
-### 14.6 Maintenance automation
+### 14.6 Maintenance
 
-These are recurring tasks the operator runs through the Talos API. Disruptive ones take the disruption lock and respect maintenance windows.
+**Defragmenting etcd** (`plan.PlanDefragment`, `internal/controller/upkeep.go`). A member's database file only grows: what compaction and deletion free stays allocated until the member is defragmented, and etcd counts the file against its quota. At the quota etcd raises `NOSPACE` and refuses every write.
+- **When.** While `spec.management.maintenance` is `Enabled`, and a member's file is at least `minimumSize` (100Mi) with at least `freePercent` (50) of it free. Not within `interval` (24h) of the last one, counted from when that started. The numbers are read from every control plane in the pass that decides.
+- **What.** An operation of its own kind, `EtcdDefragment`, through the driver (§6.4): the lock, the hooks around it, no member begun while paused or outside a window. Every control plane is in the plan, followers by name and the member that leads last.
+- **Each member** is defragmented only while every node of the cluster is healthy, the member's own included (`plan.TouchGate` with nobody left out, and the user's gates), and the next begins after the cluster was verified healthy for the soak (`plan.VerifyGate`). The member that leads is asked to hand the lead over first, as a courtesy. `EtcdDefragment` reaches the local member only (`T/internal/app/machined/internal/server/v1alpha1/v1alpha1_server.go:2172`), so it is addressed to that node, through another one.
+- **Failure.** A member that cannot be defragmented within the step timeout halts the operation, like any step. Retry defragments it again, which does no harm; skip leaves it out.
+- **The connection** is a kind of its own (`talos.Keeper`): reading, `EtcdDefragment` and `EtcdForfeitLeadership`, made only while maintenance is enabled.
+- **With fewer than three members**, etcd has no quorum while one is defragmented, and the Kubernetes API stalls for that long. It is allowed all the same: the alternative is the quota.
+- `EtcdMaintained` says where things stand; a defragmentation that is due and does not start has the reason of what it waits for. With maintenance disabled the operator still says that a database is fragmented.
 
-| Task | Mechanism | Policy |
-|------|-----------|--------|
-| **etcd defragmentation** | `EtcdStatus` ratio `db_size_in_use/db_size`; `EtcdDefragment` defragments the **local** member only (`v1alpha1_server.go:2172`), so it is targeted per node | When ratio < 0.5 and the DB is above a size floor. One member at a time, followers first, then `EtcdForfeitLeadership` and the old leader last. Health check between members. |
-| **etcd alarms** | `EtcdAlarmList` / `EtcdAlarmDisarm` | NOSPACE: defrag, then disarm. **CORRUPT: alert only, never auto-disarm.** Optional `quota-backend-bytes` via the metrics/etcd profile (default 2 GiB). |
-| **Support bundle on failure** | `github.com/siderolabs/go-talos-support` (MPL-2.0, depends only on machinery): service and kernel logs, kube-system logs, non-secret COSI resources, controller graph | Captured automatically when a rollout fails. Stored on a PVC or object store and referenced from `status.operation.failure`. No Sidero age recipients. |
-| **Credential hygiene** | Talos re-issues the operator's certificates (§9); the operator alerts if they are not renewed. Optional human talosconfig/kubeconfig Secrets refreshed. | Alert on the operator's own cert expiry and on CA age; CAs last 10 years. Talos already rotates apid/trustd (24h) and control-plane certs (1y) itself. |
-| **Hardware watchdog** | `WatchdogTimerConfig` (`device`, `timeout` ≥ 10s; machined feeds it every timeout/3) | Recommended patch for bare metal. It recovers a hung kernel or machined after boot. It does **not** cover network breakage (TRY does) or an early-boot hang before machined (§8.5.2). |
-| **Contract-bump hygiene** | Documents that new clusters get by default but upgraded ones lack (`FilesystemTrimConfig`, `SecurityProfileConfig`, scrub, …) | Handled by the version-contract bump workflow: preview diff, then approval. Not silent. |
+**Alarms of etcd are not handled** (§12.27).
 
-**Not in v1:**
+**The support bundle** (`internal/controller/bundle.go`). When an operation halts at a machine, the operator reads from that machine, with the connection every observation uses, the state of its services, the last 500 lines of the logs of `machined`, `apid`, `kubelet` and `cri` (and `etcd` on a control plane), and the kernel log, at most 128 KiB of each. They go, compressed, into the Secret `<cluster>-support-bundle`, and `status.operation.failure.bundle` names it.
+- Once per failure, in the pass that records it. A node that does not answer then is tried for five minutes; after that `bundle` says why there is none.
+- One Secret per cluster, overwritten by the next failure, owned by the TalosCluster. A Secret of that name that is not the cluster's is left alone.
+- Never logged. It needs `update` on Secrets in the operator's namespace, which is the one permission this added.
+
+**Certificates.** `status.certificates` has the validity of the operator's own client certificate and of the authorities in the secrets bundle (only the certificates are parsed, never their keys). A certificate that cannot be read keeps the dates it had: the one that matters most is the one that just stopped working. The alerts are in §14.2. Talos rotates what it issues itself (apid and trustd certificates daily, control-plane certificates yearly); rotating an authority is not built (§10).
+
+**Recommended, not rendered:** a `WatchdogTimerConfig` on bare metal, which recovers a hung kernel or machined after boot. It does not cover a config that cuts a node off (TRY does) or a hang before machined (§8.5.2). The guide has the document.
+
+**Not built:**
 - etcd snapshots, scheduled or before an operation: out of scope altogether (§12.23);
+- credentials for people (§12.27);
 - CA rotation (later, §10);
 - `ImageVerificationConfig` signature policy (low value for a small cluster; CRI enforcement unverified);
 - automated disk wipes for Rook OSD recycling;
@@ -1296,7 +1329,7 @@ Image GC needs nothing: Talos already runs it every 15 minutes (`T/internal/app/
 ### 14.7 Decisions
 
 Decided 2026-10-09:
-1. **Log shipping goes to a collector on the node.** Which backend is behind it is the owner's choice. The operator renders Talos service and kernel log shipping to the collector (§14.3).
+1. **Superseded 2026-10-12:** log shipping goes to a collector on the node, which is the owner's to run, and the config for it is the owner's to declare (§12.27).
 2. **Superseded 2026-10-11:** there is no snapshot target, because the operator takes no snapshots (§12.23).
 3. **How the bot that proposes bumps is run is the owner's choice.** The repository ships an example configuration, nothing more.
 4. **The `validate` check is meant to be required only for changes touching the Talos CRs,** so that it does not stand in the way of unrelated automation.
