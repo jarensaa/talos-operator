@@ -1201,7 +1201,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		// Only what is there is looked at, never what it says: a log is not for a public CI log.
 		for _, key := range []string{"failure.txt", "services.txt", "machined.log.gz", "kubelet.log.gz", "dmesg.log.gz"} {
-			Expect(len(bundle.Data[key])).To(BeNumerically(">", 0), "the bundle has no %s", key)
+			Expect(bundle.Data[key]).NotTo(BeEmpty(), "the bundle has no %s", key)
 		}
 
 		_, hasEtcd := bundle.Data["etcd.log.gz"]

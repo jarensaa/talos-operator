@@ -45,13 +45,15 @@ func TestPlanDefragment(t *testing.T) {
 		members []DefragMember
 		due     bool
 	}{
-		"half of it is in use":           {[]DefragMember{member("a", 400, 201, true)}, false},
-		"exactly half is free":           {[]DefragMember{member("a", 400, 200, true)}, true},
-		"too small to bother":            {[]DefragMember{member("a", 99, 1, true)}, false},
-		"just large enough":              {[]DefragMember{member("a", 100, 1, true)}, true},
-		"sizes not read":                 {[]DefragMember{{Name: "a", Leader: true}}, false},
-		"numbers that cannot be":         {[]DefragMember{member("a", 400, 500, true)}, false},
-		"one of three is fragmented":     {[]DefragMember{member("a", 400, 390, true), member("b", 400, 100, false), member("c", 400, 390, false)}, true},
+		"half of it is in use":   {[]DefragMember{member("a", 400, 201, true)}, false},
+		"exactly half is free":   {[]DefragMember{member("a", 400, 200, true)}, true},
+		"too small to bother":    {[]DefragMember{member("a", 99, 1, true)}, false},
+		"just large enough":      {[]DefragMember{member("a", 100, 1, true)}, true},
+		"sizes not read":         {[]DefragMember{{Name: "a", Leader: true}}, false},
+		"numbers that cannot be": {[]DefragMember{member("a", 400, 500, true)}, false},
+		"one of three is fragmented": {
+			[]DefragMember{member("a", 400, 390, true), member("b", 400, 100, false), member("c", 400, 390, false)}, true,
+		},
 		"none of three is":               {[]DefragMember{member("a", 400, 390, true), member("b", 400, 380, false)}, false},
 		"an empty database of no member": {nil, false},
 	} {
@@ -85,11 +87,17 @@ func TestPlanDefragment(t *testing.T) {
 		got    Defragment
 		reason string
 	}{
-		"paused":             {blocked(func(s *DefragSettings) { s.Paused = true }, passOf("a", "b", "c"), fragmented), BlockPaused},
-		"outside its window": {blocked(func(s *DefragSettings) { s.Policy.OutsideWindow = "opens at 02:00" }, passOf("a", "b", "c"), fragmented), BlockOutsideWindow},
+		"paused": {blocked(func(s *DefragSettings) { s.Paused = true }, passOf("a", "b", "c"), fragmented), BlockPaused},
+		"outside its window": {
+			blocked(func(s *DefragSettings) { s.Policy.OutsideWindow = "opens at 02:00" }, passOf("a", "b", "c"), fragmented),
+			BlockOutsideWindow,
+		},
 		"a member unhealthy": {blocked(nil, sick, fragmented), BlockGateClosed},
-		"a user's gate":      {blocked(func(s *DefragSettings) { s.Policy.GateClosed = "storage is rebuilding" }, passOf("a", "b", "c"), fragmented), BlockGateClosed},
-		"a member not read":  {blocked(nil, passOf("a", "b", "c"), unread), BlockNotCurrent},
+		"a user's gate": {
+			blocked(func(s *DefragSettings) { s.Policy.GateClosed = "storage is rebuilding" }, passOf("a", "b", "c"), fragmented),
+			BlockGateClosed,
+		},
+		"a member not read": {blocked(nil, passOf("a", "b", "c"), unread), BlockNotCurrent},
 		"defragmented an hour ago": {
 			blocked(func(s *DefragSettings) { s.Last = now.Add(-time.Hour) }, passOf("a", "b", "c"), fragmented), BlockTooSoon,
 		},
@@ -99,8 +107,9 @@ func TestPlanDefragment(t *testing.T) {
 		}
 	}
 
-	if got := blocked(func(s *DefragSettings) { s.Last = now.Add(-DefaultDefragmentInterval) }, passOf("a", "b", "c"), fragmented); !got.MayStart() {
-		t.Errorf("a day later it is due again: %+v", got)
+	aDayLater := blocked(func(s *DefragSettings) { s.Last = now.Add(-DefaultDefragmentInterval) }, passOf("a", "b", "c"), fragmented)
+	if !aDayLater.MayStart() {
+		t.Errorf("a day later it is due again: %+v", aDayLater)
 	}
 }
 

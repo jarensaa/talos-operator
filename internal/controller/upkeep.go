@@ -257,7 +257,8 @@ func reportDefragmentation(tc *talosv1alpha1.TalosCluster, obs observation, note
 
 	st.Phase = talosv1alpha1.ClusterPhaseManaged
 
-	setCondition(st, gen, talosv1alpha1.ConditionEtcdMaintained, metav1.ConditionFalse, talosv1alpha1.ReasonDefragmenting, progressOf(op, note))
+	setCondition(st, gen, talosv1alpha1.ConditionEtcdMaintained, metav1.ConditionFalse, talosv1alpha1.ReasonDefragmenting,
+		progressOf(op, note))
 	reportHeld(tc, obs.policy, "a member that was defragmented is still verified, no other member is defragmented")
 }
 
@@ -266,23 +267,25 @@ func (r *TalosClusterReconciler) continueDefragment(ctx context.Context, tc *tal
 ) (string, error) {
 	op := tc.Status.Operation
 
-	begin := func(name string, attempt int32) error {
+	begin := func(name string, attempt int32) {
 		// A control plane that left the cluster since the plan was made has no member any more.
 		if machineNamed(machines, name) == nil {
 			skipped(op, name)
 
-			return nil
+			return
 		}
 
 		op.Current = &talosv1alpha1.OperationStep{
 			Machine: name, Step: plan.StepDefragmenting, Attempt: attempt, Since: metav1.NewTime(r.now()),
 		}
-
-		return nil
 	}
 
 	return r.drive(ctx, tc, obs, timing, turns{
-		begin: begin,
+		begin: func(name string, attempt int32) error {
+			begin(name, attempt)
+
+			return nil
+		},
 		step: func() (string, error) {
 			return r.defragStep(ctx, tc, obs, machines, timing)
 		},
@@ -304,7 +307,7 @@ func (r *TalosClusterReconciler) continueDefragment(ctx context.Context, tc *tal
 				// Defragmenting a member twice does no harm: the turn starts over.
 				op.Failure, op.Current = nil, nil
 
-				return begin(f.Machine, attempt)
+				begin(f.Machine, attempt)
 			}
 
 			return nil
