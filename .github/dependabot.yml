@@ -1,0 +1,78 @@
+# Dependabot proposes the bumps of what this repository is built from. It runs weekly, waits a few
+# days after a release before proposing it, and groups what has to move together, so that a week
+# is a handful of pull requests. Nothing is merged by itself.
+#
+# The commit prefix decides whether a merged bump is released (CLAUDE.md, "Releases are
+# automatic"): Go modules are compiled into the operator, so they are a fix; everything else
+# builds, tests or releases it, and releases nothing.
+version: 2
+
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 5
+    commit-message:
+      prefix: fix
+      include: scope
+    groups:
+      # What the operator knows about Talos and Kubernetes is compiled in from these: which
+      # Kubernetes a Talos release runs, which steps an upgrade may take, what a Kubernetes
+      # release removed (docs/scope.md §7.5). Their patch releases are how that stays current.
+      # go-kubernetes requires a machinery of its own, so they move together. A new minor of
+      # machinery is a new Talos to support, which is work and not a bump: it comes alone.
+      talos:
+        patterns:
+          - github.com/siderolabs/*
+          - github.com/cosi-project/*
+        update-types:
+          - patch
+      # client-go, api, apimachinery and controller-runtime are built against each other.
+      kubernetes:
+        patterns:
+          - k8s.io/*
+          - sigs.k8s.io/*
+      other:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - github.com/siderolabs/*
+          - github.com/cosi-project/*
+
+  - package-ecosystem: github-actions
+    # "/" is the workflows; the composite actions are named, each with an action.yml of its own.
+    directories:
+      - /
+      - /.github/actions/setup-go
+      - /.github/actions/save-go-cache
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 5
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # The release tooling (semantic-release). All of it is devDependencies.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      release-tooling:
+        patterns:
+          - "*"
