@@ -27,6 +27,12 @@ while read -r _ local_sha _ _; do
 done
 "$pushes" || exit 0
 
+# What is pushed will be merged as it is, and releases are decided from its commit messages.
+if git rev-parse --verify --quiet origin/main >/dev/null; then
+  step "commit messages"
+  hack/release/commits.sh origin/main || fail "reword those commits before they are pushed"
+fi
+
 step "modules, generated files and formatting"
 regenerate
 stale=$(git diff --name-only HEAD -- "${generated_paths[@]}")
