@@ -300,6 +300,33 @@ func scenarios() []scenario {
 			}},
 		},
 		{
+			// A machine that is declared and has not joined is not a node that cannot be read, and
+			// not a control plane that is missing from etcd. Neither is one that has left.
+			name: "a control plane that waits to be added, and a worker that has left",
+			change: func(f *fixture) {
+				notAMember := func(tm *talosv1alpha1.TalosMachine) {
+					set(&tm.Status.Conditions, condition(talosv1alpha1.ConditionNodeObserved, metav1.ConditionFalse, talosv1alpha1.ReasonNotAMember))
+					set(&tm.Status.Conditions,
+						condition(talosv1alpha1.ConditionConfigMatchesLive, metav1.ConditionUnknown, talosv1alpha1.ReasonNotAMember))
+					set(&tm.Status.Conditions, condition(talosv1alpha1.ConditionMatched, metav1.ConditionFalse, talosv1alpha1.ReasonNotAMember))
+					tm.Status.Talos.Ready = false
+				}
+
+				waiting := f.machine("node-c")
+				notAMember(waiting)
+				waiting.Status.JoinedAt, waiting.Status.Etcd = nil, nil
+				set(&waiting.Status.Conditions, condition(talosv1alpha1.ConditionProvisionable, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded))
+
+				left := f.machine("node-d")
+				notAMember(left)
+				left.Status.RemovedAt = &epoch
+				left.Spec.DesiredState = talosv1alpha1.DesiredStateRemoved
+
+				f.cluster.Status.Observed.EtcdMembers = f.cluster.Status.Observed.EtcdMembers[:2]
+				f.is(talosv1alpha1.ConditionMembershipCurrent, metav1.ConditionFalse, talosv1alpha1.ReasonAwaitingMachine)
+			},
+		},
+		{
 			name: "a control plane that stays a learner",
 			change: func(f *fixture) {
 				f.machine("node-c").Status.Etcd.IsLearner = true

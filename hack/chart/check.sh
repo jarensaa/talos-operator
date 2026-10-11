@@ -59,6 +59,14 @@ grep -qx talos-operator-upgrade-checks <<<"$default" || fail "the upgrade checks
 diff <(rules talos-operator-upgrade-checks) <(yq -o json -I0 '.rules' "$chart/files/upgrade-check-rules.yaml") >/dev/null ||
   fail "the upgrade checks' ClusterRole does not carry files/upgrade-check-rules.yaml"
 
+# The generated role is bound in the release's namespace, where its rules about Nodes and pods
+# mean nothing: what the operator does to them cluster-wide has to be granted here, by hand.
+for role in node-reader node-drainer node-remover; do
+  grep -qx "talos-operator-$role" <<<"$default" || fail "the ClusterRole $role is not bound"
+done
+[ "$(rules talos-operator-node-remover)" = '[{"apiGroups":[""],"resources":["nodes"],"verbs":["delete"]}]' ] ||
+  fail "removing a machine deletes its Node, and the operator deletes nothing else"
+
 ! grep -q gates <<<"$default" || fail "no gate is granted anything by default"
 grep -qx talos-operator-gates <<<"$gated" || fail "gates.rules must be bound to the operator"
 [ "$(rules talos-operator-gates --set "$gate")" = '[{"apiGroups":["ceph.rook.io"],"resources":["cephclusters"],"verbs":["get"]}]' ] ||

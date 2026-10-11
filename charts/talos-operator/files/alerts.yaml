@@ -147,7 +147,7 @@ groups:
       - alert: TalosMachineNotObserved
         expr: >-
           max by (namespace, taloscluster, machine) (
-            talos_operator_machine_condition{condition="NodeObserved", status!="True"}
+            talos_operator_machine_condition{condition="NodeObserved", status!="True", reason!="NotAMember"}
           ) == 1
         for: 10m
         labels:

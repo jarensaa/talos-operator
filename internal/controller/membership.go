@@ -472,8 +472,8 @@ func reportMembership(tc *talosv1alpha1.TalosCluster, obs observation, all []tal
 	switch {
 	case obs.facts == nil:
 	case len(leaving)+len(waiting) == 0:
-		current(metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded, "all %d machines that are declared are members, and no member is to be removed",
-			len(members(all)))
+		current(metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded,
+			"all %d machines that are declared are members, and no member is to be removed", len(members(all)))
 	case !membershipEnabled(tc):
 		current(metav1.ConditionFalse, talosv1alpha1.ReasonMembershipDisabled,
 			"%s are not members and %s are to be removed; set spec.management.membership to Enabled to add and remove machines",
@@ -1074,7 +1074,8 @@ func (r *TalosClusterReconciler) wiped(ctx context.Context, tc *talosv1alpha1.Ta
 }
 
 // removalKubernetes reads the machine's Node and, while it is being drained, the pods on it.
-func (r *TalosClusterReconciler) removalKubernetes(ctx context.Context, name string, cur *talosv1alpha1.OperationStep, node *plan.RemovalNode,
+func (r *TalosClusterReconciler) removalKubernetes(ctx context.Context, name string, cur *talosv1alpha1.OperationStep,
+	node *plan.RemovalNode,
 ) (*corev1.Node, []corev1.Pod, error) {
 	if name == "" {
 		// A machine that was never known under a name has no Node to speak of.

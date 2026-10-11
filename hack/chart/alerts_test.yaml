@@ -2977,6 +2977,147 @@ tests:
     exp_alerts: []
   - alertname: TalosControlPlaneNotEtcdVoter
     eval_time: 2h
+    exp_alerts: []
+  input_series:
+  - series: talos_operator_cluster_approval_pending{namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_cluster_condition{condition="ConfigInSync",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_condition{condition="CredentialsValid",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_condition{condition="Healthy",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_condition{condition="MembershipCurrent",namespace="talos-operator",reason="AwaitingMachine",status="False",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_condition{condition="TalosAPIReachable",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_condition{condition="VersionsReachable",namespace="talos-operator",reason="UpToDate",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_etcd_members{namespace="talos-operator",role="learner",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_cluster_etcd_members{namespace="talos-operator",role="voter",taloscluster="my-cluster"}
+    values: 2x120
+  - series: talos_operator_cluster_observed_timestamp_seconds{namespace="talos-operator",taloscluster="my-cluster"}
+    values: 0+60x120
+  - series: talos_operator_cluster_operation_halted{namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_cluster_operation_in_progress{namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_cluster_phase{namespace="talos-operator",phase="Managed",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_version_info{component="kubernetes",desired="1.37.1",namespace="talos-operator",running="1.37.1",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_version_info{component="talos",desired="v1.14.2",namespace="talos-operator",running="v1.14.2",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_cluster_version_plan_steps{namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_info{revision="000000000000",version="v0.0.0"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="ConfigMatchesLive",machine="node-a",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="ConfigMatchesLive",machine="node-b",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="ConfigMatchesLive",machine="node-c",namespace="talos-operator",reason="NotAMember",status="Unknown",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="ConfigMatchesLive",machine="node-d",namespace="talos-operator",reason="NotAMember",status="Unknown",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="Matched",machine="node-c",namespace="talos-operator",reason="NotAMember",status="False",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="Matched",machine="node-d",namespace="talos-operator",reason="NotAMember",status="False",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="NodeObserved",machine="node-a",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="NodeObserved",machine="node-b",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="NodeObserved",machine="node-c",namespace="talos-operator",reason="NotAMember",status="False",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="NodeObserved",machine="node-d",namespace="talos-operator",reason="NotAMember",status="False",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_condition{condition="Provisionable",machine="node-c",namespace="talos-operator",reason="Succeeded",status="True",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_etcd_member{machine="node-a",namespace="talos-operator",role="learner",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_machine_etcd_member{machine="node-a",namespace="talos-operator",role="voter",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_etcd_member{machine="node-b",namespace="talos-operator",role="learner",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_machine_etcd_member{machine="node-b",namespace="talos-operator",role="voter",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_hold{machine="node-a",namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_machine_hold{machine="node-b",namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_machine_hold{machine="node-c",namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_machine_hold{machine="node-d",namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_machine_info{kubelet_version="1.37.1",machine="node-a",namespace="talos-operator",node="node-a",pool="control-planes",role="ControlPlane",schematic="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",talos_version="v1.14.2",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_info{kubelet_version="1.37.1",machine="node-b",namespace="talos-operator",node="node-b",pool="control-planes",role="ControlPlane",schematic="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",talos_version="v1.14.2",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_info{kubelet_version="1.37.1",machine="node-c",namespace="talos-operator",node="node-c",pool="control-planes",role="ControlPlane",schematic="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",talos_version="v1.14.2",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_info{kubelet_version="1.37.1",machine="node-d",namespace="talos-operator",node="node-d",pool="workers",role="Worker",schematic="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",talos_version="v1.14.2",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_phase{machine="node-a",namespace="talos-operator",phase="Ready",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_phase{machine="node-b",namespace="talos-operator",phase="Ready",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_phase{machine="node-c",namespace="talos-operator",phase="Ready",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_phase{machine="node-d",namespace="talos-operator",phase="Ready",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_ready{machine="node-a",namespace="talos-operator",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_ready{machine="node-b",namespace="talos-operator",taloscluster="my-cluster"}
+    values: 1x120
+  - series: talos_operator_machine_ready{machine="node-c",namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_machine_ready{machine="node-d",namespace="talos-operator",taloscluster="my-cluster"}
+    values: "0x120"
+  - series: talos_operator_state_read_errors_total{}
+    values: "0x120"
+  interval: 1m
+  name: a control plane that waits to be added, and a worker that has left
+- alert_rule_test:
+  - alertname: TalosOperatorDown
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosOperatorCannotReadState
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosClusterNotObserved
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosOperationHalted
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosRolloutBlocked
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosConfigDrift
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosNodeWithoutMachine
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosVersionsUnreachable
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosAPIUnreachable
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosClusterUnhealthy
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosMachineNotObserved
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosMachineNotReady
+    eval_time: 2h
+    exp_alerts: []
+  - alertname: TalosControlPlaneNotEtcdVoter
+    eval_time: 2h
     exp_alerts:
     - exp_annotations:
         description: 'The control plane node-c of my-cluster has not been a voting

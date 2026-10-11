@@ -229,7 +229,8 @@ func TestRemoverSendsTheResetOfARemovalAndNothingElse(t *testing.T) {
 	}
 
 	// The connection lets no other reset through, whoever builds the request.
-	if err := c.ResetGeneric(client.WithNode(ctx, apiNode.String()), &machineapi.ResetRequest{Graceful: true, Reboot: true}); status.Code(err) != codes.PermissionDenied {
+	whole := &machineapi.ResetRequest{Graceful: true, Reboot: true}
+	if err := c.ResetGeneric(client.WithNode(ctx, apiNode.String()), whole); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("a reset of the whole system disk must be refused, got %v", err)
 	}
 
