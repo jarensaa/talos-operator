@@ -63,7 +63,7 @@ A Kubernetes operator that manages Talos Linux clusters declaratively through CR
 
 **The design source of truth is [docs/scope.md](docs/scope.md).** Read the relevant section before implementing anything. If the implementation needs to diverge from it, update the doc in the same change.
 
-Milestones M0–M9 are tracked as beads epics; run `bd ready` for unblocked work.
+Milestones are tracked as beads epics; run `bd ready` for unblocked work. What is left is in docs/scope.md §10: M10b, M11, and PKI rotation for later. Bootstrapping a cluster and the rest of the old M9 are out of scope (§12.26).
 
 ## This repository is public
 
