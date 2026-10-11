@@ -1217,7 +1217,9 @@ Built with M6: §7.5 describes it. What the earlier plan had here and M6 left ou
 
 ### 14.5 Version bump automation
 
-Built with M6 as far as it is the operator's: the `validate` command (§7.5) and, in `docs/examples`, a Renovate configuration and a workflow that runs the check. Not built: a `render` command that prints machine configs from the manifests and a secrets bundle, for rebuilding a cluster by hand.
+Built with M6 as far as it is the operator's: the `validate` command (§7.5) and, in `docs/examples`, a Renovate configuration and a workflow that runs the check.
+
+Out of scope: a `render` command that prints machine configs from the manifests and a secrets bundle, for rebuilding a cluster by hand. A cluster that is lost is rebuilt with fresh PKI from its owner's own runbook (§1, §12.7), so configs rendered with the old bundle are not what a rebuild needs, and their output would be a secret to handle outside the cluster.
 
 One conflict to watch for where the check is a required one: automation that commits straight to the main branch, such as an image update bot, is blocked by it unless the rule is scoped to the paths that hold the cluster's manifests.
 
