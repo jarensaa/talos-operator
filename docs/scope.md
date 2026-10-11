@@ -242,7 +242,7 @@ spec:
 
 status:
   phase: Adopting | Adopted | Managed | Degraded   # only moves forward (§12.14)
-  conditions:                         # ResourcesDerived, ConfigProven, ConfigHandover, ConfigInSync, TalosUpToDate, KubernetesUpToDate, Healthy, RolloutBlocked, ...
+  conditions:                         # ResourcesDerived, ConfigProven, ConfigHandover, ConfigInSync, TalosUpToDate, KubernetesUpToDate, VersionsReachable, Healthy, RolloutBlocked, ...
   observed:
     talosVersions: { v1.14.0: 3 }
     kubernetesVersion: 1.37.0
@@ -281,6 +281,11 @@ status:
   abortedTargets: {}                  # what an aborted rollout was applying; not started again (§8.3)
   upgrades: { skipped: {}, aborted: {}, kubernetes: "" }   # machine -> installer image a human took out of an upgrade (§7.3);
                                       #   the Kubernetes version whose upgrade a human aborted (§7.4)
+  versions:                           # what runs, what exists upstream, and the way to what the spec asks for (§7.5)
+    talos: v1.14.1
+    kubernetes: 1.36.5
+    plan: [ { kind: Talos, from: v1.14.1, to: v1.14.2 }, { kind: Kubernetes, from: 1.36.5, to: 1.37.1 } ]
+    available: { talos: [v1.14.2], kubernetes: [1.36.5, 1.37.1], problem: "" }
   history: []                         # the last 10 operations: outcome Succeeded | Aborted | Superseded
 ```
 
@@ -705,18 +710,42 @@ Windows and gates hold a Kubernetes upgrade as they hold every operation (§6.4)
 
 **Not done, by decision (§12.20):** the manifests Talos applies when a cluster is bootstrapped (kube-proxy, CoreDNS, their RBAC). Talos applies them once and never again, and on an adopted cluster they have often been changed or replaced since. The upgrade does bring the kube-proxy image of each control plane's config in line, as talosctl does, so that the manifest Talos would apply names the cluster's version; that changes nothing that runs. A kube-proxy DaemonSet that is left behind the cluster's version is named in `KubernetesUpToDate`.
 
-### 7.5 Automatic upgrades (R2)
+### 7.5 Version awareness (R2)
 
-Decision (§12): layer 1 only for v1. Layer 2 is M9 stretch.
+A version change in the spec is rolled out by the upgrades of §7.3 and §7.4, inside the maintenance windows and behind the gates of §6.4. With a bot that proposes version bumps to the repository holding the spec, upgrades happen without anyone picking versions, and Git stays what says which versions a cluster runs. This section is what makes that safe to leave alone: knowing which versions exist, working out the way to the ones asked for, and refusing a bump that cannot work, before it reaches the cluster and again when it does.
 
-1. **Declarative auto-rollout (core, always on).** Any version change in the spec is rolled out automatically, within maintenance windows and behind the gates. Combined with **Renovate on the Flux repo** bumping `versions.talos` and `versions.kubernetes`, this gives automatic upgrades while Git stays the source of truth. This is the recommended route.
-2. **Operator-driven version tracking (optional).** With `autoUpgrade.<x>.policy: Patch|Minor`, the operator polls the Image Factory `/versions` endpoint (Talos) and the dl.k8s.io stable channels (Kubernetes). It picks the highest allowed version that passes the compatibility matrix and the operator's supported range, and writes it into **`status.autoUpgrade.target`**, not the spec. The effective target is `max(spec, status.autoUpgrade.target)`. Status is reported. Downside: the cluster diverges from Git.
+Implemented in `internal/plan/versions.go` (the way), `internal/catalog` (what exists upstream), `internal/controller/versions.go` (status) and `internal/validate` with `cmd/validate.go` (the check).
 
-Both layers share:
-- maintenance windows;
-- a Talos upgrade and a Kubernetes upgrade never run concurrently (the single disruption lock);
-- Talos goes first when the new Kubernetes version needs it, and Kubernetes goes first when the new Talos version drops support for the current one;
-- fail-closed: after a failed rollout, nothing automatic happens until a human acks (§8.3).
+**The way** (`plan.PlanVersions`). From the versions a cluster runs to the versions its spec asks for, as a sequence of upgrades, or the reason there is none. Talos and Kubernetes take turns as their versions allow: a Talos version is only installed while it runs the Kubernetes version the cluster has then, and a Kubernetes version only reached, one minor at a time, while the nodes' Talos runs it. Where both could go next, Talos does. The planner starts nothing. Each upgrade still decides for itself whether it may start, by the same rules, which are Talos's own (`compatibility`); the plan is that answer worked out ahead.
+
+**Status** (`status.versions`, condition `VersionsReachable`). What the cluster runs, the plan, and what exists upstream. `VersionsReachable` is false, with the reason, when the spec asks for versions there is no way to: a Talos release that does not run the Kubernetes version asked for, a downgrade, a jump Talos does not make.
+
+**What goes together is compiled in.** Which Kubernetes a Talos release runs, which steps each allows, and what a Kubernetes release removed (flags, feature gates, admission plugins, APIs) are the rules of `machinery`'s `compatibility` package and of go-kubernetes's upgrade checks, the ones `talosctl` uses. They are Sidero's to keep and reach the operator by a dependency bump; the operator keeps no matrix of its own beside them, which would only ever be the same rules, later. An operator therefore knows nothing of a Talos minor newer than the one it was built for, and says so.
+
+**What exists upstream** (`catalog`) is the one thing no build can know: which releases are out, and whether Image Factory builds an installer for this cluster's schematic. Only where `versionSources.enabled` switches it on (§12.22), the operator asks, over HTTPS and nothing else, and only asks:
+- the Image Factory a TalosCluster's installer names: which Talos releases it builds, whether it has the schematic, whether the release has every extension the schematic names (extensions come and go between releases), and whether it builds the installer;
+- the Kubernetes release site: the newest patch release of a minor;
+- the registries of the images a Kubernetes upgrade is about to pull: whether each exists, asked the way a node asks when it pulls, without credentials.
+
+These are other people's services, run for everyone, so they are asked as rarely as is of use: an answer is kept for six hours, a "no" and a failure for ten minutes, and every request says who is asking (`catalog.UserAgent`). All of it is the documented public API of Image Factory and of a registry. None of the services publishes terms that forbid it, and two publish none at all; §12.22 has what was looked for. Upstream is never asked while an operation is in flight, and the planners take what is known from status, not from the network: every replica plans with the same releases, and an operation is not replanned because a release came out.
+
+What is found out is used for exactly three things:
+1. `status.versions.available` lists the newest release of each Talos minor this operator supports, and of each Kubernetes minor those run. It is information. Nothing is upgraded because of it; the operator changing the version it is asked for is not built (M9).
+2. A Kubernetes upgrade over several minors goes through the newest release known of each minor in between; where none is known it goes through `.0` (§12.21). A hop that was begun is finished at the release it was begun with.
+3. An upgrade to something that certainly does not exist is refused before a node is asked to pull it (`Incompatible`): an installer Image Factory does not build, an image of a Kubernetes component that its registry does not have. The images are asked about, not the release: the kubelet image Talos runs is published a while after the Kubernetes release it is of.
+
+Every answer has three values, and "not known" is neither yes nor no. A source that is down, a registry that wants credentials, or an operator that was not told to ask, refuses nothing and reports nothing: what a node can pull is for the node to find out, through its own registry configuration (§7.3).
+
+**The check** (`manager validate`). The same binary, run on the manifests in a repository, with no cluster and no secret:
+- the versions go together, are ones this operator upgrades to, and, given the manifests as they were before the change (`--base`), can be reached from there: no downgrade, no jump Talos does not make;
+- the installer of the cluster and of every pool with a schematic of its own exists, and so do the images of the Kubernetes components that the rendered configs name. Here "not known" is a failure: a check that passes because a site was down is not one to rely on;
+- maintenance windows and gate expressions can be understood, which the API server does not check;
+- every machine's config renders, with secrets made up for the purpose. A machine whose config comes partly from a Secret is not rendered, and is named;
+- a field the API does not have is an error, where the API server would drop it without a word.
+
+It exits 1 when something is wrong and prints what; on GitHub Actions each problem is also an annotation, and the run's summary lists the upgrades the change means. It checks the change against the base branch, which is not what the cluster runs: an earlier bump may still be waiting for its window. It is a filter before a merge. The operator plans again from what the nodes run, and has the last word. `docs/examples` has a workflow that runs it on pull requests and a Renovate configuration that proposes the bumps.
+
+**What decides the order of things** stays as it was: one operation at a time (§8.1), a failed operation halts until a human acts (§8.3), and nothing starts outside a window.
 
 ### 7.6 Expanding the cluster (R4)
 
@@ -921,6 +950,7 @@ Task beads under a milestone are cut when the milestone starts, for the same rea
 | **M4b Talos upgrades** | A version or installer change takes every node there, one at a time: installed, drained, rebooted, verified; the operator upgrades the nodes it runs on; the config that names the installer follows (§7.3) | v0.7.0 |
 | **M4c Rollout policy** | Maintenance windows, gates on objects in the cluster, and hook Jobs around an operation and around each node, for every kind of operation (§6.4) | v0.8.0 |
 | **M5 Kubernetes upgrades** | A version change takes the components Talos runs there, one component on one node at a time, every API server first, a minor at a time; refused up front when the nodes' Talos does not run the version or when it would strand a flag or an object (§7.4) | v0.8.0 |
+| **M6 Version awareness** | Status plans the upgrades to what the spec asks for and, where the operator is told to ask upstream, says which Talos and Kubernetes releases exist; an upgrade to an installer or image that does not exist is then refused before a node pulls; a `validate` command checks a repository's manifests before they are merged; an example bot configuration (§7.5) | v0.9.0 |
 
 ### What every remaining milestone builds on
 
@@ -939,23 +969,17 @@ It is postponed on purpose (decided 2026-10-10). While no cluster depends on the
 | M2, M3 | Adoption, `config: Manage`, and one harmless config change. |
 | M4 | A Talos patch release, inside a maintenance window and behind a gate on the cluster's storage, with a hook around each node. |
 | M5 | A Kubernetes minor release. |
+| M6 | A version bump proposed by a bot, checked by `validate` in the repository that holds the spec, merged, and rolled out inside a window. |
 
-### M4 and M5, as delivered
+### M4 to M6, as delivered
 
-§6.4, §7.3 and §7.4 describe the rollout policy, Talos upgrades and Kubernetes upgrades as built.
+§6.4, §7.3, §7.4 and §7.5 describe the rollout policy, Talos upgrades, Kubernetes upgrades and version awareness as built.
 
 - **Shown on QEMU:** a Talos patch upgrade of every node with a workload kept up behind a disruption budget; the operator upgrading the nodes it runs on and carrying on; the leader killed in the middle of a config rollout; a rollout held back outside its window and behind a gate, with hooks run as Jobs around it and around each node; a Kubernetes minor upgrade, API server restarts included, refused first while a kubelet was started with a flag the new version removed, with the config change that took the flag out going through meanwhile.
 - **Shown against the fake only:** a node that falls back to its previous boot, a drain a budget never allows, an image that cannot be pulled, a Kubernetes component that does not come up, a hook that fails or does not finish; each halting with the node as the failure left it and resuming on retry. Also a Kubernetes version the nodes' Talos does not run, one more than a minor away, and objects of an API the new version stops serving: an API server does not serve a stand-in for such an API, and the real ones are alpha APIs a cluster has to be started with.
+- **Shown for M6:** on QEMU, status listing what really exists upstream, the resources of an adopted cluster passing `validate` against the real Image Factory and registries and failing it for a schematic that does not exist, and a Talos bump held to its maintenance window. Against a fake upstream: an installer and an image that do not exist refused before a node is touched, a hop through the newest release of a minor, and a source that is down refusing nothing. The example Renovate configuration has not been run.
 - **Out of M5:** anything Talos does not run itself (CNI, CSI, workloads), the manifests it applies at bootstrap (§12.20), and rolling a Kubernetes upgrade back. A failed upgrade halts and is fixed forward; the one component that was being changed goes back by itself.
 - **Not built in M4:** more than one worker at a time, a rollback to the previous boot slot on request (§12.19), and reinstalling a node for a change only an install can make, which stays refused (`RequiresReinstall`) and belongs with replacing machines (M8).
-
-### M6 Version awareness and automatic upgrades
-
-Status says which versions exist and which sequence of upgrades leads to them. A version bump that cannot work is refused before it reaches the cluster, by a check that runs in CI, and again by the operator. With a bot proposing bumps to the repository that holds the spec, upgrades happen without anyone picking versions.
-- In: working out the order of Talos and Kubernetes steps; the check as a command; reporting what is available; an example bot configuration.
-- Out: the operator changing the desired version by itself (M9). Requiring Git or Flux: the check and the bot configuration are optional tooling around an operator that still only acts on its objects (§12.9).
-- **Done when:** a bump whose prerequisite step has not landed is rejected with the reason; a valid one rolls out inside the window and not outside it; the check fails a pull request that names an installer which does not exist.
-- Needs M4 and M5.
 
 ### M7 Adding machines
 
@@ -1006,9 +1030,8 @@ Two of these have a reason to be promoted: PKI rotation, because adoption leaves
 
 1. The real cluster, when its owner decides the API has settled enough to depend on.
 2. M10a and M11a: small, independent, and wanted before upgrades touch a real control plane.
-3. M6.
-4. M7, then M8.
-5. M10b, M11b, and whatever of M9 has earned it.
+3. M7, then M8.
+4. M10b, M11b, and whatever of M9 has earned it.
 
 R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7.
 
@@ -1085,6 +1108,7 @@ Decided 2026-10-08:
 19. **One node at a time, and no rollback on request** (decided 2026-10-10, with M4c). Several workers at once would make an upgrade of a large cluster faster, and would need a budget for how many, an order among those in flight, and an answer for one of them failing while the others are half way. Nothing the operator is used for yet has enough workers to pay for that. Rolling a node back to its previous boot slot by annotation (`MachineService.Rollback`) would be a fourth kind of Talos access for a case Talos already handles where it matters: a system that does not come up falls back by itself (§8.5.2). A system that comes up and is wrong is taken back by asking for the previous version, which is a downgrade and refused (§12.17); that refusal is the thing to revisit if the need shows up, not a side door around it.
 20. **The manifests Talos applies at bootstrap are nobody's** (decided 2026-10-10, with M5). Talos applies kube-proxy, CoreDNS and their RBAC when a cluster is bootstrapped and never again (`T/internal/app/machined/pkg/controllers/k8s/manifest_apply.go`); `talosctl upgrade-k8s` re-applies them, with force as an option. On an adopted cluster they have often been edited, replaced by a CNI's own proxy, or put under GitOps since, and applying them would take cluster-admin rights and make the operator a second owner of objects in `kube-system`. So a Kubernetes upgrade changes a node's config and nothing else. That includes the kube-proxy image a control plane's config names: it belongs to the version, and a config that named another would have Talos apply the wrong kube-proxy wherever it does apply that manifest. Nothing runs from it. A kube-proxy DaemonSet that a Kubernetes upgrade left behind is named in `KubernetesUpToDate`: kube-proxy may be older than the API server, not newer, so being left behind is safe for a while and never silent.
 21. **A Kubernetes upgrade applies its own configs, and a larger jump goes through `.0`** (decided 2026-10-10, with M5). `talosctl upgrade-k8s` patches each node's config component by component; an operator that owns the config has to do the same itself, or the two would fight (§3.8). The patch is taken from the node's live config, not from the rendered one, so that the upgrade changes one image and leaves every other difference to the config rollout that owns it. The config rollout in turn leaves the images alone: it applies the rendered config with the images the node has. An earlier cut blocked a rollout whenever an image differed, and so a refused upgrade blocked the removal of the very flag it was refused for. Each patched config is tried and confirmed like any other change, which upstream does not do: a component that does not come up goes back to its previous image without anyone reaching the node. Kubernetes does not skip minors, so a spec that is further away is reached through the first release of each minor in between. The operator knows no newer release of those minors without asking the network, which is M6's business; until then, `.0` is the one version of a minor that is sure to exist.
+22. **The operator may ask upstream what exists, only that, and only when told to** (decided 2026-10-11, with M6). Knowing which releases exist is what turns "the image could not be pulled" on the first node into a refusal before any node, and what lets a hop over several Kubernetes minors use a release with its fixes. The price is that the operator talks to something other than its cluster, and to services that are not this project's. How others do it: Omni lists the releases of Image Factory and scans a registry for Kubernetes tags every fifteen minutes, by default, and filters them with the compiled-in compatibility rules; OpenShift's version operator and the k3s upgrade controller ask an update service or a channel server; kubeadm asks the Kubernetes release site. Each of them asks a service its own project runs. tuppr, the one that like this operator is a third party to Talos, asks nothing: the version is what the resource says, a bot proposes it, and a release that does not exist fails at the pull. So asking is **off by default** (`versionSources.enabled`), and switching it on is the cluster owner's decision to use those services. Where it is on it is kept small: reads only, HTTPS only, a handful of requests every six hours, identified by a User-Agent, never during an operation. What it learns can refuse an upgrade and can choose a release on the way to the version asked for; it can never choose the version. The services asked are Image Factory, the Kubernetes release site and the registries the cluster's nodes pull from anyway. Image Factory's API reference documents the routes used as public; neither it nor the Kubernetes release site publishes terms for its use that were found, `registry.k8s.io` is a volunteer-run service that asks heavy users to mirror, and GitHub's acceptable use policy forbids burdening its servers by automation without naming a limit. Nothing was found that forbids these requests, and nothing that grants them either. The `validate` check asks the same services by default: it runs once for a pull request, beside the bot that proposed the change by asking them too. It is a subcommand of the operator's own binary, so that the image a cluster runs is the image that checks its manifests. **Not kept: a compatibility matrix of this project's own.** The rules (what runs what, which steps are allowed, what a release removed) are machinery's and go-kubernetes's, compiled in, and the removed kubelet flag the e2e uses is found by them. A table of the newest release of each minor, built in and refreshed by a bot, would let an operator that asks nothing go through a better release than `.0`; it is not built.
 
 ## 13. Prior art summary
 
@@ -1101,7 +1125,7 @@ Decided 2026-10-08:
 
 ## 14. Day-2 operations
 
-> **Not built.** This section is the earlier plan for M6, M10 and M11. §10 says what those milestones have to deliver, and leaves open some of what is decided here (whether cluster metrics are an operator feature, for one).
+> **Not built**, except §14.4 and §14.5. This section is the earlier plan for M6, M10 and M11. §10 says what those milestones have to deliver, and leaves open some of what is decided here (whether cluster metrics are an operator feature, for one).
 
 Beyond R1–R4, a self-managed cluster needs four things:
 - the ability to see what Talos is doing;
@@ -1186,92 +1210,16 @@ Scope:
 
 ### 14.4 Upgrade-path awareness
 
-**Rules.** One planner package (`internal/plan/versions`) is used by the operator **and** by the `validate` CLI (§14.5). It encodes:
-1. `compatibility.TalosVersion.UpgradeableFrom` (embedded machinery tables).
-2. `KubernetesVersion.SupportedWith(talos)` for every intermediate state.
-3. go-kubernetes `upgrade.Path.IsSupported` (Kubernetes: same minor, or +1 minor only).
-4. **Talos minors step +1 and land on that minor's latest patch.** This is the documented recommendation and is stricter than the tables, which allow 1.12→1.14.
+Built with M6: §7.5 describes it. What the earlier plan had here and M6 left out:
+- **Talos minors stepping one at a time, onto each minor's newest patch.** Talos's own tables allow more, and the operator follows the tables. Within the two minors this operator supports there is only one step to take.
+- **A richer `status.versions`**, with every release marked as supported or not and a recommended path that the spec does not ask for. Status lists what exists and plans what the spec asks for.
+- **The schematic as data**: declaring extensions and kernel arguments in the spec and letting the operator derive the schematic ID.
 
-Current tables (machinery v1.14.0 and v1.15.0-alpha.0):
+### 14.5 Version bump automation
 
-| Target Talos | Upgrade from host ≥ | Downgrade from host < | Kubernetes |
-|--------------|---------------------|-----------------------|------------|
-| 1.13 | 1.11.0 | 1.15.0 | 1.31–1.36 |
-| 1.14 | 1.12.0 | 1.16.0 | 1.32–1.37 |
-| 1.15 (alpha, may change) | 1.13.0 | 1.17.0 | 1.33–1.38 |
+Built with M6 as far as it is the operator's: the `validate` command (§7.5) and, in `docs/examples`, a Renovate configuration and a workflow that runs the check. Not built: a `render` command that prints machine configs from the manifests and a secrets bundle, for rebuilding a cluster by hand.
 
-**Planning.** The planner turns (observed state, desired spec) into an ordered list of `(talos, kubernetes)` hops in which every adjacent pair satisfies all four rules. That one mechanism solves ordering:
-- Talos goes first when the new Kubernetes version needs it.
-- Kubernetes goes first when the new Talos version raises the Kubernetes floor.
-- A spec that jumps several minors is executed through the intermediate latest patches.
-
-The full plan is published in status before anything starts.
-
-**Availability.** Every 6–12h, with caching (no auth, no documented rate limit), the operator polls:
-- factory `GET /versions`;
-- the stable Kubernetes releases (kubelet tags on `ghcr.io/siderolabs/kubelet`).
-
-It then publishes:
-
-```yaml
-status:
-  versions:
-    observed: { talos: v1.14.0, kubernetes: 1.37.0 }
-    available:
-      talos:      [ { version: v1.14.2, type: patch, supported: true } ]
-      kubernetes: [ { version: 1.37.1, type: patch, supported: true },
-                    { version: 1.38.0, type: minor, supported: false,
-                      reason: "Talos 1.14 supports Kubernetes < 1.38; requires Talos >= 1.15" } ]
-    recommendedPath: [ { talos: v1.14.2 }, { kubernetes: 1.37.1 } ]
-    specPlan: [ … ]                    # concrete hops for the current spec
-    lastChecked: …
-  conditions: [ UpgradeAvailable, SpecPathValid, InstallerAvailable, ExtensionsAvailable ]
-```
-
-**Pre-rollout checks against Image Factory:**
-- `HEAD /v2/<platform>-installer/<schematic>/manifests/<version>` must return 200; manifests are built lazily, so use a generous timeout.
-- The schematic's extensions must be a subset of `GET /version/<v>/extensions/official`. Extensions do appear and disappear between versions, e.g. `intel-hd-audio` exists in 1.14.2 but not in 1.14.0.
-
-**Schematic as data.** `POST /schematics` is content-addressed and idempotent: the ID is the SHA-256 of the canonical schematic. A later option is to declare extensions and kernel args in the CR and let the operator derive the schematic ID, instead of hand-copying a 64-character hash.
-
-**Machinery skew.** A Talos minor newer than the operator's embedded tables is reported as `supported: unknown` and is never rolled out. Upgrading the operator (with newer machinery) is therefore a prerequisite of every Talos minor bump. Renovate tracks the machinery Go module in this repo, and the operator image wherever the operator is deployed from.
-
-**Admission.** Spec versions without a valid path are **not** rejected at admission: that would wedge the Flux Kustomization. Instead they set `SpecPathValid=False` and no rollout starts.
-
-### 14.5 Version bump automation (Renovate + CI)
-
-**Renovate** runs on the repository that holds the spec. No Talos preset exists upstream; the config follows the home-operations pattern.
-- The CR carries annotations, in block style so each value can have a comment:
-  ```yaml
-  versions:
-    # renovate: datasource=github-releases depName=siderolabs/talos
-    talos: v1.14.0
-    # renovate: datasource=github-releases depName=kubernetes/kubernetes
-    kubernetes: 1.37.0
-  ```
-- `github-releases` is the datasource for both, because it has release timestamps. Since Renovate 42, `minimumReleaseAge` requires timestamps, which the factory and ghcr.io datasources lack. Existence of the installer and kubelet image is checked by CI instead.
-- Docker lookups for `factory.talos.dev/*` are disabled: the factory does not support `tags/list`.
-- Pre-releases are ignored. Patch and minor bumps are separated, with one PR per minor (`separateMultipleMinor`).
-- **Patches:** 3-day soak, automerge **only** through the required `validate` check.
-- **Minors:** 14-day soak, Dependency Dashboard approval, never automerged, release-notes reminder in the PR body.
-- `rebaseWhen: behind-base-branch`, so a Kubernetes PR blocked on Talos re-runs CI once the Talos PR merges.
-- The full proposed `renovate.json5` is in the M6 beads issue.
-
-**`talos-operator validate`.** A CLI in the operator image runs the §14.4 planner as a required GitHub Actions check on PRs that touch the CR. It checks that:
-- the versions parse and are not pre-releases;
-- a path exists from the base-branch spec to the PR spec;
-- the target is in the factory `/versions` list;
-- the schematic exists and its extensions are available;
-- the installer manifest exists;
-- the kubelet image exists.
-
-It writes the plan as markdown to `$GITHUB_STEP_SUMMARY`.
-
-*Limitation:* the base branch is not what is running. A previous bump may be waiting for a maintenance window, and CI cannot reach the cluster. CI is a pre-merge filter; the operator re-plans from live state and is the final authority.
-
-**`talos-operator render`.** It renders machine configs from the CRs plus a secrets bundle, using the same code as the operator. It replaces hand-written generation scripts for disaster recovery, so the rebuild runbook and the operator can never disagree. Such scripts can be retired once the cluster is adopted.
-
-**Conflict to watch for:** automation that commits directly to `main` (image update bots, for one). A branch-protection rule that requires `validate` blocks those pushes unless the rule is scoped to the CR paths (§14.7).
+One conflict to watch for where the check is a required one: automation that commits straight to the main branch, such as an image update bot, is blocked by it unless the rule is scoped to the paths that hold the cluster's manifests.
 
 ### 14.6 Maintenance automation
 

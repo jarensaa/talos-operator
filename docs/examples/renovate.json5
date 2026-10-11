@@ -1,0 +1,66 @@
+// An example Renovate configuration for a repository that holds a cluster's manifests.
+//
+// It proposes a pull request when a newer Talos or Kubernetes release exists, by editing the
+// versions of a TalosCluster. Nothing here upgrades anything: the operator rolls out what is
+// merged, inside the cluster's maintenance windows and behind its gates, and the validate check
+// (validate-workflow.yml) turns down a bump that cannot work.
+//
+// The versions are found by a comment above each, so mark them in the TalosCluster:
+//
+//   versions:
+//     # renovate: datasource=github-releases depName=siderolabs/talos
+//     talos: v1.14.2
+//     # renovate: datasource=github-releases depName=kubernetes/kubernetes
+//     kubernetes: 1.37.1
+//
+// This is a starting point. It has not been run against a repository by the operator's own tests.
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended", ":dependencyDashboard"],
+  customManagers: [
+    {
+      customType: "regex",
+      description: "Versions marked with a renovate comment",
+      managerFilePatterns: ["/\\.ya?ml$/"],
+      matchStrings: [
+        "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(\\s+versioning=(?<versioning>\\S+))?\\n\\s*[\\w.-]+\\s*[:=]\\s*[\"']?(?<currentValue>[^\"'\\s]+)",
+      ],
+      versioningTemplate: "{{#if versioning}}{{{versioning}}}{{else}}semver{{/if}}",
+    },
+  ],
+  packageRules: [
+    // The spec names Kubernetes without the "v" its release tags carry.
+    { matchPackageNames: ["kubernetes/kubernetes"], extractVersion: "^v(?<version>.+)$" },
+    {
+      // Releases only, one pull request per step, and not before a release has been out for a
+      // few days. GitHub releases are the source because they carry the date that takes.
+      matchPackageNames: ["siderolabs/talos", "kubernetes/kubernetes"],
+      ignoreUnstable: true,
+      allowedVersions: "!/-(alpha|beta|rc)/",
+      separateMinorPatch: true,
+      separateMultipleMinor: true,
+      minimumReleaseAge: "3 days",
+      internalChecksFilter: "strict",
+      // A Kubernetes bump that waits for a Talos bump is checked again once that one is merged.
+      rebaseWhen: "behind-base-branch",
+    },
+    {
+      // A patch release merges by itself, through the required validate check and nothing else.
+      matchPackageNames: ["siderolabs/talos", "kubernetes/kubernetes"],
+      matchUpdateTypes: ["patch"],
+      automerge: true,
+      automergeType: "pr",
+      platformAutomerge: true,
+      ignoreTests: false,
+    },
+    {
+      // A minor is a decision: longer out, approved on the dashboard, merged by a human.
+      matchPackageNames: ["siderolabs/talos", "kubernetes/kubernetes"],
+      matchUpdateTypes: ["minor", "major"],
+      automerge: false,
+      minimumReleaseAge: "14 days",
+      dependencyDashboardApproval: true,
+      prBodyNotes: ["Minor bump: read the upstream release notes for breaking changes before merging."],
+    },
+  ],
+}
