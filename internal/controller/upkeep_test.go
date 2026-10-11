@@ -494,6 +494,24 @@ var _ = Describe("Upkeep", func() {
 		Expect(maintained().Reason).To(Equal(plan.BlockGateClosed), maintained().Message)
 		Expect(defragmented()).To(BeEmpty())
 
+		// It is healthy again, and the operation starts: the first member's turn is written down,
+		// and nothing was sent yet. The cluster stops being healthy before it is.
+		scenario.SetHealth(talos.HealthResult{Healthy: true})
+		runUntil("the first member's turn begins", func() bool {
+			return tc.Status.Operation != nil && tc.Status.Operation.Current != nil
+		})
+		Expect(defragmented()).To(BeEmpty(), "a turn is written down before anything is sent")
+
+		scenario.SetHealth(talos.HealthResult{Healthy: false, Messages: []string{"a node is not ready"}})
+
+		for range 6 {
+			clock = clock.Add(20 * time.Second)
+			settle(nil)
+		}
+
+		Expect(defragmented()).To(BeEmpty(), "a member whose turn it is waits for the gate like one whose turn has not come")
+		Expect(tc.Status.Operation.Current.Step).To(Equal(plan.StepDefragmenting))
+
 		scenario.SetHealth(talos.HealthResult{Healthy: true})
 		runUntil("the first member is defragmented", func() bool { return len(defragmented()) == 1 })
 
