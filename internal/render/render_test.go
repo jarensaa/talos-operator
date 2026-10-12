@@ -210,3 +210,58 @@ func TestBytesOrderedLikeFollowsTheOtherConfig(t *testing.T) {
 		t.Fatalf("order: got %v, want %v", got, want)
 	}
 }
+
+func TestADocumentKeySaysItsKind(t *testing.T) {
+	for key, kind := range map[render.DocKey]string{
+		render.RootKey:                  "",
+		keyKubeNode:                     "KubeNodeConfig",
+		keyBond:                         "BondConfig",
+		"v1alpha1/UserVolumeConfig/a/b": "UserVolumeConfig",
+	} {
+		if got := key.Kind(); got != kind {
+			t.Errorf("%s: kind %q, want %q", key, got, kind)
+		}
+	}
+
+	// A key built from what a document states is the key the document has in a config.
+	for key, of := range map[render.DocKey][3]string{
+		keyBond:        {"v1alpha1", "BondConfig", "bond0"},
+		keyKubeNode:    {"v1alpha1", "KubeNodeConfig", ""},
+		render.RootKey: {"", "", ""},
+	} {
+		if got := render.KeyOf(of[0], of[1], of[2]); got != key {
+			t.Errorf("%v: key %q, want %q", of, got, key)
+		}
+	}
+}
+
+func TestLayersApplyClusterThenPoolThenMachine(t *testing.T) {
+	got := render.Layered([]string{"cluster-1", "cluster-2"}, []string{"pool"}, []string{"machine"})
+	if !slices.Equal(got, []string{"cluster-1", "cluster-2", "pool", "machine"}) {
+		t.Fatalf("got %v", got)
+	}
+
+	if got := render.Layered[string](nil, nil, []string{"machine"}); !slices.Equal(got, []string{"machine"}) {
+		t.Fatalf("a machine without shared layers: %v", got)
+	}
+}
+
+func TestReproduces(t *testing.T) {
+	rendered := mustRender(t, input(t, bondPatch))
+
+	live, err := talos.ParseMachineConfig(rendered.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := render.Reproduces("the specs", rendered, live); err != nil {
+		t.Fatalf("a config is reproduced by itself: %v", err)
+	}
+
+	// What differs is shown, and named after what was rendered.
+	err = render.Reproduces("the specs", mustRender(t, input(t)), live)
+	if err == nil || !strings.HasPrefix(err.Error(), "the specs do not reproduce the live config:\n") ||
+		!strings.Contains(err.Error(), "+bondMode: 802.3ad") {
+		t.Fatalf("got %v", err)
+	}
+}
