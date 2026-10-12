@@ -102,6 +102,21 @@ jobs:
           # Headless VMs need none of the recommended GUI/audio packages.
           sudo apt-get install -y -qq --no-install-recommends qemu-system-x86 qemu-utils ovmf iptables
 
+      # A hosted runner's link says 1500 bytes, and not every path from it carries that: towards
+      # Image Factory, packets of more than about 1400 are lost without a word, so nothing tells
+      # the sender to send smaller ones. Whatever only sends small packets works, and a TLS client
+      # that offers a post-quantum key share does not, because its first message fills a packet.
+      # Talos's containerd is one, and so is the operator: the nodes connected and never installed
+      # (docs/dev/e2e.md). So every connection through the uplink, the runner's own and the VMs',
+      # is told a segment size that every path carries. The rule only ever lowers it.
+      - name: Keep TCP segments small enough for every path
+        run: |
+          uplink=$(ip -o route show default | awk '{print $5; exit}')
+          test -n "$uplink" || { echo "::error::no default route to clamp segments on"; exit 1; }
+          sudo iptables -t mangle -A POSTROUTING -o "$uplink" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
+          sudo iptables -t mangle -A PREROUTING -i "$uplink" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
+          sudo iptables -t mangle -S | grep TCPMSS
+
       - uses: ./.github/actions/install-talosctl
         with:
           version: ${{ env.TALOSCTL_VERSION }}
