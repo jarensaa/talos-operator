@@ -249,3 +249,28 @@ func TestThePlannersCallARunningNodeWhatTalosDoes(t *testing.T) {
 		t.Fatalf("the planners call it %q and Talos %q", plan.StageRunning, talos.StageRunning)
 	}
 }
+
+// A condition that is cleared and set again within a pass has not changed. Its transition time
+// moves only when its status is another than it was when the pass began.
+func TestAConditionSetAgainHasNotChanged(t *testing.T) {
+	then := metav1.NewTime(time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC))
+	now := metav1.NewTime(then.Add(time.Hour))
+
+	before := []metav1.Condition{
+		{Type: talosv1alpha1.ConditionRolloutBlocked, Status: metav1.ConditionTrue, LastTransitionTime: then},
+		{Type: talosv1alpha1.ConditionConfigInSync, Status: metav1.ConditionFalse, LastTransitionTime: then},
+	}
+	after := []metav1.Condition{
+		{Type: talosv1alpha1.ConditionConfigInSync, Status: metav1.ConditionTrue, LastTransitionTime: now},
+		{Type: talosv1alpha1.ConditionRolloutBlocked, Status: metav1.ConditionTrue, LastTransitionTime: now},
+		{Type: talosv1alpha1.ConditionTalosUpToDate, Status: metav1.ConditionTrue, LastTransitionTime: now},
+	}
+
+	keepTransitions(before, after)
+
+	for i, want := range []metav1.Time{now, then, now} {
+		if !after[i].LastTransitionTime.Equal(&want) {
+			t.Errorf("%s: its transition is at %s, want %s", after[i].Type, after[i].LastTransitionTime, want)
+		}
+	}
+}

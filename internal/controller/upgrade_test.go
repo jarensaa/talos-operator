@@ -410,14 +410,14 @@ var _ = Describe("Talos upgrade", func() {
 
 		Expect(h.operation()).To(BeNil())
 		Expect(h.tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-		Expect(h.tc.Status.Upgrades.Aborted).To(HaveKeyWithValue(worker1, newerImage))
+		Expect(h.tc.Status.Holds[talosv1alpha1.OperationTalosUpgrade].Aborted).To(HaveKeyWithValue(worker1, newerImage))
 		Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonAborted))
 		Expect(called(fake.MethodImagePull)).To(HaveLen(1), "an aborted upgrade is not started again as it is")
 
 		By("asking for what the nodes run again")
 		upgradeTo(talosVersion)
 		h.settle(nil)
-		Expect(h.tc.Status.Upgrades).To(BeNil(), "the abort is spent")
+		Expect(h.tc.Status.Holds).To(BeEmpty(), "the abort is spent")
 		Expect(upToDate().Status).To(Equal(metav1.ConditionTrue), upToDate().Message)
 	})
 
@@ -438,7 +438,7 @@ var _ = Describe("Talos upgrade", func() {
 		h.runUntil("the upgrade ends", func() bool { return h.idle() && len(h.tc.Status.History) >= 1 })
 
 		h.advance(time.Hour)
-		Expect(h.tc.Status.Upgrades.Skipped).To(HaveKeyWithValue(worker1, newerImage))
+		Expect(h.tc.Status.Holds[talosv1alpha1.OperationTalosUpgrade].Skipped).To(HaveKeyWithValue(worker1, newerImage))
 		Expect(upToDate().Status).To(Equal(metav1.ConditionFalse))
 		Expect(upToDate().Message).To(ContainSubstring(worker1))
 		Expect(called(fake.MethodInstall)).To(Equal([]string{worker1, worker2, cp1Machine}), "the skipped machine is not tried again")

@@ -442,7 +442,7 @@ var _ = Describe("Kubernetes upgrade", func() {
 			h.settle(h.idle)
 
 			Expect(h.tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-			Expect(h.tc.Status.Upgrades.Kubernetes).To(Equal(patch))
+			Expect(h.tc.Status.Holds[talosv1alpha1.OperationKubernetesUpgrade].Aborted).To(HaveKeyWithValue(talosv1alpha1.HoldEverything, patch))
 
 			sent := len(h.applies())
 			h.advance(time.Hour)
@@ -452,7 +452,7 @@ var _ = Describe("Kubernetes upgrade", func() {
 
 			upgradeKubernetes("1.37.2")
 			h.runUntil("the upgrade to the other version ends", func() bool { return len(kubernetesOperations()) == 2 })
-			Expect(h.tc.Status.Upgrades).To(BeNil())
+			Expect(h.tc.Status.Holds).To(BeEmpty())
 			Expect(imagesOf(cp1Machine)[plan.ComponentControllerManager]).To(HaveSuffix(":v1.37.2"))
 		})
 	})

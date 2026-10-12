@@ -69,6 +69,8 @@ func (r *TalosMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return ctrl.Result{}, err
 	}
 
+	keepTransitions(original.Status.Conditions, tm.Status.Conditions)
+
 	if !equality.Semantic.DeepEqual(original.Status, tm.Status) {
 		// A merge patch of what this pass changed. The cluster's rollout writes status.config's
 		// appliedHash and skippedHash, which this controller never sets, so neither needs to

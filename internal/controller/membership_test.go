@@ -363,7 +363,7 @@ var _ = Describe("Adding and removing machines", func() {
 		h.settle(nil)
 		Expect(operation()).To(BeEmpty())
 		Expect(sent(fake.MethodMaintenanceApply, wTwo)).To(Equal(1))
-		Expect(h.tc.Status.Membership.Add).To(HaveKey(wTwo.name))
+		Expect(h.tc.Status.Holds[talosv1alpha1.OperationAddMachine].Aborted).To(HaveKey(wTwo.name))
 	})
 
 	It("removes a worker: drained, reset, seen to have forgotten the cluster, and its Node deleted", func() {
@@ -424,7 +424,7 @@ var _ = Describe("Adding and removing machines", func() {
 
 		// It waits in maintenance mode, as what it is, and is left there while it is to stay out.
 		h.scenario.UpdateNode(wTwo.addr, func(n *fake.Node) {
-			n.MachineType, n.Nodename, n.MachineStatus = fake.TypeWorker, wTwo.name, talos.MachineStatus{Stage: stageRunning, Ready: true}
+			n.MachineType, n.Nodename, n.MachineStatus = fake.TypeWorker, wTwo.name, talos.MachineStatus{Stage: talos.StageRunning, Ready: true}
 		})
 		h.clock = h.clock.Add(10 * time.Minute)
 		h.settle(nil)

@@ -156,6 +156,8 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
+	keepTransitions(original.Status.Conditions, tc.Status.Conditions)
+
 	if !equality.Semantic.DeepEqual(original.Status, tc.Status) {
 		// The status holds the operation lock and the step in flight, so it is only ever written
 		// on top of the version it was decided from.
@@ -826,7 +828,21 @@ func setCondition(st *talosv1alpha1.TalosClusterStatus, gen int64, condType stri
 	setConditionIn(&st.Conditions, gen, condType, status, reason, message)
 }
 
-// setConditionIn sets a condition; LastTransitionTime only moves when the status changes.
+// keepTransitions gives every condition that has the status it had before this pass the
+// transition time it had then. A pass says what holds now, and says some of it by clearing a
+// condition and setting it again, which is no transition: left as it is, the time of every such
+// condition would move with every pass, and a cluster that is blocked, and so at rest, would be
+// written to for as long as it is.
+func keepTransitions(before, after []metav1.Condition) {
+	for i := range after {
+		if was := meta.FindStatusCondition(before, after[i].Type); was != nil && was.Status == after[i].Status {
+			after[i].LastTransitionTime = was.LastTransitionTime
+		}
+	}
+}
+
+// setConditionIn sets a condition. Its LastTransitionTime only moves when its status changes
+// from what it was when the pass began (keepTransitions).
 func setConditionIn(conds *[]metav1.Condition, gen int64, condType string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(conds, metav1.Condition{
 		Type:               condType,

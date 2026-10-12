@@ -481,7 +481,7 @@ var _ = Describe("Config rollout", func() {
 			Expect(h.applies()).To(Equal([]string{tried(worker1), tried(worker2), confirmed(worker2)}))
 			Expect(h.tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
 			Expect(h.tc.Status.History[0].Skipped).To(Equal([]string{worker1}))
-			Expect(h.machine(worker1).Status.Config.SkippedHash).To(Equal(target))
+			Expect(h.tc.Status.Holds[talosv1alpha1.OperationConfigRollout].Skipped).To(HaveKeyWithValue(worker1, target))
 
 			h.advance(time.Hour)
 			Expect(h.operation()).To(BeNil(), "a skipped config is not rolled out to the machine again")
@@ -498,7 +498,7 @@ var _ = Describe("Config rollout", func() {
 
 			h.settle(nil)
 			Expect(h.inSync().Status).To(Equal(metav1.ConditionTrue), h.inSync().Message)
-			Expect(h.machine(worker1).Status.Config.SkippedHash).To(BeEmpty())
+			Expect(h.tc.Status.Holds).To(BeEmpty(), "a skip is spent once the machine renders another config")
 		})
 
 		It("ends the rollout on abort and does not start the same one again", func() {
@@ -508,7 +508,7 @@ var _ = Describe("Config rollout", func() {
 			h.settle(h.idle)
 
 			Expect(h.tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-			Expect(h.tc.Status.AbortedTargets).To(HaveLen(2))
+			Expect(h.tc.Status.Holds[talosv1alpha1.OperationConfigRollout].Aborted).To(HaveLen(2))
 
 			h.advance(time.Hour)
 			Expect(h.operation()).To(BeNil())
@@ -523,7 +523,7 @@ var _ = Describe("Config rollout", func() {
 
 			Expect(h.inSync().Status).To(Equal(metav1.ConditionTrue), h.inSync().Message)
 			Expect(h.blocked()).To(BeNil())
-			Expect(h.tc.Status.AbortedTargets).To(BeEmpty())
+			Expect(h.tc.Status.Holds).To(BeEmpty())
 			Expect(h.applies()).To(Equal([]string{tried(worker1)}))
 		})
 	})
@@ -794,6 +794,24 @@ var _ = Describe("Config rollout", func() {
 
 		h.advance(time.Hour)
 		Expect(h.applies()).To(Equal([]string{tried(worker2)}))
+	})
+
+	It("is not written to while a rollout that is due waits", func() {
+		h.updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Paused = true })
+		h.setPoolConfig(talosv1alpha1.MachineRoleWorker, labelConfig("one"))
+		h.settle(nil)
+		Expect(h.blocked().Reason).To(Equal(talosv1alpha1.ReasonPaused))
+
+		// What is blocked is said by clearing RolloutBlocked and setting it again in every pass. A
+		// condition's transition time has the resolution of a second, so two passes more than a
+		// second apart would each write the status if that counted as a transition.
+		written, since := h.tc.ResourceVersion, h.blocked().LastTransitionTime
+
+		time.Sleep(1100 * time.Millisecond)
+		h.round()
+
+		Expect(h.tc.ResourceVersion).To(Equal(written), "a cluster at rest is not written to")
+		Expect(h.blocked().LastTransitionTime).To(Equal(since))
 	})
 
 	It("touches no node while paused, and goes on when the pause is lifted", func() {

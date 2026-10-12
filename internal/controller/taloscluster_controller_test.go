@@ -18,10 +18,8 @@ package controller
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net/netip"
-	"slices"
 	"strings"
 	"time"
 
@@ -46,7 +44,6 @@ import (
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/adopt"
 	"github.com/jarensaa/talos-operator/internal/plan"
-	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos"
 	"github.com/jarensaa/talos-operator/internal/talos/fake"
 	"github.com/jarensaa/talos-operator/internal/talos/talostest"
@@ -73,7 +70,7 @@ var (
 const (
 	cpUUID     = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001"
 	workerUUID = "aaaaaaaa-bbbb-4ccc-8ddd-000000000002"
-	schematic  = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
+	schematic  = talostest.SchematicID
 )
 
 // liveConfig generates a node's config the way talosctl would, signed by the shared test bundle.
@@ -81,27 +78,12 @@ const (
 func liveConfig(role talosmachine.Type, patches ...string) []byte {
 	GinkgoHelper()
 
-	in := render.Input{
-		ClusterName:       "e2e",
-		Endpoint:          "https://" + cpAddr.String() + ":6443",
-		KubernetesVersion: kubernetesVersion,
-		Contract:          config.TalosVersion1_14,
-		Bundle:            talostest.Bundle(GinkgoT()),
-		Role:              role,
-		InstallImage:      "factory.talos.dev/metal-installer/" + schematic + ":" + talosVersion,
-	}
+	in := talostest.Input(GinkgoT(), patches...)
+	in.ClusterName, in.Endpoint = "e2e", "https://"+cpAddr.String()+":6443"
+	in.KubernetesVersion, in.InstallImage = kubernetesVersion, talostest.InstallerOf(talosVersion)
+	in.Role = role
 
-	for _, p := range patches {
-		in.Patches = append(in.Patches, []byte(p))
-	}
-
-	cfg, err := render.Generate(in)
-	Expect(err).NotTo(HaveOccurred())
-
-	raw, err := cfg.Bytes()
-	Expect(err).NotTo(HaveOccurred())
-
-	return raw
+	return talostest.Config(GinkgoT(), in)
 }
 
 // reproduceLiveConfigs sets the spec the fake's live configs were generated from (liveConfig).
@@ -836,7 +818,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 				raw, err := sigsyaml.Marshal(obj)
 				Expect(err).NotTo(HaveOccurred())
 
-				for _, secret := range secretMaterial(talostest.Bundle(GinkgoT())) {
+				for _, secret := range talostest.SecretValues(talostest.Bundle(GinkgoT())) {
 					Expect(string(raw)).NotTo(ContainSubstring(secret), "a derived spec leaks secret material")
 				}
 			}
@@ -1138,21 +1120,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 		})
 	})
 })
-
-// secretMaterial lists a bundle's secret values as they appear in configs: base64-encoded keys and
-// plain tokens.
-func secretMaterial(b *secrets.Bundle) []string {
-	keys := [][]byte{b.Certs.OS.Key, b.Certs.Etcd.Key, b.Certs.K8s.Key, b.Certs.K8sAggregator.Key, b.Certs.K8sServiceAccount.Key}
-
-	out := make([]string, 0, len(keys)+4)
-	out = append(out, b.Secrets.BootstrapToken, b.Secrets.SecretboxEncryptionSecret, b.TrustdInfo.Token, b.Cluster.Secret)
-
-	for _, key := range keys {
-		out = append(out, base64.StdEncoding.EncodeToString(key))
-	}
-
-	return slices.DeleteFunc(out, func(s string) bool { return s == "" })
-}
 
 // Pools of the spec's "cluster", one per role; createPools makes them.
 const (
