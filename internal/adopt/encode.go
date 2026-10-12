@@ -19,14 +19,14 @@ package adopt
 import (
 	"bytes"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/hex"
-	"encoding/pem"
 	"fmt"
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	yaml "go.yaml.in/yaml/v4"
+
+	"github.com/jarensaa/talos-operator/internal/adopt/bundle"
 )
 
 // EncodeBundle encodes a secrets bundle in the secrets.yaml format of `talosctl gen secrets`, so
@@ -46,53 +46,19 @@ func DecodeBundle(data []byte) (*secrets.Bundle, error) {
 	return b, nil
 }
 
-// Names of a bundle's certificate authorities, as status.certificates lists them.
-const (
-	AuthorityOS                   = "os"
-	AuthorityKubernetes           = "kubernetes"
-	AuthorityKubernetesAggregator = "kubernetes-aggregator"
-	AuthorityEtcd                 = "etcd"
-)
-
 // Validity is the time a certificate is valid for.
 type Validity struct {
 	NotBefore, NotAfter time.Time
 }
 
-// AuthorityValidity returns the validity of each certificate authority of the bundle. One the
-// bundle does not have, or that is not a certificate, is left out. Only the certificates are
-// read, never their keys.
+// AuthorityValidity returns the validity of each certificate authority of the bundle, by the name
+// status.certificates lists it under (bundle.AuthorityCertificates). One the bundle does not
+// have, or that is not a certificate, is left out.
 func AuthorityValidity(b *secrets.Bundle) map[string]Validity {
 	out := map[string]Validity{}
-	if b == nil || b.Certs == nil {
-		return out
-	}
 
-	crt := func(name string, pemBytes []byte) {
-		block, _ := pem.Decode(pemBytes)
-		if block == nil {
-			return
-		}
-
-		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-			out[name] = Validity{NotBefore: cert.NotBefore, NotAfter: cert.NotAfter}
-		}
-	}
-
-	if ca := b.Certs.OS; ca != nil {
-		crt(AuthorityOS, ca.Crt)
-	}
-
-	if ca := b.Certs.K8s; ca != nil {
-		crt(AuthorityKubernetes, ca.Crt)
-	}
-
-	if ca := b.Certs.K8sAggregator; ca != nil {
-		crt(AuthorityKubernetesAggregator, ca.Crt)
-	}
-
-	if ca := b.Certs.Etcd; ca != nil {
-		crt(AuthorityEtcd, ca.Crt)
+	for name, cert := range bundle.AuthorityCertificates(b) {
+		out[name] = Validity{NotBefore: cert.NotBefore, NotAfter: cert.NotAfter}
 	}
 
 	return out

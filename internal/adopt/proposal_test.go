@@ -238,3 +238,21 @@ func TestBundleEncodingRoundTrips(t *testing.T) {
 		t.Fatalf("hash must be stable across encoding: %q vs %q", h1, h2)
 	}
 }
+
+// The authorities are listed under the names status.certificates has for them.
+func TestAuthorityValidity(t *testing.T) {
+	got := adopt.AuthorityValidity(talostest.Bundle(t))
+	if len(got) != 4 {
+		t.Fatalf("a bundle has four authorities, got %d", len(got))
+	}
+
+	for _, name := range []string{"os", "kubernetes", "kubernetes-aggregator", "etcd"} {
+		if v, ok := got[name]; !ok || !v.NotAfter.After(v.NotBefore) {
+			t.Errorf("%s: validity %+v, listed %v", name, v, ok)
+		}
+	}
+
+	if len(adopt.AuthorityValidity(nil)) != 0 {
+		t.Fatal("no bundle has no authorities")
+	}
+}

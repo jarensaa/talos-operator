@@ -149,3 +149,39 @@ func TestVerifyNamesTheMismatchingNodeAndFields(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthorityCertificates(t *testing.T) {
+	b := talostest.Bundle(t)
+
+	got := bundle.AuthorityCertificates(b)
+	if len(got) != 4 {
+		t.Fatalf("a bundle has four authorities, got %d", len(got))
+	}
+
+	for _, name := range []string{"os", "kubernetes", "kubernetes-aggregator", "etcd"} {
+		if cert := got[name]; cert == nil || !cert.IsCA {
+			t.Errorf("%s: not listed as a certificate authority", name)
+		}
+	}
+
+	// One the bundle does not have, and one that is not a certificate, are left out; the others
+	// are still listed.
+	certs := *b.Certs
+	certs.Etcd = nil
+
+	notACertificate := *certs.K8s
+	notACertificate.Crt = []byte("not a certificate")
+	certs.K8s = &notACertificate
+
+	lacking := *b
+	lacking.Certs = &certs
+
+	got = bundle.AuthorityCertificates(&lacking)
+	if len(got) != 2 || got["os"] == nil || got["kubernetes-aggregator"] == nil {
+		t.Fatalf("got %d authorities of a bundle that has two", len(got))
+	}
+
+	if len(bundle.AuthorityCertificates(nil)) != 0 || len(bundle.AuthorityCertificates(&secrets.Bundle{})) != 0 {
+		t.Fatal("no bundle, and a bundle without certificates, have no authorities")
+	}
+}
