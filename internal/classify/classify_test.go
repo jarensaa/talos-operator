@@ -313,3 +313,65 @@ func TestClassifyKubernetesVersion(t *testing.T) {
 		t.Fatal("no approval makes a config rollout apply a Kubernetes version")
 	}
 }
+
+// A document whose fields do not say how it changed is classified as a whole: by its kind, and as
+// Unknown where it is the legacy root document, which has no class but that of its fields.
+func TestClassifyADocumentAsAWhole(t *testing.T) {
+	const (
+		kubelet = render.DocKey("v1alpha1/KubeletConfig")
+		install = render.DocKey("v1alpha1/UnattendedInstallConfig")
+	)
+
+	doc := func(key render.DocKey, body string) *render.Config {
+		cfg := &render.Config{Docs: map[render.DocKey][]byte{}}
+		if body != "" {
+			cfg.Docs[key] = []byte(body)
+		}
+
+		return cfg
+	}
+
+	tests := []struct {
+		name          string
+		key           render.DocKey
+		live, desired string
+		want          classify.Class
+	}{
+		// The same fields in another order: the bytes differ, and no field does.
+		{"the root document, no field differing", render.RootKey,
+			"machine:\n  type: worker\ncluster:\n  id: a\n", "cluster:\n  id: a\nmachine:\n  type: worker\n", classify.Unknown},
+		{"a Kubernetes component, no field differing", kubelet,
+			"image: a\nextraArgs: {b: c}\n", "extraArgs: {b: c}\nimage: a\n", classify.LiveSafe},
+		{"the installer's document, no field differing", install,
+			"installer:\n  image: a\n  disk: b\n", "installer:\n  disk: b\n  image: a\n", classify.BootTime},
+		// The image is the installer's only while nothing else in the document moves with it.
+		{"the installer's image and its disk", install,
+			"installer:\n  image: a\n  disk: b\n", "installer:\n  image: c\n  disk: d\n", classify.BootTime},
+		// A document only one of the configs has.
+		{"the root document gone", render.RootKey, "machine:\n  type: worker\n", "", classify.Protected},
+		{"a Kubernetes component appearing", kubelet, "", "image: a\n", classify.LiveSafe},
+		{"the installer's document appearing", install, "", "installer:\n  image: a\n", classify.BootTime},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := classify.Classify(doc(tt.key, tt.live), doc(tt.key, tt.desired))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The reason is the document, with no field named.
+			if got.Class != tt.want || !slices.Equal(got.Reasons, []string{string(tt.key)}) {
+				t.Fatalf("got %s (%v), want %s (%s)", got.Class, got.Reasons, tt.want, tt.key)
+			}
+		})
+	}
+
+	// A document that cannot be compared field by field is an error, and never a class.
+	for _, key := range []render.DocKey{render.RootKey, kubelet, install} {
+		_, err := classify.Classify(doc(key, "image: a\n"), doc(key, "image: [unclosed\n"))
+		if err == nil || !strings.HasPrefix(err.Error(), "compare "+string(key)+": ") {
+			t.Errorf("%s: got %v", key, err)
+		}
+	}
+}
