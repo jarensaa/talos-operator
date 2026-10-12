@@ -25,6 +25,7 @@ package exporter
 import (
 	"context"
 	"runtime/debug"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -39,14 +40,28 @@ import (
 // before the cache has filled.
 const readTimeout = 5 * time.Second
 
+// labels are the labels every series of one resource carries: their names where a metric is
+// described, their values where a series is made.
+type labels []string
+
+// with returns the labels followed by more, in a slice of its own.
+func (l labels) with(more ...string) []string { return slices.Concat(l, more) }
+
 // Labels every series of a cluster, and of a machine, carries.
 var (
-	clusterLabels = []string{"namespace", "taloscluster"}
-	machineLabels = []string{"namespace", "taloscluster", "machine"}
+	clusterLabels = labels{"namespace", "taloscluster"}
+	machineLabels = labels{"namespace", "taloscluster", "machine"}
 )
 
-func desc(name, help string, base []string, more ...string) *prometheus.Desc {
-	return prometheus.NewDesc("talos_operator_"+name, help, append(append([]string{}, base...), more...), nil)
+// descs is every metric about the resources, in the order they are declared. Describe sends it,
+// so a metric cannot be exported without being described.
+var descs []*prometheus.Desc
+
+func desc(name, help string, base labels, more ...string) *prometheus.Desc {
+	d := prometheus.NewDesc("talos_operator_"+name, help, base.with(more...), nil)
+	descs = append(descs, d)
+
+	return d
 }
 
 var (
@@ -166,16 +181,7 @@ func New(reader client.Reader) *Collector {
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	c.readErrors.Describe(ch)
 
-	for _, d := range []*prometheus.Desc{
-		infoDesc,
-		clusterPhaseDesc, clusterConditionDesc, clusterObservedDesc, clusterVersionDesc, clusterPlanDesc, clusterEtcdDesc,
-		clusterOperationDesc, clusterHaltedDesc, clusterApprovalDesc,
-		clusterCertificateExpiryDesc, clusterCertificateIssuedDesc, clusterDefragmentedDesc,
-		operationInfoDesc, operationStartDesc, operationTurnsDesc, operationFailureDesc, operationFailureTimeDesc,
-		machineInfoDesc, machinePhaseDesc, machineConditionDesc, machineReadyDesc, machineHoldDesc, machineChangeDesc,
-		machineEtcdDesc, machineEtcdLeaderDesc, machineEtcdSizeDesc, machineEtcdInUseDesc,
-		machineServiceDesc, machineDiagnosticDesc, machineTimeDesc, machineLinkDesc, machineLinkSpeedDesc, machineVolumeDesc,
-	} {
+	for _, d := range descs {
 		ch <- d
 	}
 }
@@ -248,8 +254,7 @@ func (c *Collector) state(ctx context.Context) ([]prometheus.Metric, error) {
 
 func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 	st := &tc.Status
-	base := []string{tc.Namespace, tc.Name}
-	with := func(more ...string) []string { return append(append([]string{}, base...), more...) }
+	base := labels{tc.Namespace, tc.Name}
 
 	out := []prometheus.Metric{
 		gauge(clusterOperationDesc, truth(st.Operation != nil), base...),
@@ -258,7 +263,7 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 	}
 
 	if st.Phase != "" {
-		out = append(out, gauge(clusterPhaseDesc, 1, with(string(st.Phase))...))
+		out = append(out, gauge(clusterPhaseDesc, 1, base.with(string(st.Phase))...))
 	}
 
 	out = append(out, conditions(clusterConditionDesc, base, st.Conditions)...)
@@ -274,8 +279,8 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 	}
 
 	out = append(out,
-		gauge(clusterVersionDesc, 1, with("talos", desired.Talos, running.Talos)...),
-		gauge(clusterVersionDesc, 1, with("kubernetes", desired.Kubernetes, running.Kubernetes)...),
+		gauge(clusterVersionDesc, 1, base.with("talos", desired.Talos, running.Talos)...),
+		gauge(clusterVersionDesc, 1, base.with("kubernetes", desired.Kubernetes, running.Kubernetes)...),
 		gauge(clusterPlanDesc, float64(len(running.Plan)), base...),
 	)
 
@@ -289,8 +294,8 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 		}
 
 		out = append(out,
-			gauge(clusterEtcdDesc, float64(len(obs.EtcdMembers)-learners), with(voter)...),
-			gauge(clusterEtcdDesc, float64(learners), with(learner)...),
+			gauge(clusterEtcdDesc, float64(len(obs.EtcdMembers)-learners), base.with(voter)...),
+			gauge(clusterEtcdDesc, float64(learners), base.with(learner)...),
 		)
 
 		if obs.ObservedAt != nil {
@@ -300,8 +305,8 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 
 	for _, cert := range st.Certificates {
 		out = append(out,
-			gauge(clusterCertificateExpiryDesc, seconds(cert.ExpiresAt), with(cert.Name)...),
-			gauge(clusterCertificateIssuedDesc, seconds(cert.IssuedAt), with(cert.Name)...),
+			gauge(clusterCertificateExpiryDesc, seconds(cert.ExpiresAt), base.with(cert.Name)...),
+			gauge(clusterCertificateIssuedDesc, seconds(cert.IssuedAt), base.with(cert.Name)...),
 		)
 	}
 
@@ -313,18 +318,18 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 		kind := string(op.Type)
 
 		out = append(out,
-			gauge(operationInfoDesc, 1, with(kind, op.Target)...),
-			gauge(operationStartDesc, seconds(op.StartedAt), with(kind)...),
-			gauge(operationTurnsDesc, float64(len(op.Plan)), with(kind, "planned")...),
-			gauge(operationTurnsDesc, float64(len(op.Completed)), with(kind, "completed")...),
-			gauge(operationTurnsDesc, float64(len(op.Skipped)), with(kind, "skipped")...),
+			gauge(operationInfoDesc, 1, base.with(kind, op.Target)...),
+			gauge(operationStartDesc, seconds(op.StartedAt), base.with(kind)...),
+			gauge(operationTurnsDesc, float64(len(op.Plan)), base.with(kind, "planned")...),
+			gauge(operationTurnsDesc, float64(len(op.Completed)), base.with(kind, "completed")...),
+			gauge(operationTurnsDesc, float64(len(op.Skipped)), base.with(kind, "skipped")...),
 		)
 
 		if failure := op.Failure; failure != nil {
-			out = append(out, gauge(operationFailureDesc, 1, with(kind, failure.Machine, failure.Step, failure.Reason, failure.Hook)...))
+			out = append(out, gauge(operationFailureDesc, 1, base.with(kind, failure.Machine, failure.Step, failure.Reason, failure.Hook)...))
 
 			if failure.At != nil {
-				out = append(out, gauge(operationFailureTimeDesc, seconds(*failure.At), with(kind)...))
+				out = append(out, gauge(operationFailureTimeDesc, seconds(*failure.At), base.with(kind)...))
 			}
 		}
 	}
@@ -334,8 +339,7 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 
 func machineMetrics(tm *talosv1alpha1.TalosMachine, pool *talosv1alpha1.TalosMachinePool) []prometheus.Metric {
 	st := &tm.Status
-	base := []string{tm.Namespace, pool.Spec.ClusterRef.Name, tm.Name}
-	with := func(more ...string) []string { return append(append([]string{}, base...), more...) }
+	base := labels{tm.Namespace, pool.Spec.ClusterRef.Name, tm.Name}
 
 	var node, talosVersion, schematic, kubelet string
 
@@ -354,30 +358,30 @@ func machineMetrics(tm *talosv1alpha1.TalosMachine, pool *talosv1alpha1.TalosMac
 	}
 
 	out := []prometheus.Metric{
-		gauge(machineInfoDesc, 1, with(pool.Name, string(pool.Spec.Role), node, talosVersion, kubelet, schematic)...),
+		gauge(machineInfoDesc, 1, base.with(pool.Name, string(pool.Spec.Role), node, talosVersion, kubelet, schematic)...),
 		gauge(machineReadyDesc, truth(ready), base...),
 		gauge(machineHoldDesc, truth(tm.Spec.Hold), base...),
 	}
 
 	if st.Phase != "" {
-		out = append(out, gauge(machinePhaseDesc, 1, with(string(st.Phase))...))
+		out = append(out, gauge(machinePhaseDesc, 1, base.with(string(st.Phase))...))
 	}
 
 	out = append(out, conditions(machineConditionDesc, base, st.Conditions)...)
 
 	if st.Config != nil && st.Config.ChangeClass != "" {
-		out = append(out, gauge(machineChangeDesc, 1, with(st.Config.ChangeClass)...))
+		out = append(out, gauge(machineChangeDesc, 1, base.with(st.Config.ChangeClass)...))
 	}
 
 	// A machine that has not joined, or has left, is no control plane of the cluster yet or any
 	// more: it has no place in etcd to be missing from.
-	if pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane && st.JoinedAt != nil && st.RemovedAt == nil {
+	if pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane && tm.IsMember() {
 		member := st.Etcd != nil && st.Etcd.MemberID != ""
 		isLearner := member && st.Etcd.IsLearner
 
 		out = append(out,
-			gauge(machineEtcdDesc, truth(member && !isLearner), with(voter)...),
-			gauge(machineEtcdDesc, truth(isLearner), with(learner)...),
+			gauge(machineEtcdDesc, truth(member && !isLearner), base.with(voter)...),
+			gauge(machineEtcdDesc, truth(isLearner), base.with(learner)...),
 		)
 
 		// A size of zero is a member that was not read: an etcd database is never empty.
@@ -395,21 +399,19 @@ func machineMetrics(tm *talosv1alpha1.TalosMachine, pool *talosv1alpha1.TalosMac
 
 // healthMetrics is what Talos said about the node when it was last read. Nothing of it is
 // exported for a node that was not read: what is not known is not said to be fine, or broken.
-func healthMetrics(health *talosv1alpha1.NodeHealth, base []string) []prometheus.Metric {
+func healthMetrics(health *talosv1alpha1.NodeHealth, base labels) []prometheus.Metric {
 	if health == nil {
 		return nil
 	}
 
-	with := func(more ...string) []string { return append(append([]string{}, base...), more...) }
-
 	var out []prometheus.Metric
 
 	for _, service := range health.Services {
-		out = append(out, gauge(machineServiceDesc, truth(service.Running && service.Healthy), with(service.Name)...))
+		out = append(out, gauge(machineServiceDesc, truth(service.Running && service.Healthy), base.with(service.Name)...))
 	}
 
 	for _, diagnostic := range health.Diagnostics {
-		out = append(out, gauge(machineDiagnosticDesc, 1, with(diagnostic.ID)...))
+		out = append(out, gauge(machineDiagnosticDesc, 1, base.with(diagnostic.ID)...))
 	}
 
 	if health.TimeSynced != nil {
@@ -417,15 +419,15 @@ func healthMetrics(health *talosv1alpha1.NodeHealth, base []string) []prometheus
 	}
 
 	for _, link := range health.Links {
-		out = append(out, gauge(machineLinkDesc, truth(link.Up), with(link.Name, link.Bond)...))
+		out = append(out, gauge(machineLinkDesc, truth(link.Up), base.with(link.Name, link.Bond)...))
 
 		if link.SpeedMbps > 0 {
-			out = append(out, gauge(machineLinkSpeedDesc, float64(link.SpeedMbps), with(link.Name)...))
+			out = append(out, gauge(machineLinkSpeedDesc, float64(link.SpeedMbps), base.with(link.Name)...))
 		}
 	}
 
 	for _, volume := range health.Volumes {
-		out = append(out, gauge(machineVolumeDesc, truth(volume.Phase == volumeReady), with(volume.Name, volume.Phase)...))
+		out = append(out, gauge(machineVolumeDesc, truth(volume.Phase == volumeReady), base.with(volume.Name, volume.Phase)...))
 	}
 
 	return out
@@ -433,12 +435,11 @@ func healthMetrics(health *talosv1alpha1.NodeHealth, base []string) []prometheus
 
 // conditions is one series for each condition, labelled with what it says now. The message is
 // left out: it is prose, it changes, and it can quote what a node said.
-func conditions(d *prometheus.Desc, base []string, list []metav1.Condition) []prometheus.Metric {
+func conditions(d *prometheus.Desc, base labels, list []metav1.Condition) []prometheus.Metric {
 	out := make([]prometheus.Metric, 0, len(list))
 
 	for _, cond := range list {
-		labels := append(append([]string{}, base...), cond.Type, string(cond.Status), cond.Reason)
-		out = append(out, gauge(d, 1, labels...))
+		out = append(out, gauge(d, 1, base.with(cond.Type, string(cond.Status), cond.Reason)...))
 	}
 
 	return out
