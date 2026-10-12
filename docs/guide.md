@@ -315,6 +315,50 @@ The check compares a change with the base branch, not with the cluster: an earli
 
 [`docs/examples`](examples) has a workflow that runs the check on pull requests and a Renovate configuration that proposes version bumps, with patch releases merged by themselves once the check passes and minors left for a human.
 
+Where the files hold a TalosCluster and none of its machines, the check renders a control plane from the cluster alone, so that the images of a Kubernetes version are looked for all the same.
+
+### Bumping versions on a schedule
+
+The image has a third command, for a repository that wants its versions bumped without a bot:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/jarensaa/talos-operator:v0.13.0 \
+  bump clusters/my-cluster
+```
+
+It finds every TalosCluster in the files and directories given and writes the next version into it. Nothing is upgraded by that: you commit the file, whatever applies the repository delivers it, and the operator rolls it out inside your windows and behind your gates. It needs no cluster and no secret, and asks the Image Factory the TalosCluster names, the Kubernetes release site and the image registries what exists.
+
+One run takes one step for a cluster, so that one commit is one upgrade:
+
+- The next release is the newest of the minor the file names. Once the file is on that, it is the newest of the next minor.
+- Talos goes before Kubernetes wherever it can. A Talos release that does not run the Kubernetes version in the file waits, and Kubernetes takes the step; a Kubernetes release that the file's Talos does not run waits the other way round.
+- Only a version this operator upgrades to is written. A Talos minor newer than the operator was built for is named, with the reason, and not taken: upgrade the operator first.
+- What it would write is put through the check above before it is written. A Talos release that Image Factory does not build for your schematic, because an extension is not out for it yet, is not written, and neither is a Kubernetes release whose kubelet image is not published.
+- Nothing but the version changes in the file. Comments, order and quotes stay as you wrote them. A version behind a YAML alias is left for you.
+
+| Flag | |
+|---|---|
+| `--talos`, `--kubernetes` | Bump one of the two only. |
+| `--patch` | Take patch releases only: stay on the minors the file names. |
+| `--dry-run` | Print what would be written, and write nothing. |
+
+What was written is printed on standard output, one line for every cluster, such as `clusters/my-cluster/cluster.yaml: TalosCluster talos-operator/my-cluster: Talos v1.14.1 to v1.14.2`. Everything else goes to standard error: what was not taken and why, and what was not checked. So a script can do this:
+
+```bash
+bumped=$(docker run ... bump --patch clusters/my-cluster)
+[ -n "$bumped" ] && git commit --all --message "Bump ${bumped##*: }" && git push
+```
+
+It exits with 0 when it wrote a version or there is none newer to take, with 1 when it wrote none because a newer release could not be taken for a reason that is not a rule of Talos or Kubernetes, or because the manifests have a problem as they are, and with 2 when the files cannot be read or written. A kubelet image that is not published yet is the usual reason for a 1, and the next run finds it.
+
+Three things to know:
+
+- **It reads the file, not the cluster.** A second bump can be committed before the first is rolled out. The operator then goes from what the nodes run to what the spec says in one plan, Kubernetes one minor at a time. To have one upgrade finish before the next is proposed, let the script wait while `status.versions.plan` of the TalosCluster lists a step.
+- **It takes a release the day it is out.** Neither Image Factory nor the Kubernetes release site says how old a release is. The Renovate example waits some days; if you want that, use it instead.
+- **A minor is a decision.** A new minor of Kubernetes removes APIs and flags, and one of Talos changes more than a patch does. The operator refuses a Kubernetes upgrade that would strand what the cluster uses, but it cannot read release notes. The example workflow pushes patch releases by themselves with `--patch`; run the command without it where a human looks at the result, such as in a job that opens a pull request.
+
+Use the image of the operator release the cluster runs: which versions go together is what that release was built with.
+
 ## Windows, gates and hooks
 
 `spec.rollout` holds three things that apply to every operation: a config rollout, a Talos upgrade and a Kubernetes upgrade.

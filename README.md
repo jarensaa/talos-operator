@@ -14,7 +14,7 @@ It is built for clusters that already exist. The operator derives its resources 
 - **Talos upgrades, one node at a time.** A new version or installer is installed to a node's inactive boot slot while it keeps working. Only then is the node drained, with disruption budgets respected, and rebooted. A node that does not come back on the new system, or does not get healthy, halts the upgrade with that node still cordoned. The operator runs two replicas and upgrades the nodes it runs on.
 - **Kubernetes upgrades, one component at a time.** A new version reaches the API servers first, then the other control-plane components, then the kubelets, one minor at a time. Each change is tried and kept only once the component runs the new version. An upgrade is refused up front when a node's Talos does not run the version, or when it would strand a flag or an object of a removed API.
 - **Windows, gates and hooks.** Changes can be held to maintenance windows, made to wait on a CEL expression over any object in the cluster, such as a storage cluster's health, and wrapped in Jobs that run around an operation and around each node.
-- **Version awareness.** Status lists the Talos and Kubernetes releases that exist and the upgrades that lead to what the spec asks for. An upgrade to an installer or image that does not exist is refused before a node is asked to pull it. A `validate` command checks the manifests in a repository before they are merged.
+- **Version awareness.** Status lists the Talos and Kubernetes releases that exist and the upgrades that lead to what the spec asks for. An upgrade to an installer or image that does not exist is refused before a node is asked to pull it. A `validate` command checks the manifests in a repository before they are merged, and a `bump` command writes the next version into them.
 - **Adding, removing and replacing machines.** A machine that waits in Talos's maintenance mode joins the cluster once you declare it, if it says it is the hardware you declared and its config fits its disks. A machine you mark as removed is drained, reset, and only counted as gone when it waits in maintenance mode again. A control plane leaves only while three voting members of etcd remain, so replacing one is declaring the new and removing the old.
 - **Metrics, alerts and dashboards.** What the operator knows is exported as metrics: an operation that is halted, what holds a change back, drift, nodes that cannot be read, etcd membership. So is what Talos says about each node and has no metrics endpoint for: its services, its warnings, the clock, links and bonds, volumes, the size of each etcd database. Where the cluster has the Prometheus Operator, the chart installs a ServiceMonitor, alerts and two Grafana dashboards; where it has none, nothing.
 - **Upkeep.** etcd is defragmented before a database reaches its quota, one member at a time and the leader last, behind the same gates as a rollout. When an operation fails at a machine, the end of that machine's logs is kept in a Secret. Status says how long the cluster's certificates last.
@@ -265,6 +265,15 @@ docker run --rm -v "$PWD:/work:ro" -w /work ghcr.io/jarensaa/talos-operator:v0.9
 
 It fails when the Talos and Kubernetes versions do not go together, when the installer or a Kubernetes image does not exist, when the step from `--base` is a downgrade, when a machine's config does not render, or when a maintenance window or a gate cannot be understood. [`docs/examples`](docs/examples) has a GitHub Actions workflow that runs it on pull requests, and a Renovate configuration that proposes version bumps. With both, a new release becomes a pull request, the check decides whether it can work, and the operator rolls out what is merged inside your windows.
 
+Without a bot, the same image bumps the versions itself. Run on a schedule, it writes the next Talos or Kubernetes release into the TalosCluster it finds, one step for every run, and prints what it wrote for your script to commit:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/jarensaa/talos-operator:v0.13.0 \
+  bump clusters/my-cluster
+```
+
+It takes the newest release of the minor the file names, then the newest of the next minor, Talos before Kubernetes wherever the versions allow it. It writes only a version this operator upgrades to and that passes the check above, and changes nothing else in the file. `--talos` and `--kubernetes` bump one of the two only, `--patch` stays on the minor, and `--dry-run` writes nothing. The [guide](docs/guide.md#bumping-versions-on-a-schedule) has the rest, and [`docs/examples`](docs/examples) a workflow that runs it every night.
+
 `status.versions` on the TalosCluster says the same from the cluster's side: what it runs, which releases exist, and the upgrades to what the spec asks for. Which releases exist is only listed with `versionSources.enabled: true` in the chart: the operator then asks Image Factory, the Kubernetes release site and the image registries a few times a day. Without it, it talks to nothing but its cluster.
 
 ## Project status
@@ -280,7 +289,7 @@ It fails when the Talos and Kubernetes versions do not go together, when the ins
 | Talos upgrades: version or installer, drained and rebooted node by node | Implemented |
 | Kubernetes upgrades: the components Talos runs, a minor at a time | Implemented |
 | Maintenance windows, gates on objects in the cluster, hook Jobs | Implemented |
-| Version awareness: releases that exist, the planned upgrades, a `validate` check for CI | Implemented |
+| Version awareness: releases that exist, the planned upgrades, a `validate` check for CI, a `bump` command for a schedule | Implemented |
 | The cluster's own health in Prometheus and Grafana: Talos's view of each node, a Talos dashboard | Implemented |
 | Defragmenting etcd; a support bundle for a failed operation; certificate expiry | Implemented |
 | Handling an alarm of etcd, restarting etcd for a changed argument, credentials for people | Not built |
