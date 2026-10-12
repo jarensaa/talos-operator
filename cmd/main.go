@@ -111,7 +111,8 @@ func parseFlags() *options {
 	flag.BoolVar(&o.versionSources, "version-sources", false,
 		"Ask Image Factory, the Kubernetes release site and the registries of the Kubernetes images what exists: "+
 			"status then says which releases are available, and an upgrade to something that does not exist is refused "+
-			"before a node is asked to pull it. Without it the operator talks to nothing but the cluster it manages.")
+			"before a node is asked to pull it. Without it the operator asks one thing outside the cluster it manages: "+
+			"before a Talos upgrade of a machine with Secure Boot on, which certificate its Image Factory signs boot images with.")
 	flag.StringVar(&o.kubernetesReleases, "kubernetes-releases", catalog.DefaultKubernetesReleases,
 		"Where Kubernetes publishes its releases. Image Factory is the one a TalosCluster's installer names.")
 
@@ -173,10 +174,15 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) e
 		return err
 	}
 
-	// One source for every cluster, so that what was asked a moment ago is not asked again.
+	// One source for every cluster, so that what was asked a moment ago is not asked again. What
+	// exists upstream is only asked where that is switched on; who signs the boot images of an
+	// Image Factory is asked before an upgrade of a machine with Secure Boot on, wherever the
+	// operator runs (docs/scope.md §7.3).
+	source := &catalog.Cached{Source: &catalog.HTTP{KubernetesReleases: o.kubernetesReleases}}
+
 	var upstream catalog.Source
 	if o.versionSources {
-		upstream = &catalog.Cached{Source: &catalog.HTTP{KubernetesReleases: o.kubernetesReleases}}
+		upstream = source
 	}
 
 	if err := (&controller.TalosClusterReconciler{
@@ -193,6 +199,7 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) e
 		// which node an upgrade should leave for last.
 		NodeName: os.Getenv("NODE_NAME"),
 		Catalog:  upstream,
+		Signers:  source,
 		// The cluster the operator runs in is the cluster it manages (docs/scope.md §4.2).
 		KubernetesChecks: controller.KubernetesCheckerFunc(func(ctx context.Context, from, to string) ([]string, error) {
 			return talos.RemovedAPIObjects(ctx, mgr.GetConfig(), from, to)

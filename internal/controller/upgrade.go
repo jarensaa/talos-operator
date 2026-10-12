@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"maps"
@@ -100,9 +102,10 @@ func (v upgradeView) kubernetesNode() string {
 }
 
 // installed reports whether the node's version and schematic were read, and whether they are the
-// ones the spec asks for.
+// ones the spec asks for. A node whose firmware was not asked about Secure Boot is not known
+// either: what it would boot decides whether it may be upgraded at all.
 func (v upgradeView) installed() (known, yes bool) {
-	if v.node == nil || v.node.version == "" || v.node.schematicID == nil || v.install.Image == "" {
+	if v.node == nil || v.node.version == "" || v.node.schematicID == nil || v.node.secureBoot == nil || v.install.Image == "" {
 		return false, false
 	}
 
@@ -152,12 +155,83 @@ func (r *TalosClusterReconciler) upgradeMachine(ctx context.Context, tc *talosv1
 	m.HostsOperator = r.NodeName != "" && v.kubernetesNode() == r.NodeName
 
 	if !yes {
-		if m.Problem = talos.UpgradeProblem(v.node.version, v.install.Version, obs.kubernetes); m.Problem == "" {
+		m.Problem = cmp.Or(
+			talos.UpgradeProblem(v.node.version, v.install.Version, obs.kubernetes),
+			talos.SecureBootInstallerProblem(*v.node.secureBoot, v.install.SecureBoot, v.install.Image),
+		)
+		if m.Problem == "" {
 			m.Problem = r.installerProblem(ctx, tc, v.install)
 		}
 	}
 
 	return m
+}
+
+// secureBootPreflight asks, of every machine an upgrade is about to touch whose firmware has
+// Secure Boot on, whether that firmware boots the system the upgrade installs, and writes the
+// answer into the planner's view of the machine (docs/scope.md §7.3). The firmware's db is read
+// from the node, and the certificate the installer's boot image is signed with is asked of the
+// Image Factory the installer comes from: nothing in the cluster knows it. That is why this runs
+// when an upgrade may otherwise start and at no other time, and why not knowing holds the
+// upgrade up: the node that does not boot would be found at its reboot.
+func (r *TalosClusterReconciler) secureBootPreflight(ctx context.Context, obs observation, views map[string]upgradeView,
+	planned []plan.UpgradeMachine, pending []string,
+) {
+	ctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
+	defer cancel()
+
+	// One Image Factory signs for every pool of a cluster; it is asked once.
+	type answer struct {
+		signer *x509.Certificate
+		err    error
+	}
+
+	signers := map[string]answer{}
+
+	signer := func(factoryURL string) (*x509.Certificate, error) {
+		if r.Signers == nil {
+			return nil, errors.New("this operator has nothing to ask with")
+		}
+
+		if _, asked := signers[factoryURL]; !asked {
+			cert, err := r.Signers.SecureBootSigner(ctx, factoryURL)
+			signers[factoryURL] = answer{signer: cert, err: err}
+		}
+
+		return signers[factoryURL].signer, signers[factoryURL].err
+	}
+
+	for i := range planned {
+		m := &planned[i]
+
+		v := views[m.Name]
+		if !slices.Contains(pending, m.Name) || v.node == nil || v.node.secureBoot == nil || !*v.node.secureBoot {
+			continue
+		}
+
+		var db talos.SecureBootDB
+
+		reads := newNodeReads(ctx, v.node.address)
+		if !reads.read("Secure Boot db", func(ctx context.Context) (err error) {
+			db, err = obs.reader.SecureBootDB(ctx, v.node.address)
+
+			return err
+		}) {
+			m.Unverified = "what its firmware trusts to boot could not be read: " + reads.reason()
+
+			continue
+		}
+
+		cert, err := signer(v.install.FactoryURL)
+		if err != nil {
+			m.Unverified = fmt.Sprintf("its firmware has Secure Boot on, and %s could not be asked which certificate it signs boot images with: %v",
+				v.install.FactoryURL, err)
+
+			continue
+		}
+
+		m.Problem = talos.SecureBootTrustProblem(db, cert, v.install.FactoryURL)
+	}
 }
 
 // upgrade owns TalosUpToDate: it continues the upgrade in flight, or plans one. It reports whether
@@ -193,11 +267,13 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 
 	planned := make([]plan.UpgradeMachine, 0, len(machines))
 	images := make(map[string]string, len(machines))
+	views := make(map[string]upgradeView, len(machines))
 
 	for i := range machines {
 		v := r.upgradeView(tc, obs.facts, pools, &machines[i])
 		planned = append(planned, r.upgradeMachine(ctx, tc, obs, v))
 		images[machines[i].Name] = v.install.Image
+		views[machines[i].Name] = v
 	}
 
 	if !enabled {
@@ -211,9 +287,8 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 		holds = &talosv1alpha1.UpgradeHolds{}
 	}
 
-	result := plan.PlanUpgrade(planned, plan.UpgradeSettings{
-		Paused: tc.Spec.Paused, Skipped: holds.Skipped, Aborted: holds.Aborted, Policy: obs.policy,
-	}, passOf(obs))
+	settings := plan.UpgradeSettings{Paused: tc.Spec.Paused, Skipped: holds.Skipped, Aborted: holds.Aborted, Policy: obs.policy}
+	result := plan.PlanUpgrade(planned, settings, passOf(obs))
 
 	// A hold covers one installer. Once the spec asks for another, it is spent.
 	if !result.AbortStands {
@@ -228,6 +303,14 @@ func (r *TalosClusterReconciler) upgrade(ctx context.Context, tc *talosv1alpha1.
 		if err := timing.Validate(); err != nil {
 			result.BlockReason, result.BlockMessage = talosv1alpha1.ReasonInvalidRollout, "spec.rollout: "+err.Error()
 		}
+	}
+
+	// Nothing else stands in the way: now, and only now, every machine of the plan is asked
+	// whether it would boot what it is about to be given. The planner decides again with the
+	// answers, and one machine that would not refuses the upgrade of all of them.
+	if result.MayStart() {
+		r.secureBootPreflight(ctx, obs, views, planned, result.Pending)
+		result = plan.PlanUpgrade(planned, settings, passOf(obs))
 	}
 
 	if result.MayStart() {

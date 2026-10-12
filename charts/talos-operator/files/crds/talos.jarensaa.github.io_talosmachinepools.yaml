@@ -138,6 +138,12 @@ spec:
                       other system extensions.
                     pattern: ^[0-9a-f]{64}$
                     type: string
+                  secureBoot:
+                    description: |-
+                      SecureBoot overrides whether the pool's machines are installed from the installer whose
+                      boot image is signed, e.g. for a pool of machines whose firmware has Secure Boot on in a
+                      cluster where the others have not.
+                    type: boolean
                 type: object
               role:
                 description: Role is ControlPlane or Worker. It selects the generation

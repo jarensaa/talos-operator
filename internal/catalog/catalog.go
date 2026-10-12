@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 // Package catalog asks what exists upstream: which Talos releases Image Factory offers, whether
-// an installer image exists there, and which Kubernetes releases there are (docs/scope.md §7.5).
+// an installer image exists there, which Kubernetes releases there are (docs/scope.md §7.5), and
+// which certificate Image Factory signs boot images with (§7.3).
 //
 // It is the one place the operator talks to anything but the cluster it manages, and it only
 // asks. Every answer has three values: yes, no, and not known. A source that cannot be reached
@@ -25,7 +26,9 @@ package catalog
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -74,9 +77,10 @@ type Source interface {
 	// (v1.14.2), oldest first.
 	TalosVersions(ctx context.Context, factoryURL string) ([]string, error)
 	// Installer checks that Image Factory has a schematic, has every extension the schematic
-	// names for a Talos version, and builds the installer: the image an upgrade pulls.
-	// ErrNotFound means it certainly does not; any other error, that it could not be told.
-	Installer(ctx context.Context, factoryURL, platform, schematic, talosVersion string) error
+	// names for a Talos version, and builds the installer: the image an upgrade pulls, which is
+	// the one with a signed boot image when secureBoot is set. ErrNotFound means it certainly
+	// does not; any other error, that it could not be told.
+	Installer(ctx context.Context, factoryURL, platform, schematic, talosVersion string, secureBoot bool) error
 	// KubernetesLatest returns the newest patch release of a Kubernetes minor ("1.37"), as
 	// "1.37.1". ErrNotFound means the minor has no release.
 	KubernetesLatest(ctx context.Context, minor string) (string, error)
@@ -84,6 +88,18 @@ type Source interface {
 	// credentials would find it. ErrNotFound means it certainly does not; a registry that wants
 	// credentials, like one that does not answer, is an error of another kind.
 	Image(ctx context.Context, image string) error
+
+	Signer
+}
+
+// Signer answers whose signature the boot images of an Image Factory carry. It is the one thing
+// asked of upstream whether or not the operator was told to ask what exists: a machine whose
+// firmware has Secure Boot on boots only what that firmware trusts, and nothing in the cluster
+// says who signed the image an upgrade is about to install (docs/scope.md §7.3, §12.28).
+type Signer interface {
+	// SecureBootSigner returns the certificate the Image Factory at factoryURL signs the boot
+	// images of its Secure Boot installers with.
+	SecureBootSigner(ctx context.Context, factoryURL string) (*x509.Certificate, error)
 }
 
 // HTTP is a Source that asks over HTTPS.
@@ -261,7 +277,7 @@ const manifestTypes = "application/vnd.oci.image.index.v1+json, application/vnd.
 // Installer implements Source. The schematic is asked about first, then the extensions it names,
 // then the installer itself, so that the answer says which of them is missing. Extensions come
 // and go between Talos releases: one that a schematic names may not exist for the next.
-func (h *HTTP) Installer(ctx context.Context, factoryURL, platform, schematic, talosVersion string) error {
+func (h *HTTP) Installer(ctx context.Context, factoryURL, platform, schematic, talosVersion string, secureBoot bool) error {
 	target, err := endpoint(factoryURL, "schematics", schematic)
 	if err != nil {
 		return err
@@ -323,10 +339,40 @@ func (h *HTTP) Installer(ctx context.Context, factoryURL, platform, schematic, t
 		return fmt.Errorf("%q is not a URL", factoryURL)
 	}
 
-	image := fmt.Sprintf("%s/%s-installer/%s:%s", u.Host, platform, schematic, talosVersion)
+	repository := platform + "-installer"
+	if secureBoot {
+		repository += "-secureboot"
+	}
+
+	image := fmt.Sprintf("%s/%s/%s:%s", u.Host, repository, schematic, talosVersion)
 
 	// A plain-HTTP factory is a test's; a registry is asked over the scheme of the factory.
 	return h.image(ctx, u.Scheme, image, buildTimeout)
+}
+
+// SecureBootSigner implements Signer (Image Factory: GET /secureboot/signing-cert.pem).
+func (h *HTTP) SecureBootSigner(ctx context.Context, factoryURL string) (*x509.Certificate, error) {
+	target, err := endpoint(factoryURL, "secureboot", "signing-cert.pem")
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := h.get(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ := pem.Decode(body)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("%s: the answer is not a certificate", target)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("%s: the answer is not a certificate", target)
+	}
+
+	return cert, nil
 }
 
 // Image implements Source.

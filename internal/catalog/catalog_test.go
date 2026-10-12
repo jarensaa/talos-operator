@@ -18,6 +18,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 const (
@@ -45,6 +48,17 @@ type upstream struct {
 	mu     sync.Mutex
 	asked  []string
 	status int
+	// signer is what Image Factory answers when asked for its Secure Boot signing certificate;
+	// empty means it has none.
+	signer string
+}
+
+// answer changes what the server says from now on.
+func (u *upstream) answer(status int, signer string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.status, u.signer = status, signer
 }
 
 func (u *upstream) serve(t *testing.T) string {
@@ -60,7 +74,7 @@ func (u *upstream) serve(t *testing.T) string {
 
 		u.mu.Lock()
 		u.asked = append(u.asked, r.Method+" "+r.URL.Path)
-		status := u.status
+		status, signer := u.status, u.signer
 		u.mu.Unlock()
 
 		if status != 0 {
@@ -78,9 +92,11 @@ func (u *upstream) serve(t *testing.T) string {
 			"/v2/metal-installer/" + schematic + "/manifests/v1.14.2": "",
 			"/v2/metal-installer/" + schematic + "/manifests/v1.14.0": "",
 			"/v2/metal-installer/" + extended + "/manifests/v1.14.2":  "",
-			"/v2/siderolabs/kubelet/manifests/v1.37.1":                "",
-			"/v2/library/busybox/manifests/latest":                    "",
-			"/v2/kube-apiserver/manifests/sha256:0123":                "",
+			// The installer whose boot image is signed is an image of its own.
+			"/v2/metal-installer-secureboot/" + schematic + "/manifests/v1.14.2": "",
+			"/v2/siderolabs/kubelet/manifests/v1.37.1":                           "",
+			"/v2/library/busybox/manifests/latest":                               "",
+			"/v2/kube-apiserver/manifests/sha256:0123":                           "",
 			"/token":                   `{"token":"anonymous"}`,
 			"/release/stable-1.36.txt": "v1.36.5\n",
 			"/release/stable-1.35.txt": "v1.37.0",
@@ -108,6 +124,10 @@ func (u *upstream) serve(t *testing.T) string {
 			w.WriteHeader(http.StatusBadRequest)
 
 			return
+		}
+
+		if signer != "" {
+			answers["/secureboot/signing-cert.pem"] = signer
 		}
 
 		body, ok := answers[r.URL.Path]
@@ -141,7 +161,7 @@ func TestHTTP(t *testing.T) {
 		t.Fatalf("releases only, no pre-release and no alias: got %v, %v", versions, err)
 	}
 
-	if err := h.Installer(ctx, base, "metal", schematic, "v1.14.2"); err != nil {
+	if err := h.Installer(ctx, base, "metal", schematic, "v1.14.2", false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -154,13 +174,13 @@ func TestHTTP(t *testing.T) {
 		{missing, "v1.14.2", "no schematic " + missing},
 		{extended, "v1.14.0", "names the extension siderolabs/intel-hd-audio, which Talos v1.14.0 does not have"},
 	} {
-		err := h.Installer(ctx, base, "metal", tt.schematic, tt.version)
+		err := h.Installer(ctx, base, "metal", tt.schematic, tt.version, false)
 		if !errors.Is(err, ErrNotFound) || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%s %s: got %v, want %q", tt.schematic[:8], tt.version, err, tt.want)
 		}
 	}
 
-	if err := h.Installer(ctx, base, "metal", extended, "v1.14.2"); err != nil {
+	if err := h.Installer(ctx, base, "metal", extended, "v1.14.2", false); err != nil {
 		t.Fatalf("an extension the release has is no problem: %v", err)
 	}
 
@@ -204,6 +224,93 @@ func TestHTTP(t *testing.T) {
 	}
 }
 
+// Who signs the boot images of an Image Factory, and the installer that carries a signed one.
+func TestHTTPAsksWhoSignsBootImages(t *testing.T) {
+	signer := talostest.SigningCertificate(t, "Image signing", nil).Certificate
+	u := &upstream{signer: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signer.Raw}))}
+	base := u.serve(t)
+	h := &HTTP{pause: noPause}
+	ctx := context.Background()
+
+	got, err := h.SecureBootSigner(ctx, base)
+	if err != nil || !got.Equal(signer) {
+		t.Fatalf("got %v, %v", got, err)
+	}
+
+	if err := h.Installer(ctx, base, "metal", schematic, "v1.14.2", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// That Image Factory builds the plain installer of a schematic says nothing about the signed one.
+	if err := h.Installer(ctx, base, "metal", extended, "v1.14.2", true); !errors.Is(err, ErrNotFound) ||
+		!strings.Contains(err.Error(), "metal-installer-secureboot/"+extended) {
+		t.Fatalf("got %v", err)
+	}
+
+	u.mu.Lock()
+	asked := slices.Clone(u.asked)
+	u.mu.Unlock()
+
+	if !slices.Contains(asked, "GET /secureboot/signing-cert.pem") ||
+		!slices.Contains(asked, "HEAD /v2/metal-installer-secureboot/"+schematic+"/manifests/v1.14.2") {
+		t.Fatalf("asked %v", asked)
+	}
+
+	// An answer that is no certificate is no answer, and neither yes nor no.
+	for _, answer := range []string{"<html>moved</html>", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+		string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: signer.RawSubjectPublicKeyInfo}))} {
+		u.answer(0, answer)
+
+		if got, err := h.SecureBootSigner(ctx, base); err == nil || errors.Is(err, ErrNotFound) {
+			t.Errorf("%q: got %v, %v", answer, got, err)
+		}
+	}
+
+	// A factory that signs nothing says so; one that is unwell says nothing.
+	u.answer(0, "")
+
+	if _, err := h.SecureBootSigner(ctx, base); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+
+	u.answer(http.StatusBadGateway, "")
+
+	if _, err := h.SecureBootSigner(ctx, base); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
+	}
+
+	// The certificate decides whether a node is rebooted: it is not asked for over plain HTTP.
+	if _, err := h.SecureBootSigner(ctx, "http://factory.example.com"); err == nil || !strings.Contains(err.Error(), "HTTPS") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// The certificate an Image Factory signs with is asked for once, however many upgrades ask.
+func TestCachedKeepsTheSigner(t *testing.T) {
+	signer := talostest.SigningCertificate(t, "Image signing", nil).Certificate
+	fake := &Fake{Signer: signer}
+	clock := time.Date(2026, 10, 12, 12, 0, 0, 0, time.UTC)
+	c := &Cached{Source: fake, Now: func() time.Time { return clock }}
+	ctx := context.Background()
+
+	for range 3 {
+		if got, err := c.SecureBootSigner(ctx, "https://factory.example.com"); err != nil || !got.Equal(signer) {
+			t.Fatalf("got %v, %v", got, err)
+		}
+
+		clock = clock.Add(time.Hour)
+	}
+
+	if fake.Asked != 1 {
+		t.Fatalf("asked %d times", fake.Asked)
+	}
+
+	// Another factory is another signer.
+	if _, err := c.SecureBootSigner(ctx, "https://factory.example.org"); err != nil || fake.Asked != 2 {
+		t.Fatalf("got %v after %d questions", err, fake.Asked)
+	}
+}
+
 // A source that is there and unwell says nothing about what exists: not yes, and above all not no.
 func TestHTTPTellsAnOutageFromAnAbsence(t *testing.T) {
 	u := &upstream{status: http.StatusBadGateway}
@@ -212,7 +319,7 @@ func TestHTTPTellsAnOutageFromAnAbsence(t *testing.T) {
 	ctx := context.Background()
 
 	for name, err := range map[string]error{
-		"installer": h.Installer(ctx, base, "metal", schematic, "v1.14.2"),
+		"installer": h.Installer(ctx, base, "metal", schematic, "v1.14.2", false),
 		"image":     h.image(ctx, "http", strings.TrimPrefix(base, "http://")+"/siderolabs/kubelet:v1.37.1", requestTimeout),
 	} {
 		if err == nil || errors.Is(err, ErrNotFound) {
@@ -229,7 +336,7 @@ func TestHTTPTellsAnOutageFromAnAbsence(t *testing.T) {
 	}
 
 	gone := "http://127.0.0.1:1"
-	if err := (&HTTP{pause: noPause}).Installer(ctx, gone, "metal", schematic, "v1.14.2"); err == nil || errors.Is(err, ErrNotFound) {
+	if err := (&HTTP{pause: noPause}).Installer(ctx, gone, "metal", schematic, "v1.14.2", false); err == nil || errors.Is(err, ErrNotFound) {
 		t.Errorf("unreachable: got %v", err)
 	}
 }
@@ -402,8 +509,8 @@ func TestCached(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		return c.Installer(ctx, "https://factory.example.com", "metal", schematic, "v1.14.2"),
-			c.Installer(ctx, "https://factory.example.com", "metal", schematic, "v1.14.3")
+		return c.Installer(ctx, "https://factory.example.com", "metal", schematic, "v1.14.2", false),
+			c.Installer(ctx, "https://factory.example.com", "metal", schematic, "v1.14.3", false)
 	}
 
 	yes, no := everything()

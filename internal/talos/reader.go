@@ -87,6 +87,11 @@ type Reader interface {
 	Links(ctx context.Context, node netip.Addr) ([]Link, error)
 	// Volumes returns Talos's volumes on node.
 	Volumes(ctx context.Context, node netip.Addr) ([]Volume, error)
+	// SecureBoot reports whether node's firmware enforces Secure Boot.
+	SecureBoot(ctx context.Context, node netip.Addr) (bool, error)
+	// SecureBootDB returns what node's firmware trusts to boot: the certificates and image hashes
+	// in its signature database. It is read from the one file of a node the operator may read.
+	SecureBootDB(ctx context.Context, node netip.Addr) (SecureBootDB, error)
 	// Logs returns the end of the log of one of node's Talos services: its last lines, and of
 	// those the last 128 KiB.
 	Logs(ctx context.Context, node netip.Addr, service string, lines int32) ([]byte, error)
