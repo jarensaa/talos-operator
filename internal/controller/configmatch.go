@@ -234,7 +234,7 @@ func (r *TalosMachineReconciler) observeConfig(ctx context.Context, tc *talosv1a
 	// Before that, the comparison is what proves adoption, and leaves nothing out.
 	behind := false
 
-	if managing(tc) {
+	if tc.Spec.Management.ManagesConfig() {
 		if desired, behind, err = withLiveKubernetes(desired, raw); err != nil {
 			report(metav1.ConditionFalse, talosv1alpha1.ReasonFailed, "keep the node's Kubernetes images: "+err.Error())
 

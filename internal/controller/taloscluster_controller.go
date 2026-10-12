@@ -57,12 +57,6 @@ const (
 	DefaultObserveInterval = time.Minute
 	// DefaultHealthTimeout bounds the server-side health check per reconcile.
 	DefaultHealthTimeout = 30 * time.Second
-
-	machineTypeControlPlane = "controlplane"
-	machineTypeWorker       = "worker"
-
-	// stageRunning is the Talos machine stage of a booted, configured node.
-	stageRunning = plan.StageRunning
 )
 
 // TalosClusterReconciler observes Talos clusters and reports their state. In observe mode it
@@ -153,7 +147,7 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		adoptErr = r.prove(ctx, tc, obs)
 	}
 
-	if adoptErr == nil && managing(tc) {
+	if adoptErr == nil && tc.Spec.Management.ManagesConfig() {
 		obs.policy, obs.policyChanges = r.policy(ctx, tc)
 		adoptErr = r.manage(ctx, tc, obs)
 
@@ -215,14 +209,14 @@ func (r *TalosClusterReconciler) untilWindow(obs observation, wait time.Duration
 // proving reports whether the adoption proof is evaluated: the cluster is observed only and was
 // reached. The proof's own gate decides whether it can succeed (docs/scope.md §7.1 stage 3).
 func proving(tc *talosv1alpha1.TalosCluster, obs observation) bool {
-	return observing(tc) && obs.facts != nil && obs.reader != nil
+	return !tc.Spec.Management.ManagesConfig() && obs.facts != nil && obs.reader != nil
 }
 
 // adopting reports whether the adoption step runs: the cluster is observed only and every
 // adoption precondition holds (docs/scope.md §7.1 stage 1). The step itself only writes resources
 // until the cluster is adopted; after that it keeps checking the secrets bundle against the nodes.
 func adopting(tc *talosv1alpha1.TalosCluster, obs observation) bool {
-	return observing(tc) && obs.facts != nil &&
+	return !tc.Spec.Management.ManagesConfig() && obs.facts != nil &&
 		meta.IsStatusConditionTrue(tc.Status.Conditions, talosv1alpha1.ConditionAdoptionPreconditionsMet)
 }
 
@@ -327,9 +321,9 @@ func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.
 		}
 
 		switch m.MachineType {
-		case machineTypeControlPlane:
+		case talos.MachineTypeControlPlane:
 			obs.controlPlanes = append(obs.controlPlanes, addr)
-		case machineTypeWorker:
+		case talos.MachineTypeWorker:
 			obs.workers = append(obs.workers, addr)
 		}
 
@@ -343,7 +337,7 @@ func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.
 
 		obs.talosVersions[facts.version]++
 
-		if m.MachineType == machineTypeControlPlane && facts.read && !etcdVia.IsValid() {
+		if m.MachineType == talos.MachineTypeControlPlane && facts.read && !etcdVia.IsValid() {
 			etcdVia = addr
 		}
 	}
@@ -468,7 +462,7 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 		return err
 	})
 
-	if m.MachineType == machineTypeControlPlane {
+	if m.MachineType == talos.MachineTypeControlPlane {
 		reads.read("etcd status", func(ctx context.Context) error {
 			es, err := r.EtcdStatus(ctx, addr)
 			if err == nil {
@@ -592,7 +586,7 @@ func (r *TalosClusterReconciler) applyObservation(tc *talosv1alpha1.TalosCluster
 
 	st.ObservedGeneration = gen
 
-	if observing(tc) {
+	if !tc.Spec.Management.ManagesConfig() {
 		st.Phase = talosv1alpha1.ClusterPhaseAdopting
 		if adopted(tc) {
 			st.Phase = talosv1alpha1.ClusterPhaseAdopted

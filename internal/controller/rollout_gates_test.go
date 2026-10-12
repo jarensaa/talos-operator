@@ -51,12 +51,12 @@ func TestFactsReachTheGatesWithUnknownsIntact(t *testing.T) {
 		credentialsAdmin: true,
 		nodes: []nodeFacts{
 			{
-				hostname: "cp-read", machineType: machineTypeControlPlane, version: "v1.14.2",
-				status: &talos.MachineStatus{Stage: stageRunning, Ready: true}, schematicID: &schematicID,
+				hostname: "cp-read", machineType: talos.MachineTypeControlPlane, version: "v1.14.2",
+				status: &talos.MachineStatus{Stage: talos.StageRunning, Ready: true}, schematicID: &schematicID,
 				configSettled: &settled, etcdStatusRead: true, etcdErrors: []string{"alarm: NOSPACE"}, read: true,
 			},
-			{hostname: "cp-dark", machineType: machineTypeControlPlane, readErr: "timeout"},
-			{hostname: "worker-old", machineType: machineTypeWorker, version: "v1.12.4"},
+			{hostname: "cp-dark", machineType: talos.MachineTypeControlPlane, readErr: "timeout"},
+			{hostname: "worker-old", machineType: talos.MachineTypeWorker, version: "v1.12.4"},
 		},
 		etcdMembers: []talos.EtcdMember{{ID: 1, Hostname: "cp-read", IsLearner: true}},
 	}

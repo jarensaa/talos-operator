@@ -102,7 +102,7 @@ var _ = Describe("TalosMachine binding", func() {
 			SystemUUID: cpUUID, Hostname: cpNodename, KubernetesNodeName: cpNodename,
 		}))
 		Expect(got.Status.Talos).To(Equal(&talosv1alpha1.TalosState{
-			Version: talosVersion, SchematicID: schematic, BootID: cpNodename + "-boot-1", Stage: stageRunning, Ready: true,
+			Version: talosVersion, SchematicID: schematic, BootID: cpNodename + "-boot-1", Stage: talos.StageRunning, Ready: true,
 		}))
 		Expect(got.Status.Kubelet).To(Equal(&talosv1alpha1.KubeletState{Version: kubernetesVersion}))
 		Expect(got.Status.Etcd).To(Equal(&talosv1alpha1.EtcdState{MemberID: "a1", Leader: true}))

@@ -56,7 +56,7 @@ The design is shaped by one kind of cluster: a small bare-metal cluster that som
 | Installer images from Image Factory | Each node's schematic must be tracked and preserved across upgrades. |
 | Storage that lives on the nodes (Ceph, for one) | Node disruption must be gated on the storage system's health. Never wipe user disks. |
 | A CNI installed by something else, kube-proxy disabled | A Kubernetes upgrade must not fight whoever owns those manifests. Syncing Talos's bootstrap manifests is off by default for adopted clusters. |
-| The Kubernetes endpoint is a DNS name resolving to every node | Talos API endpoints used during upgrades must be **IPs of healthy, non-target nodes**, never the DNS name. |
+| The Kubernetes endpoint is a DNS name resolving to every node | Talos API endpoints used during upgrades must be **IPs of nodes other than the target**, never the DNS name. |
 | The secrets bundle may or may not have been kept | Recovery from cluster loss is a rebuild with fresh PKI (§12.7), so an off-cluster copy is optional break-glass, not DR. The operator holds an in-cluster copy (needed to render configs) and must never regenerate it for an existing cluster. |
 | **The files the cluster was built from are stale.** A live cluster diverges from its generated configs and patches. | The live cluster is the only source of truth for adoption. The operator derives the spec from live state, and files are at most cross-checked (§7.1). |
 
@@ -130,7 +130,7 @@ Self-hosted on a 3-CP-only cluster means the operator will drain and reboot its 
 - **2 replicas**, leader election, required pod anti-affinity, PDB `maxUnavailable: 1`.
 - **Every step is persisted before its side effect** (CACPPT's "annotate before etcd-leave" pattern). Example: `status.operation.step = Draining(node-2)` is written before the drain starts. If the leader is evicted, the standby resumes at that step.
 - **Steps are keyed on observed facts, not memory.** A reboot step stores the pre-reboot boot ID. On resume, a changed boot ID means "reboot happened".
-- **Talos calls are never routed through the target node.** `WithEndpoints` uses the IPs of healthy non-target CPs, and `client.WithNode(target)` reaches the target through apid proxying. Endpoints are re-resolved after every reboot.
+- **Talos calls are never routed through the target node.** `WithEndpoints` uses the IPs of the control planes other than the target, all of them, and `client.WithNode(target)` reaches the target through apid proxying. They are not sorted by health: a pass that could not read a member closes every gate anyway (§6.3). Endpoints are re-resolved after every reboot.
 - **The node hosting the current leader is upgraded last** in its group. This minimises failovers; it is not required for correctness.
 
 What self-hosted cannot do: recover from quorum loss, or bootstrap the cluster it lives in. Both remain out-of-band (talosctl + the existing runbook) and are documented, not automated.

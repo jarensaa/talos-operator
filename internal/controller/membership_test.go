@@ -660,7 +660,7 @@ var _ = Describe("Adding and removing machines", func() {
 
 		// It waits in maintenance mode, as what it is, and is left there while it is to stay out.
 		scenario.UpdateNode(wTwo.addr, func(n *fake.Node) {
-			n.MachineType, n.Nodename, n.MachineStatus = fake.TypeWorker, wTwo.name, talos.MachineStatus{Stage: stageRunning, Ready: true}
+			n.MachineType, n.Nodename, n.MachineStatus = fake.TypeWorker, wTwo.name, talos.MachineStatus{Stage: talos.StageRunning, Ready: true}
 		})
 		clock = clock.Add(10 * time.Minute)
 		settle(nil)

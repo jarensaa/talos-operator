@@ -32,6 +32,7 @@ import (
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/plan"
+	"github.com/jarensaa/talos-operator/internal/talos"
 )
 
 // operationTypes reads the types of operation the CRD admits from the marker on the type, so
@@ -238,5 +239,13 @@ func TestAnAnswerNoStepCarriesOutIsRefused(t *testing.T) {
 
 	if _, done := answered(op, plan.Action{Kind: plan.Fail, Reason: plan.FailTimeout, Message: "late"}, now); !done || op.Failure == nil {
 		t.Fatal("a failure halts the operation")
+	}
+}
+
+// The planners judge a node by the stage Talos gives a booted, configured one. They may not ask
+// the Talos machinery for its name, so this holds the two to each other.
+func TestThePlannersCallARunningNodeWhatTalosDoes(t *testing.T) {
+	if plan.StageRunning != talos.StageRunning {
+		t.Fatalf("the planners call it %q and Talos %q", plan.StageRunning, talos.StageRunning)
 	}
 }

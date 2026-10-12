@@ -45,10 +45,6 @@ const defragTimeout = 5 * time.Minute
 // reaches the Talos API with. The others are the authorities of the secrets bundle.
 const certificateOperator = "operator"
 
-func maintenanceEnabled(tc *talosv1alpha1.TalosCluster) bool {
-	return managing(tc) && tc.Spec.Management.Maintenance == talosv1alpha1.CapabilityEnabled
-}
-
 // observeCertificates owns status.certificates: when the operator's own client certificate and
 // the cluster's certificate authorities stop being valid. A certificate that could not be read
 // in this pass keeps the date it had: a date does not change while nobody looks, and the one
@@ -167,7 +163,7 @@ func (r *TalosClusterReconciler) planDefragment(ctx context.Context, tc *talosv1
 		maintained(metav1.ConditionUnknown, talosv1alpha1.ReasonAwaitingStatus, "the size of no etcd member's database was read")
 	case len(result.Pending) == 0:
 		maintained(metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded, "no etcd member's database is due for defragmenting")
-	case !maintenanceEnabled(tc):
+	case !tc.Spec.Management.MayMaintain():
 		maintained(metav1.ConditionFalse, talosv1alpha1.ReasonMaintenanceDisabled,
 			"the etcd database of %s is fragmented, and is left so while spec.management.maintenance is not Enabled", fragmented)
 	case !result.MayStart():

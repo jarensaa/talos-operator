@@ -172,7 +172,7 @@ func (r *TalosClusterReconciler) planKubernetes(ctx context.Context, tc *talosv1
 		return false, nil, err
 	}
 
-	if !upgradesEnabled(tc) {
+	if !tc.Spec.Management.MayUpgrade() {
 		r.reportKubernetes(ctx, tc, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), planned, false)
 
 		return false, nil, nil

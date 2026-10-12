@@ -128,7 +128,7 @@ func fakeNode(addr netip.Addr, machineType, name, uuid string, etcdID uint64) fa
 	return fake.Node{
 		Addr: addr, MachineType: machineType, Nodename: name, EtcdMemberID: etcdID,
 		Version:           talos.VersionInfo{Tag: talosVersion},
-		MachineStatus:     talos.MachineStatus{Stage: stageRunning, Ready: true},
+		MachineStatus:     talos.MachineStatus{Stage: talos.StageRunning, Ready: true},
 		BootID:            name + "-boot-1",
 		SystemInformation: talos.SystemInformation{UUID: uuid},
 		Schematic:         talos.Schematic{ID: schematic},

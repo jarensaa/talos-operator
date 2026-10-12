@@ -79,7 +79,7 @@ func (f clusterFacts) judged() plan.Cluster {
 	for _, n := range f.nodes {
 		m := plan.Member{
 			Hostname:       n.hostname,
-			ControlPlane:   n.machineType == machineTypeControlPlane,
+			ControlPlane:   n.machineType == talos.MachineTypeControlPlane,
 			ReadErr:        n.readErr,
 			Version:        n.version,
 			Schematic:      n.schematicID,

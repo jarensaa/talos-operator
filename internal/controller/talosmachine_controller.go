@@ -159,7 +159,7 @@ func (r *TalosMachineReconciler) observe(ctx context.Context, tm *talosv1alpha1.
 
 		return err
 	}) {
-		if !isMember(tm) {
+		if !tm.IsMember() {
 			// Nothing answers as a node of this cluster, and none was expected to: the machine is
 			// one that is to be added, or one that has left.
 			return r.observeCandidate(ctx, tc, pool, tm, node)
@@ -247,7 +247,7 @@ func (r *TalosMachineReconciler) observeCandidate(ctx context.Context, tc *talos
 		meta.RemoveStatusCondition(&tm.Status.Conditions, talosv1alpha1.ConditionProvisionable)
 
 		return nil
-	case !membershipEnabled(tc):
+	case !tc.Spec.Management.MayChangeMembership():
 		return provisionable(metav1.ConditionFalse, talosv1alpha1.ReasonMembershipDisabled,
 			"nothing is asked of a machine that is not a member while spec.management.membership is not Enabled")
 	}
@@ -465,7 +465,7 @@ func (r *TalosMachineReconciler) observeNode(ctx context.Context, tgt *target.Ta
 	}
 
 	// Only what the node said in this pass makes a machine Ready.
-	if talosState.Stage == stageRunning && talosState.Ready {
+	if talosState.Stage == talos.StageRunning && talosState.Ready {
 		st.Phase = talosv1alpha1.MachinePhaseReady
 	} else {
 		st.Phase = talosv1alpha1.MachinePhasePending
@@ -539,10 +539,10 @@ func setMachineCondition(tm *talosv1alpha1.TalosMachine, condType string, status
 
 func roleMachineType(role talosv1alpha1.MachineRole) string {
 	if role == talosv1alpha1.MachineRoleControlPlane {
-		return machineTypeControlPlane
+		return talos.MachineTypeControlPlane
 	}
 
-	return machineTypeWorker
+	return talos.MachineTypeWorker
 }
 
 // kubeletVersion returns the kubelet version Kubernetes reports for node name, without the

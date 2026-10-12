@@ -60,7 +60,7 @@ func newFleet(tc *talosv1alpha1.TalosCluster, reader client.Reader, facts *clust
 	f.members = make([]talosv1alpha1.TalosMachine, 0, len(all))
 
 	for i := range all {
-		if isMember(&all[i]) {
+		if all[i].IsMember() {
 			f.members = append(f.members, all[i])
 		}
 	}
@@ -188,7 +188,7 @@ func (m boundMachine) kubernetesNode() string {
 // running reports whether the machine's node said, in this pass, that it finished booting and is
 // ready.
 func (m boundMachine) running() bool {
-	return m.node != nil && m.node.status != nil && m.node.status.Stage == stageRunning && m.node.status.Ready
+	return m.node != nil && m.node.status != nil && m.node.status.Stage == talos.StageRunning && m.node.status.Ready
 }
 
 // installed reports whether the node's version and schematic were read, and whether they are the

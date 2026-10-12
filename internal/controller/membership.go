@@ -48,18 +48,6 @@ import (
 
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=delete
 
-// membershipEnabled reports whether the operator may add and remove machines of tc.
-func membershipEnabled(tc *talosv1alpha1.TalosCluster) bool {
-	return managing(tc) && tc.Spec.Management.Membership == talosv1alpha1.CapabilityEnabled
-}
-
-// isMember reports whether a machine counts as a node of its cluster: it was found to be one, and
-// has not been taken out since. A machine that is not is one to be added, or one that has left;
-// no rollout, no upgrade and no proof waits for it (docs/scope.md §7.6).
-func isMember(tm *talosv1alpha1.TalosMachine) bool {
-	return tm.Status.JoinedAt != nil && tm.Status.RemovedAt == nil
-}
-
 // hostnamesInUse are the names a machine that is added must not be given: those of the live
 // members, of the members of etcd, and of the Nodes the cluster's machines are known under.
 func hostnamesInUse(f *fleet, except string) []string {
@@ -76,7 +64,7 @@ func hostnamesInUse(f *fleet, except string) []string {
 	}
 
 	for i := range f.all {
-		if id := f.all[i].Status.Identity; id != nil && f.all[i].Name != except && isMember(&f.all[i]) {
+		if id := f.all[i].Status.Identity; id != nil && f.all[i].Name != except && f.all[i].IsMember() {
 			names = append(names, id.Hostname, id.KubernetesNodeName)
 		}
 	}
@@ -158,7 +146,7 @@ func toAdd(f *fleet) []*talosv1alpha1.TalosMachine {
 
 	for i := range f.all {
 		tm := &f.all[i]
-		if tm.Spec.DesiredState != talosv1alpha1.DesiredStateRemoved && !isMember(tm) && f.of(tm).node == nil {
+		if tm.Spec.DesiredState != talosv1alpha1.DesiredStateRemoved && !tm.IsMember() && f.of(tm).node == nil {
 			out = append(out, tm)
 		}
 	}
@@ -173,7 +161,7 @@ func toRemove(f *fleet) []*talosv1alpha1.TalosMachine {
 
 	for i := range f.all {
 		tm := &f.all[i]
-		if tm.Spec.DesiredState == talosv1alpha1.DesiredStateRemoved && (isMember(tm) || f.of(tm).node != nil) {
+		if tm.Spec.DesiredState == talosv1alpha1.DesiredStateRemoved && (tm.IsMember() || f.of(tm).node != nil) {
 			out = append(out, tm)
 		}
 	}
@@ -198,7 +186,7 @@ func (r *TalosClusterReconciler) planRemoval(tc *talosv1alpha1.TalosCluster, obs
 	})
 
 	leaving := toRemove(f)
-	if len(leaving) == 0 || !membershipEnabled(tc) {
+	if len(leaving) == 0 || !tc.Spec.Management.MayChangeMembership() {
 		return false, nil
 	}
 
@@ -242,7 +230,7 @@ func (r *TalosClusterReconciler) planJoin(ctx context.Context, tc *talosv1alpha1
 	waiting := toAdd(f)
 	planned := make([]plan.JoinMachine, 0, len(waiting))
 
-	if membershipEnabled(tc) {
+	if tc.Spec.Management.MayChangeMembership() {
 		for _, tm := range waiting {
 			v, err := f.view(ctx, tm)
 			if err != nil {
@@ -258,7 +246,7 @@ func (r *TalosClusterReconciler) planJoin(ctx context.Context, tc *talosv1alpha1
 	hold(tc, talosv1alpha1.OperationAddMachine, func(h *talosv1alpha1.Holds) {
 		spent := func(name, config string) bool {
 			tm := f.declared(name)
-			if tm == nil || isMember(tm) {
+			if tm == nil || tm.IsMember() {
 				return true
 			}
 
@@ -321,7 +309,7 @@ func reportMembership(tc *talosv1alpha1.TalosCluster, f *fleet) {
 	case len(leaving)+len(waiting) == 0:
 		current(metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded,
 			"all %d machines that are declared are members, and no member is to be removed", len(f.members))
-	case !membershipEnabled(tc):
+	case !tc.Spec.Management.MayChangeMembership():
 		current(metav1.ConditionFalse, talosv1alpha1.ReasonMembershipDisabled,
 			"%s are not members and %s are to be removed; set spec.management.membership to Enabled to add and remove machines",
 			orNone(names(waiting)), orNone(names(leaving)))
@@ -593,7 +581,7 @@ func (r *TalosClusterReconciler) removalTurns(ctx context.Context, tc *talosv1al
 			m := f.of(f.declared(name))
 
 			// A machine that is no longer asked to leave, or has left by now, has no turn.
-			if m.tm == nil || m.tm.Spec.DesiredState != talosv1alpha1.DesiredStateRemoved || (!isMember(m.tm) && m.node == nil) {
+			if m.tm == nil || m.tm.Spec.DesiredState != talosv1alpha1.DesiredStateRemoved || (!m.tm.IsMember() && m.node == nil) {
 				skipped(op, name)
 
 				return nil
@@ -803,7 +791,7 @@ func (r *TalosClusterReconciler) removeMember(ctx context.Context, tc *talosv1al
 	var peer netip.Addr
 
 	for _, n := range obs.facts.nodes {
-		if n.machineType == machineTypeControlPlane && n.read {
+		if n.machineType == talos.MachineTypeControlPlane && n.read {
 			peer = n.address
 
 			break

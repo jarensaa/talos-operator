@@ -75,7 +75,7 @@ type kind struct {
 	// allowed reports whether spec.management still lets operations of the kind run, and
 	// disabled says that it no longer does. An operation in flight ends then. Nil means the kind
 	// needs nothing beyond config management.
-	allowed  func(*talosv1alpha1.TalosCluster) bool
+	allowed  func(talosv1alpha1.Management) bool
 	disabled string
 	// event names the kind in the reasons of its Events, done is the reason of a turn that is
 	// done, and does what is then true of it.
@@ -112,7 +112,7 @@ func init() {
 			name:      "the upgrade",
 			condition: talosv1alpha1.ConditionTalosUpToDate, running: talosv1alpha1.ReasonUpgrading,
 			finishes: "a node that is already cordoned is still upgraded and uncordoned, no other node is touched",
-			allowed:  upgradesEnabled, disabled: "upgrades were disabled",
+			allowed:  talosv1alpha1.Management.MayUpgrade, disabled: "upgrades were disabled",
 			event: "Upgrade", done: "MachineUpgraded", does: "runs the installed system",
 			nodeHooks: true, skippable: true, remembers: true,
 			turns: (*TalosClusterReconciler).upgradeTurns,
@@ -122,7 +122,7 @@ func init() {
 			condition: talosv1alpha1.ConditionKubernetesUpToDate, running: talosv1alpha1.ReasonUpgrading,
 			finishes: "a component whose config is being tried is still verified and confirmed, nothing else is changed",
 			// A component whose config is being tried goes back by itself, as in a config rollout.
-			allowed: upgradesEnabled, disabled: "upgrades were disabled",
+			allowed: talosv1alpha1.Management.MayUpgrade, disabled: "upgrades were disabled",
 			event: "KubernetesUpgrade", done: "ComponentUpgraded", does: "runs the new version",
 			// A Kubernetes upgrade cannot leave a node out: what follows would be newer than it.
 			remembers: true,
@@ -132,7 +132,7 @@ func init() {
 			name:      "adding machines",
 			condition: talosv1alpha1.ConditionMembershipCurrent, running: talosv1alpha1.ReasonAdding,
 			finishes: "a machine that was handed its config is still seen to join, no other machine is added",
-			allowed:  membershipEnabled, disabled: "membership was disabled",
+			allowed:  talosv1alpha1.Management.MayChangeMembership, disabled: "membership was disabled",
 			event: "Addition", done: "MachineAdded", does: "is a member of the cluster",
 			skippable: true, remembers: true,
 			turns: (*TalosClusterReconciler).joinTurns,
@@ -141,7 +141,7 @@ func init() {
 			name:      "removing machines",
 			condition: talosv1alpha1.ConditionMembershipCurrent, running: talosv1alpha1.ReasonRemoving,
 			finishes: "a node that is already cordoned is still taken out, no other node is touched",
-			allowed:  membershipEnabled, disabled: "membership was disabled",
+			allowed:  talosv1alpha1.Management.MayChangeMembership, disabled: "membership was disabled",
 			event: "Removal", done: "MachineRemoved", does: "has left the cluster",
 			nodeHooks: true, skippable: true, remembers: true,
 			turns: (*TalosClusterReconciler).removalTurns,
@@ -150,7 +150,7 @@ func init() {
 			name:      "defragmenting etcd",
 			condition: talosv1alpha1.ConditionEtcdMaintained, running: talosv1alpha1.ReasonDefragmenting,
 			finishes: "a member that was defragmented is still verified, no other member is defragmented",
-			allowed:  maintenanceEnabled, disabled: "maintenance was disabled",
+			allowed:  talosv1alpha1.Management.MayMaintain, disabled: "maintenance was disabled",
 			event: "Defragmentation", done: "MemberDefragmented", does: "has a defragmented etcd database",
 			// Nothing has to be remembered about a member that was left out, or about an operation
 			// that was ended: the interval keeps the next one away.
@@ -196,7 +196,7 @@ func (r *TalosClusterReconciler) carryOn(ctx context.Context, tc *talosv1alpha1.
 		return fmt.Errorf("the operation in flight is a %s, which this operator does not know how to carry on with", op.Type)
 	}
 
-	if k.allowed != nil && !k.allowed(tc) {
+	if k.allowed != nil && !k.allowed(tc.Spec.Management) {
 		// Nothing may be written any more, so what is in flight is neither finished nor undone.
 		r.finish(tc, talosv1alpha1.OperationAborted, k.disabled+leftCordoned(op))
 

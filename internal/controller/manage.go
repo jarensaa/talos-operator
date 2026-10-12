@@ -26,17 +26,6 @@ import (
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 )
 
-// managing reports whether the operator owns the cluster's config.
-func managing(tc *talosv1alpha1.TalosCluster) bool {
-	return tc.Spec.Management.Config == talosv1alpha1.ConfigManagementManage
-}
-
-// observing reports whether the operator only observes the cluster: its config is the owner's,
-// and nothing is written to Talos.
-func observing(tc *talosv1alpha1.TalosCluster) bool {
-	return tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == ""
-}
-
 // manage runs while config is Manage (docs/scope.md §7.1 stage 4).
 //
 // The first reconcile after entering Manage is the handover: it must find that taking ownership

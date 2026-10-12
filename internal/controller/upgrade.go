@@ -41,11 +41,6 @@ import (
 // follows through an ordinary config rollout, which applies it once the node runs what it names
 // (classify.Installed).
 
-// upgradesEnabled reports whether the operator may upgrade the nodes of tc.
-func upgradesEnabled(tc *talosv1alpha1.TalosCluster) bool {
-	return managing(tc) && tc.Spec.Management.Upgrades == talosv1alpha1.CapabilityEnabled
-}
-
 // upgradeMachine is the planner's view of a machine.
 func (r *TalosClusterReconciler) upgradeMachine(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, m boundMachine,
 ) plan.UpgradeMachine {
@@ -87,7 +82,7 @@ func (r *TalosClusterReconciler) planUpgrade(ctx context.Context, tc *talosv1alp
 		images[m.tm.Name] = m.install.Image
 	}
 
-	if !upgradesEnabled(tc) {
+	if !tc.Spec.Management.MayUpgrade() {
 		reportUpgradesDisabled(tc, planned)
 
 		return false, nil
