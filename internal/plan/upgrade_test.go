@@ -28,7 +28,7 @@ const (
 	bootAfter  = "boot-2"
 )
 
-func upgradeStep(name string) UpgradeStep { return UpgradeStep{Name: name, Since: t0} }
+func upgradeStep(name string) Step { return Step{Name: name, Since: t0} }
 
 // before is a node that still runs the old system, after one that came back on the new one, and
 // fellBack one that came back on the old one.
@@ -60,7 +60,7 @@ func with(n UpgradeNode, mutate func(*UpgradeNode)) UpgradeNode {
 func TestUpgradeHappyPath(t *testing.T) {
 	type turn struct {
 		name string
-		step UpgradeStep
+		step Step
 		node UpgradeNode
 		pre  Gate
 		chk  Gate
@@ -69,7 +69,7 @@ func TestUpgradeHappyPath(t *testing.T) {
 		next string
 	}
 
-	cordonedStep := func(name string) UpgradeStep {
+	cordonedStep := func(name string) Step {
 		s := upgradeStep(name)
 		s.Cordoned, s.BootID = true, bootBefore
 
@@ -118,7 +118,7 @@ func TestUpgradeHappyPath(t *testing.T) {
 
 func TestUpgradeFailures(t *testing.T) {
 	late := timing.StepTimeout
-	cordonedStep := func(name string) UpgradeStep {
+	cordonedStep := func(name string) Step {
 		s := upgradeStep(name)
 		s.Cordoned, s.BootID = true, bootBefore
 
@@ -127,7 +127,7 @@ func TestUpgradeFailures(t *testing.T) {
 
 	tests := []struct {
 		name   string
-		step   UpgradeStep
+		step   Step
 		node   UpgradeNode
 		pre    Gate
 		at     time.Duration
@@ -202,7 +202,7 @@ func TestOnlyAnOperatorsOwnCordonIsUndone(t *testing.T) {
 // upgradeRule names the rule an action breaks in the given situation, or returns "".
 //
 //nolint:gocyclo // one rule per action, spelled out
-func upgradeRule(step UpgradeStep, node UpgradeNode, pre, checks Gate, now time.Time, action Action) string {
+func upgradeRule(step Step, node UpgradeNode, pre, checks Gate, now time.Time, action Action) string {
 	cordoned := node.KubernetesKnown && node.Unschedulable
 	rebooted := node.Reachable && node.BootID != "" && node.BootID != step.BootID
 
@@ -290,7 +290,7 @@ func TestUpgradeInvariants(t *testing.T) {
 			for _, node := range nodes {
 				for _, offset := range offsets {
 					for _, healthyFor := range []time.Duration{-1, 0, timing.Soak} {
-						step := UpgradeStep{Name: name, Since: t0, BootID: bootBefore, Cordoned: ours}
+						step := Step{Name: name, Since: t0, BootID: bootBefore, Cordoned: ours}
 						now := t0.Add(offset)
 
 						if healthyFor >= 0 {
@@ -352,7 +352,7 @@ func TestPlanUpgradeOrder(t *testing.T) {
 		t.Fatalf("order: got %v (blocked %q: %s), want %v", got.Pending, got.BlockReason, got.BlockMessage, want)
 	}
 
-	if got.Images["cp-a"] != home.Image || len(got.Images) != 5 || got.Change == "" {
+	if got.Targets["cp-a"] != home.Image || len(got.Targets) != 5 || got.Change == "" {
 		t.Fatalf("every pending machine carries its installer image: %+v", got)
 	}
 
@@ -371,7 +371,7 @@ func (m UpgradeMachine) onNode(node string) UpgradeMachine {
 }
 
 func TestPlanUpgradeNothingToDo(t *testing.T) {
-	got := PlanUpgrade([]UpgradeMachine{upToDate(cp1, true), upToDate(w1, false)}, UpgradeSettings{Paused: true}, closedPass)
+	got := PlanUpgrade([]UpgradeMachine{upToDate(cp1, true), upToDate(w1, false)}, UpgradeSettings{Policy: pausedPolicy}, closedPass)
 	if got.MayStart() || len(got.Pending) != 0 || got.BlockReason != "" {
 		t.Fatalf("machines on their target need no upgrade and report no block: %+v", got)
 	}
@@ -396,8 +396,8 @@ func TestPlanUpgradeBlocks(t *testing.T) {
 	}{
 		{"a jump Talos does not allow", []UpgradeMachine{upgradable(w1, false), jump}, UpgradeSettings{}, openPass,
 			BlockIncompatible, "cp-1: v1.12.4"},
-		{"incompatible outranks paused", []UpgradeMachine{jump}, UpgradeSettings{Paused: true}, openPass, BlockIncompatible, cp1},
-		{wordPaused, change, UpgradeSettings{Paused: true}, openPass, BlockPaused, "spec.paused"},
+		{"incompatible outranks paused", []UpgradeMachine{jump}, UpgradeSettings{Policy: pausedPolicy}, openPass, BlockIncompatible, cp1},
+		{wordPaused, change, UpgradeSettings{Policy: pausedPolicy}, openPass, BlockPaused, "spec.paused"},
 		{"stale status", append(slices.Clone(change), stale), UpgradeSettings{}, openPass, BlockNotCurrent, w2},
 		{"an aborted upgrade is not started again", change,
 			UpgradeSettings{Aborted: map[string]string{w1: upgradable(w1, false).Image}}, openPass, BlockAborted, wordAborted},

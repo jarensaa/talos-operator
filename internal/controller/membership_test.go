@@ -599,7 +599,7 @@ var _ = Describe("Adding and removing machines", func() {
 		settle(nil)
 		Expect(operation()).To(BeEmpty())
 		Expect(sent(fake.MethodMaintenanceApply, wTwo)).To(Equal(1))
-		Expect(tc.Status.Membership.Add).To(HaveKey(wTwo.name))
+		Expect(tc.Status.Holds[talosv1alpha1.OperationAddMachine].Aborted).To(HaveKey(wTwo.name))
 	})
 
 	It("removes a worker: drained, reset, seen to have forgotten the cluster, and its Node deleted", func() {

@@ -32,9 +32,7 @@ import (
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/adopt"
-	"github.com/jarensaa/talos-operator/internal/classify"
 	"github.com/jarensaa/talos-operator/internal/render"
-	"github.com/jarensaa/talos-operator/internal/talos"
 )
 
 // maxStatusDiff bounds status.config.diff, leaving room under the CRD's 16 KiB limit.
@@ -209,15 +207,7 @@ func (r *TalosMachineReconciler) observeConfig(ctx context.Context, tc *talosv1a
 		setMachineCondition(tm, talosv1alpha1.ConditionConfigMatchesLive, status, reason, message)
 	}
 
-	parsed, err := talos.ParseMachineConfig(raw)
-	if err != nil {
-		cfg.LiveHash = ""
-		report(metav1.ConditionFalse, talosv1alpha1.ReasonParseError, "live config: "+err.Error())
-
-		return nil //nolint:nilerr // reported in ConfigMatchesLive
-	}
-
-	live, err := render.Normalize(parsed)
+	live, err := normalized(raw)
 	if err != nil {
 		cfg.LiveHash = ""
 		report(metav1.ConditionFalse, talosv1alpha1.ReasonParseError, "live config: "+err.Error())
@@ -264,16 +254,12 @@ func (r *TalosMachineReconciler) observeConfig(ctx context.Context, tc *talosv1a
 	diffs = render.Withhold(diffs, resolved.fromSecrets)
 	cfg.Diff = statusDiff(diffs)
 
-	// The class of the change decides how a rollout applies it (docs/scope.md §6.3). A node that
-	// already runs what the config's installer installs takes that part like any other change.
-	var opts []classify.Option
+	// The class of the change decides how a rollout applies it (docs/scope.md §6.3).
+	install, err := adopt.InstallTarget(&tc.Spec, &pool.Spec)
+	installed := err == nil && tm.Status.Talos != nil &&
+		tm.Status.Talos.Version == install.Version && tm.Status.Talos.SchematicID == install.SchematicID
 
-	if install, err := adopt.InstallTarget(&tc.Spec, &pool.Spec); err == nil && tm.Status.Talos != nil &&
-		tm.Status.Talos.Version == install.Version && tm.Status.Talos.SchematicID == install.SchematicID {
-		opts = append(opts, classify.Installed())
-	}
-
-	change, err := classify.Classify(live, desired, opts...)
+	change, err := changeFrom(live, desired, installed)
 	if err != nil {
 		report(metav1.ConditionFalse, talosv1alpha1.ReasonFailed, err.Error())
 

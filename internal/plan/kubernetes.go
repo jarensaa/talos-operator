@@ -18,8 +18,6 @@ package plan
 
 import (
 	"cmp"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -211,7 +209,7 @@ func HopOf(machines []KubernetesMachine, releases Releases) KubernetesHop {
 
 	switch {
 	case to.Major() != from.Major():
-		hop.Problem = fmt.Sprintf("there is no upgrade from Kubernetes %s to %s", hop.From, hop.To)
+		hop.Problem = noWayAcrossMajors(from, to)
 	case to.Minor() > from.Minor()+1:
 		hop.Version = releases.intermediate(from.Major(), from.Minor()+1)
 
@@ -244,7 +242,6 @@ func (h KubernetesHop) target(image KubernetesImage) string {
 
 // KubernetesSettings are the cluster-level inputs of a Kubernetes upgrade decision.
 type KubernetesSettings struct {
-	Paused bool
 	// Aborted is the version whose upgrade a human aborted. It is not started again.
 	Aborted string
 	// Problems are what the checks of the hop found: a Talos version that does not support it, a
@@ -259,35 +256,22 @@ type KubernetesSettings struct {
 }
 
 // KubernetesUpgrade is the planner's answer to "is a Kubernetes upgrade due, and may it start?".
+// Its turns are one component on one machine each: the API server on every control plane, then
+// the controller manager, the scheduler, the kube-proxy image of each control plane's config, and
+// the kubelet on control planes and then on workers. Its targets are the images the components
+// are to name. Held lists the workers that need the upgrade and are on hold.
 type KubernetesUpgrade struct {
+	Due
 	Hop KubernetesHop
-	// Pending lists the turns, in order: the API server on every control plane, then the
-	// controller manager, the scheduler, the kube-proxy image of each control plane's config, and
-	// the kubelet on control planes and then on workers.
-	Pending []string
-	// Images maps each turn to the image its component is to name.
-	Images map[string]string
-	// Change identifies exactly this upgrade: the turns with the images they leave and reach.
-	Change string
 	// Behind lists the machines with a component that does not name what its spec renders.
 	Behind []string
-	// Held lists workers that need the upgrade but are on hold.
-	Held []string
-	// AbortStands is true while an earlier abort covers this upgrade.
-	AbortStands bool
-	// BlockReason and BlockMessage are set when Pending is not empty but the upgrade may not start.
-	BlockReason  string
-	BlockMessage string
 }
-
-// MayStart reports whether an upgrade is due and nothing blocks it.
-func (u KubernetesUpgrade) MayStart() bool { return len(u.Pending) > 0 && u.BlockReason == "" }
 
 // PlanKubernetes decides whether a Kubernetes upgrade is due and whether it may start. p is this
 // pass over the cluster: unlike a rollout that may be there to repair a node, an upgrade starts
 // only when every node is healthy.
 func PlanKubernetes(machines []KubernetesMachine, s KubernetesSettings, p Pass) KubernetesUpgrade {
-	out := KubernetesUpgrade{Hop: HopOf(machines, s.Releases), Images: map[string]string{}}
+	out := KubernetesUpgrade{Hop: HopOf(machines, s.Releases), Due: Due{Targets: map[string]string{}}}
 
 	var stale, heldControlPlanes, downgrades, lines []string
 
@@ -348,14 +332,12 @@ func PlanKubernetes(machines []KubernetesMachine, s KubernetesSettings, p Pass) 
 
 			key := TurnKey(component, m.Name)
 			out.Pending = append(out.Pending, key)
-			out.Images[key] = target
+			out.Targets[key] = target
 			lines = append(lines, key+" "+image.Live+" "+target)
 		}
 	}
 
-	slices.Sort(lines)
-	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
-	out.Change = hex.EncodeToString(sum[:8])
+	out.Change = fingerprint(lines)
 	out.AbortStands = s.Aborted != "" && s.Aborted == out.Hop.To
 
 	if len(out.Pending) == 0 && len(downgrades)+len(heldControlPlanes) > 0 {
@@ -363,46 +345,38 @@ func PlanKubernetes(machines []KubernetesMachine, s KubernetesSettings, p Pass) 
 		out.Pending = slices.Clone(out.Behind)
 	}
 
-	if len(out.Pending) > 0 {
-		out.BlockReason, out.BlockMessage = kubernetesBlock(out, s, p, stale, slices.Compact(heldControlPlanes), downgrades)
+	if len(out.Pending) == 0 {
+		return out
 	}
+
+	var downgrade, held, unchecked block
+
+	if len(downgrades) > 0 {
+		downgrade = block{BlockIncompatible, fmt.Sprintf("Kubernetes is not downgraded, and the spec asks for %s while %s",
+			out.Hop.To, strings.Join(downgrades, ", "))}
+	}
+
+	if len(heldControlPlanes) > 0 {
+		held = block{BlockIncompatible, "a Kubernetes upgrade cannot leave a control plane out, and these are on hold: " +
+			strings.Join(slices.Compact(heldControlPlanes), ", ")}
+	}
+
+	if s.Unchecked != "" {
+		unchecked = block{BlockNotCurrent, "the upgrade could not be checked: " + s.Unchecked}
+	}
+
+	out.BlockReason, out.BlockMessage = firstBlock(
+		downgrade,
+		held,
+		incompatibleBlock(s.Problems),
+		s.Policy.block(),
+		staleBlock(stale),
+		unchecked,
+		abortedBlock(out.AbortStands, "the upgrade to this version"),
+		gateBlock(VerifyGate(p).And(s.Policy.Gates())),
+	)
 
 	return out
-}
-
-// kubernetesBlock returns why a due upgrade may not start, most fundamental reason first.
-func kubernetesBlock(u KubernetesUpgrade, s KubernetesSettings, p Pass, stale, held, downgrades []string) (string, string) {
-	if len(downgrades) > 0 {
-		return BlockIncompatible, fmt.Sprintf("Kubernetes is not downgraded, and the spec asks for %s while %s",
-			u.Hop.To, strings.Join(downgrades, ", "))
-	}
-
-	if len(held) > 0 {
-		return BlockIncompatible, "a Kubernetes upgrade cannot leave a control plane out, and these are on hold: " + strings.Join(held, ", ")
-	}
-
-	if len(s.Problems) > 0 {
-		return BlockIncompatible, strings.Join(s.Problems, "; ")
-	}
-
-	if reason, message := s.Policy.block(s.Paused); reason != "" {
-		return reason, message
-	}
-
-	switch {
-	case len(stale) > 0:
-		return BlockNotCurrent, "waiting for current status of " + strings.Join(stale, ", ")
-	case s.Unchecked != "":
-		return BlockNotCurrent, "the upgrade could not be checked: " + s.Unchecked
-	case u.AbortStands:
-		return BlockAborted, "the upgrade to this version was aborted; change the spec, or revert it, to continue"
-	}
-
-	if gate := VerifyGate(p).And(s.Policy.Gates()); !gate.Open {
-		return BlockGateClosed, gate.Reason
-	}
-
-	return "", ""
 }
 
 // KubernetesTryTimeout is how long Talos keeps the tried config of a component's turn before it
@@ -435,18 +409,5 @@ func NextKubernetesStep(step Step, node Node, pre, checks Gate, t Timing, now ti
 
 	// Nothing was sent yet, and nothing is recorded about the node's config: the config change
 	// that follows the pull is worked out from what the node runs then.
-	switch {
-	case timedOut(step, t, now):
-		if !node.Reachable {
-			return fail(FailTimeout, "not pulled within %s: %s", t.StepTimeout, notReachable)
-		}
-
-		return fail(FailTimeout, "not pulled within %s: %s", t.StepTimeout, pre.Reason)
-	case !node.Reachable:
-		return wait(notReachable)
-	case !pre.Open:
-		return wait("%s", pre.Reason)
-	default:
-		return Action{Kind: Pull}
-	}
+	return step.do(Pull, "pulled", node.Reachable, notReachable, pre, t, now)
 }

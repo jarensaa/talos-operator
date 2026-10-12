@@ -18,8 +18,6 @@ package plan
 
 import (
 	"cmp"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -44,13 +42,7 @@ const (
 	DefaultDefragmentFreePercent = 50
 	DefaultDefragmentMinimumSize = 100 << 20
 	DefaultDefragmentInterval    = 24 * time.Hour
-	blockNotDue                  = ""
-	// BlockTooSoon: etcd was defragmented less than the interval ago.
-	BlockTooSoon = "TooSoon"
 )
-
-// Defrag is the action of StepDefragmenting.
-const Defrag ActionKind = iota + 300
 
 // DefragMember is what the planner needs to know about a control plane's etcd member.
 type DefragMember struct {
@@ -76,7 +68,6 @@ func (m DefragMember) free() int64 {
 
 // DefragSettings is the cluster's side of defragmenting.
 type DefragSettings struct {
-	Paused bool
 	Policy Policy
 	// FreePercent, MinimumSize and Interval are spec.maintenance.etcd, defaults filled in.
 	FreePercent int64
@@ -86,34 +77,33 @@ type DefragSettings struct {
 	Last, Now time.Time
 }
 
-// Defragment is the planner's answer to "is etcd to be defragmented, and may that start?".
+// Defragment is the planner's answer to "is etcd to be defragmented, and may that start?". Its
+// turns are the members to defragment: every control plane, because what fragments one fragments
+// them all, followers first by name and the leader last.
 type Defragment struct {
-	// Pending lists the members to defragment: every control plane, because what fragments one
-	// fragments them all, followers first by name and the leader last.
-	Pending []string
+	Due
 	// Fragmented names the members that are over the threshold, and Detail says the same with
 	// their numbers. The numbers change with every write to the cluster, so they are for a log
 	// and not for a condition.
 	Fragmented []string
 	Detail     []string
-	// Change identifies this defragmentation.
-	Change string
-	// BlockReason and BlockMessage are set when Pending is not empty but it may not start.
-	BlockReason  string
-	BlockMessage string
 }
-
-// MayStart reports whether etcd is to be defragmented and nothing blocks it.
-func (d Defragment) MayStart() bool { return len(d.Pending) > 0 && d.BlockReason == "" }
 
 // PlanDefragment decides whether etcd is to be defragmented and whether that may start.
 func PlanDefragment(members []DefragMember, s DefragSettings, p Pass) Defragment {
-	var out Defragment
+	var (
+		out     Defragment
+		unknown block
+	)
 
 	for _, m := range members {
 		if m.Known && m.Size >= s.MinimumSize && m.free() >= s.FreePercent {
 			out.Fragmented = append(out.Fragmented, m.Name)
 			out.Detail = append(out.Detail, fmt.Sprintf("%s (%d%% of %d MiB is free)", m.Name, m.free(), m.Size>>20))
+		}
+
+		if !m.Known && unknown.reason == "" {
+			unknown = block{BlockNotCurrent, "the size of the etcd database of " + m.Name + " was not read"}
 		}
 	}
 
@@ -133,42 +123,23 @@ func PlanDefragment(members []DefragMember, s DefragSettings, p Pass) Defragment
 		out.Pending = append(out.Pending, m.Name)
 	}
 
-	sum := sha256.Sum256([]byte(strings.Join(out.Fragmented, "\n")))
-	out.Change = hex.EncodeToString(sum[:8])
-
-	switch reason, message := s.Policy.block(s.Paused); {
-	case reason != blockNotDue:
-		out.BlockReason, out.BlockMessage = reason, message
-	case !s.Last.IsZero() && s.Now.Sub(s.Last) < s.Interval:
-		out.BlockReason = BlockTooSoon
-		out.BlockMessage = fmt.Sprintf("etcd was defragmented at %s, and is not again before %s have passed",
-			s.Last.UTC().Format(time.RFC3339), s.Interval)
-	default:
-		// A member that is being defragmented answers nobody. That is only asked of a cluster in
-		// which everything else is in order, and of which every member's numbers are known.
-		for _, m := range members {
-			if !m.Known {
-				out.BlockReason, out.BlockMessage = BlockNotCurrent, "the size of the etcd database of "+m.Name+" was not read"
-
-				return out
-			}
-		}
-
-		if gate := TouchGate(p, "").And(s.Policy.Gates()); !gate.Open {
-			out.BlockReason, out.BlockMessage = BlockGateClosed, gate.Reason
-		}
+	var tooSoon block
+	if !s.Last.IsZero() && s.Now.Sub(s.Last) < s.Interval {
+		tooSoon = block{BlockTooSoon, fmt.Sprintf("etcd was defragmented at %s, and is not again before %s have passed",
+			s.Last.UTC().Format(time.RFC3339), s.Interval)}
 	}
 
-	return out
-}
+	out.Change = fingerprint(out.Fragmented)
+	// A member that is being defragmented answers nobody. That is only asked of a cluster in which
+	// everything else is in order, and of which every member's numbers are known.
+	out.BlockReason, out.BlockMessage = firstBlock(
+		s.Policy.block(),
+		tooSoon,
+		unknown,
+		gateBlock(TouchGate(p, "").And(s.Policy.Gates())),
+	)
 
-// DefragStep is the persisted state of the step of a member that is being defragmented.
-type DefragStep struct {
-	Name string
-	// Since is when this step began.
-	Since time.Time
-	// HealthySince is when verification first passed without interruption; zero if it does not.
-	HealthySince time.Time
+	return out
 }
 
 // NextDefragStep decides what to do for the member that is being defragmented. reachable is
@@ -177,27 +148,18 @@ type DefragStep struct {
 //
 // A member is never defragmented while the gate is closed: not while another member is
 // unhealthy, and not while the member before it has not been verified.
-func NextDefragStep(step DefragStep, reachable bool, pre, checks Gate, t Timing, now time.Time) Action {
+func NextDefragStep(step Step, reachable bool, pre, checks Gate, t Timing, now time.Time) Action {
 	switch step.Name {
 	case StepDefragmenting:
-		switch {
-		case timedOut(Step{Since: step.Since}, t, now):
-			return fail(FailTimeout, "not defragmented within %s: %s", t.StepTimeout, cmp.Or(pre.Reason, notReachable))
-		case !reachable:
-			return wait(notReachable)
-		case !pre.Open:
-			return wait("%s", pre.Reason)
-		default:
-			return Action{Kind: Defrag}
-		}
+		return step.do(Defrag, "defragmented", reachable, notReachable, pre, t, now)
 	case StepVerifying:
 		reason := checks.Reason
 		if !reachable {
 			reason = notReachable
 		}
 
-		return settle(reachable && checks.Open, reason, step.Since, step.HealthySince, t, now)
+		return step.settle(reachable && checks.Open, reason, t, now)
 	default:
-		return fail(FailTimeout, "unknown step %q", step.Name)
+		return unknownStep(step.Name)
 	}
 }

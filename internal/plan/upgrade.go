@@ -18,10 +18,7 @@ package plan
 
 import (
 	"cmp"
-	"crypto/sha256"
-	"encoding/hex"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -54,30 +51,10 @@ const (
 	FailImagePull = "ImagePullFailed"
 	// FailInstall: the installer failed. The node still runs what it ran.
 	FailInstall = "InstallFailed"
-	// FailDrainTimeout: the node's pods could not all be evicted in time. The node stays cordoned.
-	FailDrainTimeout = "DrainTimeout"
 	// FailFellBack: the node rebooted and is running, but not on the system that was installed.
 	// Talos reverts to the previous boot slot by itself when the new one fails to boot.
 	FailFellBack = "FellBack"
 )
-
-// DefaultDrainTimeout bounds the eviction of a node's pods.
-const DefaultDrainTimeout = 10 * time.Minute
-
-// UpgradeStep is the persisted state of the upgrade step in flight.
-type UpgradeStep struct {
-	Name string
-	// Since is when this step began.
-	Since time.Time
-	// BootID is the node's boot ID recorded before the reboot is asked for. A different boot ID
-	// afterwards is the one fact that says the reboot happened.
-	BootID string
-	// Cordoned is true when the operator decided to cordon the node, which it records before it
-	// does so. It only ever uncordons a node it cordoned itself.
-	Cordoned bool
-	// HealthySince is when verification first passed without interruption; zero if it does not.
-	HealthySince time.Time
-}
 
 // UpgradeNode is what was just observed of the step's node.
 type UpgradeNode struct {
@@ -100,24 +77,6 @@ type UpgradeNode struct {
 	PodsLeft int
 }
 
-// Upgrade actions, in addition to the ones a config step uses.
-const (
-	// Pull the installer image to the node.
-	Pull ActionKind = iota + 100
-	// Install the pulled image to the inactive boot slot.
-	Install
-	// MarkCordoned: persist that the operator is about to cordon the node.
-	MarkCordoned
-	// Cordon the node.
-	Cordon
-	// Evict the pods that are left.
-	Evict
-	// Reboot the node; a control plane gives up etcd leadership first.
-	Reboot
-	// Uncordon the node.
-	Uncordon
-)
-
 // NextUpgradeStep decides what to do for the upgrade step in flight.
 //
 // pre is the gate for taking the node down (RebootGate, and nothing pausing the operation). It is
@@ -130,7 +89,7 @@ const (
 //     that already rebooted is never rebooted again;
 //   - a node that came back on anything but the installed system is a failure, never a success;
 //   - a node is only uncordoned by the operator if the operator cordoned it.
-func NextUpgradeStep(step UpgradeStep, node UpgradeNode, pre, checks Gate, t Timing, now time.Time) Action {
+func NextUpgradeStep(step Step, node UpgradeNode, pre, checks Gate, t Timing, now time.Time) Action {
 	switch step.Name {
 	case StepPulling:
 		return nextPulling(step, node, pre, t, now)
@@ -147,7 +106,7 @@ func NextUpgradeStep(step UpgradeStep, node UpgradeNode, pre, checks Gate, t Tim
 	case StepVerifying:
 		return nextSettling(step, node, checks, t, now)
 	default:
-		return fail(FailTimeout, "unknown step %q", step.Name)
+		return unknownStep(step.Name)
 	}
 }
 
@@ -157,103 +116,47 @@ func (n UpgradeNode) installed() bool {
 	return n.Reachable && n.InstallKnown && n.Installed && n.Running
 }
 
-func nextPulling(step UpgradeStep, node UpgradeNode, pre Gate, t Timing, now time.Time) Action {
-	switch {
-	case node.installed():
+func nextPulling(step Step, node UpgradeNode, pre Gate, t Timing, now time.Time) Action {
+	if node.installed() {
 		return advance(StepUncordoning)
-	case timedOut(Step{Since: step.Since}, t, now):
-		return fail(FailTimeout, "not started within %s: %s", t.StepTimeout, cmp.Or(pre.Reason, notReachable))
-	case !node.Reachable:
-		return wait(notReachable)
-	case !pre.Open:
-		// Pulling takes nothing from the cluster, but an upgrade that cannot go on is not begun.
-		return wait("%s", pre.Reason)
-	default:
-		return Action{Kind: Pull}
 	}
+
+	// Pulling takes nothing from the cluster, but an upgrade that cannot go on is not begun.
+	return step.do(Pull, "started", node.Reachable, notReachable, pre, t, now)
 }
 
-func nextInstalling(step UpgradeStep, node UpgradeNode, t Timing, now time.Time) Action {
-	switch {
-	case node.installed():
+func nextInstalling(step Step, node UpgradeNode, t Timing, now time.Time) Action {
+	if node.installed() {
 		return advance(StepUncordoning)
-	case timedOut(Step{Since: step.Since}, t, now):
-		return fail(FailTimeout, "not installed within %s: %s", t.StepTimeout, notReachable)
-	case !node.Reachable:
-		return wait(notReachable)
-	default:
-		return Action{Kind: Install}
 	}
+
+	return step.do(Install, "installed", node.Reachable, notReachable, Gate{Open: true}, t, now)
 }
 
-func nextDraining(step UpgradeStep, node UpgradeNode, pre Gate, t Timing, now time.Time) Action {
-	// A node the operator did not cordon is either not cordoned yet, or cordoned by someone else,
-	// who is then also the one to uncordon it.
-	ours := step.Cordoned
-	cordoned := node.KubernetesKnown && node.Unschedulable
+func nextDraining(step Step, node UpgradeNode, pre Gate, t Timing, now time.Time) Action {
+	if action, draining := step.drain(node.KubernetesKnown, node.KubernetesKnown && node.Unschedulable, node.PodsLeft, pre, t, now); draining {
+		return action
+	}
 
-	switch {
-	case !now.Before(step.Since.Add(t.DrainTimeout)):
-		return fail(FailDrainTimeout, "not drained within %s: %s", t.DrainTimeout, drainWait(node, pre, cordoned))
-	case !node.KubernetesKnown:
-		return wait("the node's Kubernetes Node could not be read")
-	case !cordoned && !pre.Open:
-		return wait("%s", pre.Reason)
-	case !cordoned && !ours:
-		return Action{Kind: MarkCordoned}
-	case !cordoned:
-		return Action{Kind: Cordon}
-	case node.PodsLeft < 0:
-		return wait("the node's pods could not be listed")
-	case node.PodsLeft > 0:
-		return Action{Kind: Evict, Message: drainWait(node, pre, cordoned)}
-	case !node.Reachable || node.BootID == "":
+	if !node.Reachable || node.BootID == "" {
 		// The boot ID is recorded with the next step. Without it nothing could tell later whether
 		// the node rebooted.
 		return wait(notReachable)
-	default:
-		return advance(StepRebooting)
-	}
-}
-
-func drainWait(node UpgradeNode, pre Gate, cordoned bool) string {
-	switch {
-	case !node.KubernetesKnown:
-		return "the node's Kubernetes Node could not be read"
-	case !cordoned:
-		return cmp.Or(pre.Reason, "the node is not cordoned yet")
-	case node.PodsLeft < 0:
-		return "the node's pods could not be listed"
-	default:
-		return pods(node.PodsLeft) + " still on the node"
-	}
-}
-
-func pods(n int) string {
-	if n == 1 {
-		return "1 pod"
 	}
 
-	return strconv.Itoa(n) + " pods"
+	return advance(StepRebooting)
 }
 
-func nextRebooting(step UpgradeStep, node UpgradeNode, pre Gate, t Timing, now time.Time) Action {
-	switch {
-	case node.Reachable && node.BootID != "" && node.BootID != step.BootID:
+func nextRebooting(step Step, node UpgradeNode, pre Gate, t Timing, now time.Time) Action {
+	if node.Reachable && node.BootID != "" && node.BootID != step.BootID {
 		// It rebooted: the request went out and its answer, or the step after it, was lost.
 		return advance(StepBooting)
-	case timedOut(Step{Since: step.Since}, t, now):
-		return fail(FailTimeout, "not rebooted within %s: %s", t.StepTimeout, cmp.Or(pre.Reason, notReachable))
-	case !node.Reachable || node.BootID == "":
-		return wait(notReachable)
-	case !pre.Open:
-		return wait("%s", pre.Reason)
-	default:
-		return Action{Kind: Reboot}
 	}
+
+	return step.do(Reboot, "rebooted", node.Reachable && node.BootID != "", notReachable, pre, t, now)
 }
 
-func nextBooting(step UpgradeStep, node UpgradeNode, t Timing, now time.Time) Action {
+func nextBooting(step Step, node UpgradeNode, t Timing, now time.Time) Action {
 	rebooted := node.Reachable && node.BootID != "" && node.BootID != step.BootID
 
 	switch {
@@ -262,9 +165,9 @@ func nextBooting(step UpgradeStep, node UpgradeNode, t Timing, now time.Time) Ac
 	case rebooted && node.Running && node.InstallKnown:
 		return fail(FailFellBack, "the node rebooted and is running, but not on the system that was installed: "+
 			"Talos falls back to the previous boot when the new one does not come up")
-	case timedOut(Step{Since: step.Since}, t, now) && !rebooted:
+	case step.timedOut(t, now) && !rebooted:
 		return fail(FailTimeout, "the node did not come back from its reboot within %s; check its console", t.StepTimeout)
-	case timedOut(Step{Since: step.Since}, t, now):
+	case step.timedOut(t, now):
 		return fail(FailTimeout, "the node rebooted but did not become ready within %s", t.StepTimeout)
 	case !rebooted:
 		return wait("waiting for the node to reboot")
@@ -273,13 +176,13 @@ func nextBooting(step UpgradeStep, node UpgradeNode, t Timing, now time.Time) Ac
 	}
 }
 
-func nextUncordoning(step UpgradeStep, node UpgradeNode, t Timing, now time.Time) Action {
+func nextUncordoning(step Step, node UpgradeNode, t Timing, now time.Time) Action {
 	switch {
 	case !step.Cordoned:
 		return advance(StepVerifying)
 	case node.KubernetesKnown && !node.Unschedulable:
 		return advance(StepVerifying)
-	case timedOut(Step{Since: step.Since}, t, now):
+	case step.timedOut(t, now):
 		return fail(FailTimeout, "Kubernetes did not report the node Ready within %s; it stays cordoned", t.StepTimeout)
 	case !node.KubernetesKnown:
 		return wait("the node's Kubernetes Node could not be read")
@@ -292,30 +195,17 @@ func nextUncordoning(step UpgradeStep, node UpgradeNode, t Timing, now time.Time
 
 // nextSettling verifies an upgraded node like one whose config was changed: the whole cluster,
 // this node included, must be healthy for the soak before the upgrade moves on.
-func nextSettling(step UpgradeStep, node UpgradeNode, checks Gate, t Timing, now time.Time) Action {
-	healthy := node.installed() && checks.Open
+func nextSettling(step Step, node UpgradeNode, checks Gate, t Timing, now time.Time) Action {
+	if node.Reachable && node.Running && node.InstallKnown && !node.Installed {
+		return fail(FailFellBack, "the node no longer runs the system that was installed")
+	}
 
 	reason := checks.Reason
 	if !node.Reachable {
 		reason = notReachable
 	}
 
-	switch {
-	case node.Reachable && node.Running && node.InstallKnown && !node.Installed:
-		return fail(FailFellBack, "the node no longer runs the system that was installed")
-	case healthy && !step.HealthySince.IsZero() && now.Sub(step.HealthySince) >= t.Soak:
-		return Action{Kind: Complete}
-	case timedOut(Step{Since: step.Since}, t, now):
-		return fail(FailTimeout, "not verified within %s: %s", t.StepTimeout, reason)
-	case !healthy && !step.HealthySince.IsZero():
-		return Action{Kind: MarkUnhealthy, Message: reason}
-	case !healthy:
-		return wait("%s", reason)
-	case step.HealthySince.IsZero():
-		return Action{Kind: MarkHealthy}
-	default:
-		return soaking(Step{HealthySince: step.HealthySince}, t)
-	}
+	return step.settle(node.installed() && checks.Open, reason, t, now)
 }
 
 // UpgradeMachine is what the upgrade planner needs to know about one machine.
@@ -342,7 +232,6 @@ type UpgradeMachine struct {
 
 // UpgradeSettings are the cluster-level inputs of an upgrade decision.
 type UpgradeSettings struct {
-	Paused bool
 	// Skipped and Aborted map a machine to the installer image a human skipped for it, or whose
 	// upgrade a human aborted. Neither is started again; any other image is.
 	Skipped, Aborted map[string]string
@@ -350,39 +239,19 @@ type UpgradeSettings struct {
 	Policy Policy
 }
 
-// Block reasons of an upgrade, besides those of a config rollout.
-const (
-	// BlockIncompatible: a node cannot be taken to the version or installer its spec asks for.
-	BlockIncompatible = "Incompatible"
-)
-
-// Upgrade is the planner's answer to "is a Talos upgrade due, and may it start?".
+// Upgrade is the planner's answer to "is a Talos upgrade due, and may it start?". Its turns are
+// the machines to upgrade: a machine whose node is unhealthy first, then workers before control
+// planes; within a group the node the operator itself runs on and the etcd leader last, then by
+// name. Its targets are the installer images they are to be installed from.
 type Upgrade struct {
-	// Pending lists the machines to upgrade, in order: a machine whose node is unhealthy first,
-	// then workers before control planes; within a group the node the operator itself runs on
-	// and the etcd leader last, then by name.
-	Pending []string
-	// Images maps each pending machine to the installer image it is to be installed from.
-	Images map[string]string
-	// Change identifies exactly this upgrade: the pending machines with what they run and get.
-	Change string
-	// Held lists machines that need an upgrade but are excluded: on hold, or skipped by a human.
-	Held []string
-	// AbortStands is true while an earlier abort still covers everything that is pending.
-	AbortStands bool
-	// BlockReason and BlockMessage are set when Pending is not empty but the upgrade may not start.
-	BlockReason  string
-	BlockMessage string
+	Due
 }
-
-// MayStart reports whether an upgrade is due and nothing blocks it.
-func (u Upgrade) MayStart() bool { return len(u.Pending) > 0 && u.BlockReason == "" }
 
 // PlanUpgrade decides whether a Talos upgrade is due and whether it may start. p is this pass
 // over the cluster: an upgrade starts when the first node of its plan may be taken down.
 func PlanUpgrade(machines []UpgradeMachine, s UpgradeSettings, p Pass) Upgrade {
 	var (
-		out     = Upgrade{Images: map[string]string{}}
+		out     = Upgrade{Due: Due{Targets: map[string]string{}}}
 		pending []UpgradeMachine
 		stale   []string
 	)
@@ -402,17 +271,9 @@ func PlanUpgrade(machines []UpgradeMachine, s UpgradeSettings, p Pass) Upgrade {
 	slices.Sort(out.Held)
 	slices.Sort(stale)
 
-	// An abort stands while any machine cannot be judged, and while every pending machine would
-	// get exactly the installer whose upgrade was aborted.
-	out.AbortStands = len(s.Aborted) > 0 && (len(stale) > 0 || len(pending) > 0)
-
-	if len(pending) == 0 {
-		return out
-	}
-
 	slices.SortFunc(pending, func(a, b UpgradeMachine) int {
 		return cmp.Or(
-			-cmp.Compare(rank(ails(p, Machine{Node: a.Node})), rank(ails(p, Machine{Node: b.Node}))),
+			-cmp.Compare(rank(ails(p, a.Node)), rank(ails(p, b.Node))),
 			cmp.Compare(rank(a.ControlPlane), rank(b.ControlPlane)),
 			cmp.Compare(rank(a.HostsOperator), rank(b.HostsOperator)),
 			cmp.Compare(rank(a.EtcdLeader), rank(b.EtcdLeader)),
@@ -420,55 +281,41 @@ func PlanUpgrade(machines []UpgradeMachine, s UpgradeSettings, p Pass) Upgrade {
 		)
 	})
 
-	lines := make([]string, 0, len(pending))
+	var lines, problems []string
 
 	for _, m := range pending {
 		out.Pending = append(out.Pending, m.Name)
-		out.Images[m.Name] = m.Image
+		out.Targets[m.Name] = m.Image
 		lines = append(lines, m.Name+" "+m.Installed+" "+m.Image)
 
-		if len(stale) == 0 && s.Aborted[m.Name] != m.Image {
-			out.AbortStands = false
-		}
-	}
-
-	slices.Sort(lines)
-
-	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
-	out.Change = hex.EncodeToString(sum[:8])
-	out.BlockReason, out.BlockMessage = upgradeBlock(pending, stale, s, out, p)
-
-	return out
-}
-
-// upgradeBlock returns why a due upgrade may not start, most fundamental reason first.
-func upgradeBlock(pending []UpgradeMachine, stale []string, s UpgradeSettings, u Upgrade, p Pass) (string, string) {
-	var problems []string
-
-	for _, m := range pending {
 		if m.Problem != "" {
 			problems = append(problems, m.Name+": "+m.Problem)
 		}
 	}
 
-	if len(problems) > 0 {
-		return BlockIncompatible, strings.Join(problems, "; ")
+	out.AbortStands = abortStands(s.Aborted, stale, out.Targets)
+
+	if len(pending) == 0 {
+		return out
 	}
 
-	if reason, message := s.Policy.block(s.Paused); reason != "" {
-		return reason, message
+	out.Change = fingerprint(lines)
+	out.BlockReason, out.BlockMessage = firstBlock(
+		incompatibleBlock(problems),
+		s.Policy.block(),
+		staleBlock(stale),
+		abortedBlock(out.AbortStands, "the upgrade to this installer"),
+		gateBlock(RebootGate(p, pending[0].Node).And(s.Policy.Gates())),
+	)
+
+	return out
+}
+
+// incompatibleBlock: something cannot be taken to what its spec asks for at all.
+func incompatibleBlock(problems []string) block {
+	if len(problems) == 0 {
+		return block{}
 	}
 
-	switch {
-	case len(stale) > 0:
-		return BlockNotCurrent, "waiting for current status of " + strings.Join(stale, ", ")
-	case u.AbortStands:
-		return BlockAborted, "the upgrade to this installer was aborted; change the spec, or revert it, to continue"
-	}
-
-	if gate := RebootGate(p, pending[0].Node).And(s.Policy.Gates()); !gate.Open {
-		return BlockGateClosed, gate.Reason
-	}
-
-	return "", ""
+	return block{BlockIncompatible, strings.Join(problems, "; ")}
 }

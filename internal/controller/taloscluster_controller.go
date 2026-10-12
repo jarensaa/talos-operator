@@ -215,18 +215,14 @@ func (r *TalosClusterReconciler) untilWindow(obs observation, wait time.Duration
 // proving reports whether the adoption proof is evaluated: the cluster is observed only and was
 // reached. The proof's own gate decides whether it can succeed (docs/scope.md §7.1 stage 3).
 func proving(tc *talosv1alpha1.TalosCluster, obs observation) bool {
-	observeOnly := tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == ""
-
-	return observeOnly && obs.facts != nil && obs.reader != nil
+	return observing(tc) && obs.facts != nil && obs.reader != nil
 }
 
 // adopting reports whether the adoption step runs: the cluster is observed only and every
 // adoption precondition holds (docs/scope.md §7.1 stage 1). The step itself only writes resources
 // until the cluster is adopted; after that it keeps checking the secrets bundle against the nodes.
 func adopting(tc *talosv1alpha1.TalosCluster, obs observation) bool {
-	observeOnly := tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == ""
-
-	return observeOnly && obs.facts != nil &&
+	return observing(tc) && obs.facts != nil &&
 		meta.IsStatusConditionTrue(tc.Status.Conditions, talosv1alpha1.ConditionAdoptionPreconditionsMet)
 }
 
@@ -264,6 +260,8 @@ type observation struct {
 	// maintenance windows say something else next; zero if they never do (docs/scope.md §6.4).
 	policy        plan.Policy
 	policyChanges time.Time
+	// pass is the pass as the gates see it, once it was worked out; see passOf.
+	pass *plan.Pass
 }
 
 func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions) observation {
@@ -450,13 +448,9 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 	})
 
 	reads.read("schematic", func(ctx context.Context) error {
-		sc, err := r.ImageFactorySchematic(ctx, addr)
-
-		// A node that was not installed from Image Factory has none: that is an answer.
-		if err == nil || errors.Is(err, talos.ErrNotFound) {
-			facts.schematicID = &sc.ID
-
-			return nil
+		id, err := schematicOf(ctx, r, addr)
+		if err == nil {
+			facts.schematicID = &id
 		}
 
 		return err
@@ -480,7 +474,7 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 			if err == nil {
 				facts.etcdErrors = es.Errors
 				facts.etcdStatusRead = true
-				facts.etcdLeader = es.MemberID != 0 && es.MemberID == es.Leader
+				facts.etcdLeader = leads(es)
 				facts.etcdSize, facts.etcdInUse = es.DBSize, es.DBSizeInUse
 			}
 
@@ -493,6 +487,20 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 
 	return facts
 }
+
+// schematicOf is the Image Factory schematic a node was installed from. A node that was not
+// installed from Image Factory has none: that is an answer, and the empty one.
+func schematicOf(ctx context.Context, r talos.Reader, node netip.Addr) (string, error) {
+	schematic, err := r.ImageFactorySchematic(ctx, node)
+	if err != nil && !errors.Is(err, talos.ErrNotFound) {
+		return "", err
+	}
+
+	return schematic.ID, nil
+}
+
+// leads reports whether the etcd member that answered is the one that leads.
+func leads(es talos.EtcdStatus) bool { return es.MemberID != 0 && es.MemberID == es.Leader }
 
 // left lists the addresses of the machines the operator took out of the cluster, or is past the
 // point of taking out: removed, reset and on its way out, or confirmed dead.
@@ -584,7 +592,7 @@ func (r *TalosClusterReconciler) applyObservation(tc *talosv1alpha1.TalosCluster
 
 	st.ObservedGeneration = gen
 
-	if tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == "" {
+	if observing(tc) {
 		st.Phase = talosv1alpha1.ClusterPhaseAdopting
 		if adopted(tc) {
 			st.Phase = talosv1alpha1.ClusterPhaseAdopted
@@ -753,26 +761,23 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 		was = nil
 	}
 
-	// The same events tell the story of every kind of operation, under their own names.
-	kind, done, does := "Rollout", "MachineConfigured", "runs its rendered config"
-
 	of := is
 	if of == nil {
 		of = was
 	}
 
-	if of != nil {
-		switch of.Type { //nolint:exhaustive // every other kind tells the story of a rollout
-		case talosv1alpha1.OperationTalosUpgrade:
-			kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
-		case talosv1alpha1.OperationKubernetesUpgrade:
-			kind, done, does = "KubernetesUpgrade", "ComponentUpgraded", "runs the new version"
-		case talosv1alpha1.OperationAddMachine:
-			kind, done, does = "Addition", "MachineAdded", "is a member of the cluster"
-		case talosv1alpha1.OperationRemoveMachine:
-			kind, done, does = "Removal", "MachineRemoved", "has left the cluster"
-		}
+	if of == nil {
+		return
 	}
+
+	// The same events tell the story of every kind of operation, under its own names. An
+	// operation of a kind that has none is told as what it is called.
+	k, known := kinds[of.Type]
+	if !known {
+		k = kind{event: string(of.Type), done: "TurnDone", does: "is done"}
+	}
+
+	kind, done, does := k.event, k.done, k.does
 
 	if is != nil {
 		if was == nil {

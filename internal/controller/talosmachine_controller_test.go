@@ -97,7 +97,7 @@ var _ = Describe("TalosMachine binding", func() {
 		got := reconcileMachine(tm)
 
 		Expect(matched(got).Status).To(Equal(metav1.ConditionTrue))
-		Expect(got.Status.Phase).To(Equal(machinePhaseReady))
+		Expect(got.Status.Phase).To(Equal(talosv1alpha1.MachinePhaseReady))
 		Expect(got.Status.Identity).To(Equal(&talosv1alpha1.ObservedIdentity{
 			SystemUUID: cpUUID, Hostname: cpNodename, KubernetesNodeName: cpNodename,
 		}))
@@ -140,7 +140,7 @@ var _ = Describe("TalosMachine binding", func() {
 			Expect(k8sClient.Create(ctx, tm)).To(Succeed())
 
 			got := reconcileMachine(tm)
-			Expect(got.Status.Phase).To(Equal(machinePhaseReady))
+			Expect(got.Status.Phase).To(Equal(talosv1alpha1.MachinePhaseReady))
 			Expect(observed(got).Status).To(Equal(metav1.ConditionTrue))
 		})
 
@@ -149,7 +149,7 @@ var _ = Describe("TalosMachine binding", func() {
 
 			got := reconcileMachine(tm)
 
-			Expect(got.Status.Phase).To(Equal(machinePhasePending))
+			Expect(got.Status.Phase).To(Equal(talosv1alpha1.MachinePhasePending))
 			Expect(got.Status.Talos.Ready).To(BeFalse())
 			Expect(got.Status.Talos.Stage).To(BeEmpty())
 			Expect(observed(got).Status).To(Equal(metav1.ConditionFalse))
@@ -163,7 +163,7 @@ var _ = Describe("TalosMachine binding", func() {
 			scenario.FailNext(fake.MethodMachineStatus, cpAddr, nil)
 
 			got = reconcileMachine(tm)
-			Expect(got.Status.Phase).To(Equal(machinePhaseReady))
+			Expect(got.Status.Phase).To(Equal(talosv1alpha1.MachinePhaseReady))
 			Expect(observed(got).Status).To(Equal(metav1.ConditionTrue))
 		})
 
@@ -176,7 +176,7 @@ var _ = Describe("TalosMachine binding", func() {
 			Expect(observed(got).Message).To(ContainSubstring("boot ID"))
 			// The version of a node rarely changes, and is more use stale than missing.
 			Expect(got.Status.Talos.Version).To(Equal(talosVersion))
-			Expect(got.Status.Phase).To(Equal(machinePhaseReady), "the node itself said it is ready")
+			Expect(got.Status.Phase).To(Equal(talosv1alpha1.MachinePhaseReady), "the node itself said it is ready")
 		})
 
 		It("forgets the live config hash it can no longer vouch for", func() {
@@ -205,7 +205,7 @@ var _ = Describe("TalosMachine binding", func() {
 			Expect(observed(got).Message).To(Equal(
 				"not read in the last pass: version, boot ID, schematic, machine status, nodename, machine config, etcd status, " +
 					"services, diagnostics, time status, links, volumes"))
-			Expect(got.Status.Phase).To(Equal(machinePhasePending))
+			Expect(got.Status.Phase).To(Equal(talosv1alpha1.MachinePhasePending))
 			Expect(got.Status.Talos).To(Equal(&talosv1alpha1.TalosState{Version: talosVersion, SchematicID: schematic}))
 			Expect(got.Status.Config.LiveHash).To(BeEmpty())
 			// Which member of etcd it is stays; that it led, and how it was, does not.
@@ -220,7 +220,7 @@ var _ = Describe("TalosMachine binding", func() {
 
 			Expect(matched(got).Status).To(Equal(metav1.ConditionUnknown))
 			Expect(observed(got).Status).To(Equal(metav1.ConditionFalse))
-			Expect(got.Status.Phase).To(Equal(machinePhasePending))
+			Expect(got.Status.Phase).To(Equal(talosv1alpha1.MachinePhasePending))
 			Expect(got.Status.Talos).To(Equal(&talosv1alpha1.TalosState{Version: talosVersion, SchematicID: schematic}))
 			Expect(got.Status.Config.LiveHash).To(BeEmpty())
 			// Who it was stays on record.
@@ -242,7 +242,7 @@ var _ = Describe("TalosMachine binding", func() {
 		got := reconcileMachine(tm)
 
 		Expect(matched(got).Status).To(Equal(metav1.ConditionFalse))
-		Expect(matched(got).Reason).To(Equal(reasonIdentityMismatch))
+		Expect(matched(got).Reason).To(Equal(talosv1alpha1.ReasonIdentityMismatch))
 		Expect(got.Status.Talos).To(BeNil())
 		Expect(scenario.CallsFor(fake.MethodVersion)).To(BeEmpty())
 	})
@@ -254,7 +254,7 @@ var _ = Describe("TalosMachine binding", func() {
 		got := reconcileMachine(tm)
 
 		Expect(matched(got).Status).To(Equal(metav1.ConditionFalse))
-		Expect(matched(got).Reason).To(Equal(reasonRoleMismatch))
+		Expect(matched(got).Reason).To(Equal(talosv1alpha1.ReasonRoleMismatch))
 	})
 
 	It("flags two machines claiming the same hardware as a conflict on both", func() {

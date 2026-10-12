@@ -195,20 +195,22 @@ func TestStepNodeConcludesNothingFromAPartialView(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	full := machineView{node: &nodeFacts{activeConfig: raw, persistentConfig: raw}, live: live}
+	full := machineView{boundMachine: boundMachine{node: &nodeFacts{activeConfig: raw, persistentConfig: raw}}, live: live}
 	if got := stepNode(full); !got.Reachable || got.ActiveHash != hash || got.PersistentHash != hash {
 		t.Fatalf("a node read in full: %+v", got)
 	}
 
-	fromDisk := machineView{node: &nodeFacts{activeConfig: raw}, live: live}
+	fromDisk := machineView{boundMachine: boundMachine{node: &nodeFacts{activeConfig: raw}}, live: live}
 	if got := stepNode(fromDisk); !got.Reachable || got.PersistentHash != "" {
 		t.Fatalf("a node booted from disk has no persistent config: %+v", got)
 	}
 
+	unreadable := []byte("not: [a config")
+
 	for name, v := range map[string]machineView{
 		"no node with the machine's identity": {live: live},
-		"active config not read":              {node: &nodeFacts{}},
-		"persistent config unreadable":        {node: &nodeFacts{activeConfig: raw, persistentConfig: []byte("not: [a config")}, live: live},
+		"active config not read":              {boundMachine: boundMachine{node: &nodeFacts{}}},
+		"persistent config unreadable":        {boundMachine: boundMachine{node: &nodeFacts{activeConfig: raw, persistentConfig: unreadable}}, live: live},
 	} {
 		if got := stepNode(v); got != (plan.Node{}) {
 			t.Errorf("%s: expected an unreachable node, got %+v", name, got)
@@ -244,7 +246,8 @@ func TestEveryFailureGetsItsOwnToken(t *testing.T) {
 	for attempt := range int32(3) {
 		for _, at := range []time.Time{now, now.Add(time.Nanosecond)} {
 			op := &talosv1alpha1.Operation{
-				ID: "op-1", Current: &talosv1alpha1.OperationStep{Machine: "w-1", Step: plan.StepTrying, Attempt: attempt},
+				ID: "op-1", Type: talosv1alpha1.OperationConfigRollout,
+				Current: &talosv1alpha1.OperationStep{Machine: "w-1", Step: plan.StepTrying, Attempt: attempt},
 			}
 			failOperation(op, plan.FailRolledBack, "reverted", at)
 

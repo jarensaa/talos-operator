@@ -150,19 +150,22 @@ func TestGateAnd(t *testing.T) {
 	}
 }
 
+// pausedPolicy is the policy of a cluster whose spec.paused is set.
+var pausedPolicy = Policy{Paused: true}
+
 func TestPolicy(t *testing.T) {
 	var none Policy
-	if !none.Gates().Open || !none.Hold(false).Open {
+	if !none.Gates().Open || !none.Hold().Open {
 		t.Fatal("a cluster that declares no policy is held back by none")
 	}
 
-	if none.Hold(true).Open {
+	if (Policy{Paused: true}).Hold().Open {
 		t.Fatal("paused holds every new node")
 	}
 
 	p := Policy{OutsideWindow: "outside the maintenance windows", GateClosed: "gate ceph: HEALTH_WARN"}
-	if p.Hold(false).Open || p.Hold(false).Reason != p.OutsideWindow {
-		t.Fatalf("outside a window no node begins: %+v", p.Hold(false))
+	if p.Hold().Open || p.Hold().Reason != p.OutsideWindow {
+		t.Fatalf("outside a window no node begins: %+v", p.Hold())
 	}
 
 	if p.Gates().Open || p.Gates().Reason != p.GateClosed {

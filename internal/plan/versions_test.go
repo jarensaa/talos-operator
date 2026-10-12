@@ -267,7 +267,40 @@ func TestHopOfUsesKnownReleases(t *testing.T) {
 	}
 
 	plan := PlanKubernetes(far, KubernetesSettings{Releases: Releases{"1.36": "1.36.5"}}, healthyPass())
-	if plan.Images["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.5" {
-		t.Fatalf("images: %v", plan.Images)
+	if plan.Targets["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.5" {
+		t.Fatalf("images: %v", plan.Targets)
+	}
+}
+
+// The hop an upgrade takes next (HopOf, from what the nodes' configs name) and the way that is
+// worked out ahead (KubernetesHops, from versions) are the same rule asked two ways: one minor at
+// a time, through the release that is known of each. They must agree on where an upgrade goes
+// first, and on what has no way at all.
+func TestTheNextHopIsTheFirstOfTheWay(t *testing.T) {
+	releases := Releases{"1.35": "1.35.9", "1.36": "1.36.5"}
+
+	cluster := func(from, to string) []KubernetesMachine {
+		image := KubernetesImage{Live: "registry.k8s.io/kube-apiserver:v" + from, Desired: "registry.k8s.io/kube-apiserver:v" + to}
+
+		images := map[string]KubernetesImage{ComponentAPIServer: image}
+
+		return []KubernetesMachine{{Name: "cp1", ControlPlane: true, Current: true, Images: images}}
+	}
+
+	for _, tt := range []struct{ from, to string }{
+		{"1.34.2", "1.34.3"}, {"1.34.2", "1.35.1"}, {"1.34.2", "1.36.5"}, {"1.34.2", "1.37.0"}, {"1.34.2", "2.0.0"},
+	} {
+		t.Run(tt.from+" to "+tt.to, func(t *testing.T) {
+			way, problem := KubernetesHops(tt.from, tt.to, releases)
+			hop := HopOf(cluster(tt.from, tt.to), releases)
+
+			if hop.Problem != problem {
+				t.Fatalf("the next hop says %q and the way ahead says %q", hop.Problem, problem)
+			}
+
+			if problem == "" && hop.Version != way[0] {
+				t.Fatalf("the next hop goes to %s and the way ahead begins with %s", hop.Version, way[0])
+			}
+		})
 	}
 }

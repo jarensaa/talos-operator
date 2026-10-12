@@ -21,12 +21,11 @@ package plan
 
 import (
 	"cmp"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
 
+	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/classify"
 )
 
@@ -44,89 +43,39 @@ type Machine struct {
 	// LiveHash, DesiredHash and AppliedHash are hashes of normalized configs: what the node runs,
 	// what its spec renders, and what the operator last applied or took over.
 	LiveHash, DesiredHash, AppliedHash string
-	// SkippedHash is a rendered config a human skipped for this machine.
-	SkippedHash string
 	// Class and Reasons classify the change from live to desired.
 	Class   classify.Class
 	Reasons []string
 }
 
-// Drift policies.
-const (
-	DriftReport  = "Report"
-	DriftEnforce = "Enforce"
-)
-
 // Settings are the cluster-level inputs of a rollout decision.
 type Settings struct {
-	DriftPolicy string
-	Paused      bool
+	DriftPolicy talosv1alpha1.DriftPolicy
 	// ApprovedChange is the change hash a human approved, if any.
 	ApprovedChange string
-	// AbortedTargets is what the operation a human aborted was rolling out: machine name to
-	// rendered config hash. Nil if nothing was aborted.
-	AbortedTargets map[string]string
+	// Skipped and Aborted map a machine to the rendered config hash a human left it out with, or
+	// whose rollout a human aborted. Neither is rolled out again; any other config is.
+	Skipped, Aborted map[string]string
 	// Policy is the user's rollout policy as it stands now (docs/scope.md §6.4).
 	Policy Policy
 }
 
-// Gate is a condition that must hold before a node is touched.
-type Gate struct {
-	Open bool
-	// Reason says what is closed.
-	Reason string
-	// Note says what an open gate did not ask about, if anything.
-	Note string
-	// block is the reason a plan gives for not starting when this gate is what closes it, where
-	// that is something more particular than a closed gate: a quorum at risk, a name in use.
-	block string
-}
-
-// Block reasons of a rollout that may not start. They match the RolloutBlocked condition reasons.
-const (
-	BlockPaused            = "Paused"
-	BlockNotCurrent        = "AwaitingStatus"
-	BlockProtected         = "ProtectedChange"
-	BlockRequiresReinstall = "RequiresReinstall"
-	BlockAwaitingUpgrade   = "AwaitingUpgrade"
-	// BlockAwaitingKubernetes: a Kubernetes upgrade has to change the config first.
-	BlockAwaitingKubernetes = "AwaitingKubernetesUpgrade"
-	BlockAborted            = "Aborted"
-	BlockAwaitingApproval   = "AwaitingApproval"
-	BlockGateClosed         = "GateClosed"
-)
-
-// Rollout is the planner's answer to "is a config rollout due, and may it start?".
+// Rollout is the planner's answer to "is a config rollout due, and may it start?". Its turns are
+// the machines whose config must change: a machine whose node is unhealthy first, then workers
+// before control planes, each group by name. Its targets are the rendered config hashes they are
+// to reach.
 type Rollout struct {
-	// Pending lists the machines whose config must change, in rollout order: a machine whose
-	// node is unhealthy first, then workers before control planes, each group by name.
-	Pending []string
-	// Targets maps each pending machine to the rendered config hash it is to reach, and Bases to
-	// the live config hash it is to leave. An operation applies exactly these pairs: they are what
-	// was classified and, where needed, approved.
-	Targets map[string]string
-	Bases   map[string]string
-	// ChangeHash identifies exactly this change: the pending machines with their live and desired
-	// hashes. Approvals and aborts refer to it, so neither can be replayed onto another change.
-	ChangeHash string
+	Due
+	// Bases maps each pending machine to the live config hash it is to leave. An operation applies
+	// exactly the change from base to target: that pair is what was classified and, where needed,
+	// approved.
+	Bases map[string]string
 	// Drifted lists machines whose live config differs from what was applied while their spec is
 	// unchanged, and which the drift policy leaves alone.
 	Drifted []string
-	// Held lists machines that need a change but are excluded: on hold, or skipped by a human.
-	Held []string
 	// NeedsApproval lists pending machines whose change class requires a human's approval.
 	NeedsApproval []string
-	// AbortStands is true while an earlier abort still applies: every pending machine would get
-	// exactly the config whose rollout was aborted, or that cannot be told yet. Once it is
-	// false the abort is spent and can be forgotten.
-	AbortStands bool
-	// BlockReason and BlockMessage are set when Pending is not empty but the rollout may not start.
-	BlockReason  string
-	BlockMessage string
 }
-
-// MayStart reports whether a rollout is due and nothing blocks it.
-func (r Rollout) MayStart() bool { return len(r.Pending) > 0 && r.BlockReason == "" }
 
 // PlanRollout decides whether a config rollout is due and whether it may start. p is this pass
 // over the cluster: a rollout starts when the first node of its plan may be touched (TouchGate).
@@ -135,7 +84,7 @@ func (r Rollout) MayStart() bool { return len(r.Pending) > 0 && r.BlockReason ==
 // node is unhealthy, so any other order would wait for the node the rollout is there to repair.
 func PlanRollout(machines []Machine, s Settings, p Pass) Rollout {
 	var (
-		out     = Rollout{Targets: map[string]string{}, Bases: map[string]string{}}
+		out     = Rollout{Due: Due{Targets: map[string]string{}}, Bases: map[string]string{}}
 		pending []Machine
 		stale   []string
 	)
@@ -156,9 +105,9 @@ func PlanRollout(machines []Machine, s Settings, p Pass) Rollout {
 		specChanged := m.DesiredHash != m.AppliedHash
 
 		switch {
-		case m.Hold, m.SkippedHash == m.DesiredHash:
+		case m.Hold, s.Skipped[m.Name] == m.DesiredHash:
 			out.Held = append(out.Held, m.Name)
-		case specChanged, s.DriftPolicy == DriftEnforce:
+		case specChanged, s.DriftPolicy == talosv1alpha1.DriftPolicyEnforce:
 			pending = append(pending, m)
 		default:
 			out.Drifted = append(out.Drifted, m.Name)
@@ -169,132 +118,80 @@ func PlanRollout(machines []Machine, s Settings, p Pass) Rollout {
 	slices.Sort(out.Drifted)
 	slices.Sort(stale)
 
-	out.AbortStands = abortStands(pending, stale, s.AbortedTargets)
-
-	if len(pending) == 0 {
-		return out
-	}
-
 	slices.SortFunc(pending, func(a, b Machine) int {
 		return cmp.Or(
-			-cmp.Compare(rank(ails(p, a)), rank(ails(p, b))),
+			-cmp.Compare(rank(ails(p, a.Node)), rank(ails(p, b.Node))),
 			cmp.Compare(rank(a.ControlPlane), rank(b.ControlPlane)),
 			strings.Compare(a.Name, b.Name),
 		)
 	})
 
+	lines := make([]string, 0, len(pending))
+
 	for _, m := range pending {
 		out.Pending = append(out.Pending, m.Name)
 		out.Targets[m.Name] = m.DesiredHash
 		out.Bases[m.Name] = m.LiveHash
+		lines = append(lines, m.Name+" "+m.LiveHash+" "+m.DesiredHash)
 
 		if m.Class.NeedsApproval() {
 			out.NeedsApproval = append(out.NeedsApproval, m.Name)
 		}
 	}
 
-	out.ChangeHash = changeHash(pending)
-	out.BlockReason, out.BlockMessage = rolloutBlock(pending, stale, s, TouchGate(p, pending[0].Node).And(s.Policy.Gates()), out)
+	out.AbortStands = abortStands(s.Aborted, stale, out.Targets)
+
+	if len(pending) == 0 {
+		return out
+	}
+
+	out.Change = fingerprint(lines)
+	out.BlockReason, out.BlockMessage = firstBlock(
+		classBlock(pending, classify.Protected, BlockProtected, "protected config would change, which the operator never does"),
+		classBlock(pending, classify.BootTime, BlockRequiresReinstall,
+			"the change only takes effect through a reinstall, which is not supported yet"),
+		classBlock(pending, classify.Kubernetes, BlockAwaitingKubernetes,
+			"the config names another version of a Kubernetes component than the node runs, which a "+
+				"Kubernetes upgrade brings about, in its own order (spec.management.upgrades)"),
+		classBlock(pending, classify.Installer, BlockAwaitingUpgrade,
+			"the config names an installer image the node does not run yet, which a Talos upgrade "+
+				"brings about (spec.management.upgrades); it is applied once the node runs it"),
+		s.Policy.block(),
+		staleBlock(stale),
+		abortedBlock(out.AbortStands, "the rollout of this config"),
+		approvalBlock(out, s.ApprovedChange),
+		gateBlock(TouchGate(p, pending[0].Node).And(s.Policy.Gates())),
+	)
 
 	return out
 }
 
-// ails reports whether the machine's node is known to be unhealthy.
-func ails(p Pass, m Machine) bool {
-	if p.Cluster == nil {
-		return false
-	}
-
-	member, known := p.Cluster.member(m.Node)
-
-	return known && member.ails()
-}
-
-func rank(b bool) int {
-	if b {
-		return 1
-	}
-
-	return 0
-}
-
-// abortStands reports whether an abort still covers what is pending. It does while any machine
-// cannot be judged, and while every pending machine is to get the config the aborted operation
-// was rolling out to it. A pending machine with any other config is a change the human who
-// aborted has not seen: the spec moved on, and so does the rollout.
-func abortStands(pending []Machine, stale []string, aborted map[string]string) bool {
-	if len(aborted) == 0 {
-		return false
-	}
-
-	if len(stale) > 0 {
-		return true
-	}
+// classBlock: a change of a class that a rollout does not apply. why says what keeps it back.
+func classBlock(pending []Machine, class classify.Class, reason, why string) block {
+	var blocked []Machine
 
 	for _, m := range pending {
-		if aborted[m.Name] != m.DesiredHash {
-			return false
-		}
-	}
-
-	return len(pending) > 0
-}
-
-// rolloutBlock returns why a due rollout may not start, most fundamental reason first.
-func rolloutBlock(pending []Machine, stale []string, s Settings, gate Gate, r Rollout) (string, string) {
-	if blocked := withClass(pending, classify.Protected); len(blocked) > 0 {
-		return BlockProtected, "protected config would change, which the operator never does: " + describe(blocked)
-	}
-
-	if blocked := withClass(pending, classify.BootTime); len(blocked) > 0 {
-		return BlockRequiresReinstall, "the change only takes effect through a reinstall, which is not supported yet: " + describe(blocked)
-	}
-
-	if blocked := withClass(pending, classify.Kubernetes); len(blocked) > 0 {
-		return BlockAwaitingKubernetes, "the config names another version of a Kubernetes component than the node runs, which a " +
-			"Kubernetes upgrade brings about, in its own order (spec.management.upgrades): " + describe(blocked)
-	}
-
-	if blocked := withClass(pending, classify.Installer); len(blocked) > 0 {
-		return BlockAwaitingUpgrade, "the config names an installer image the node does not run yet, which a Talos upgrade " +
-			"brings about (spec.management.upgrades); it is applied once the node runs it: " + describe(blocked)
-	}
-
-	if reason, message := s.Policy.block(s.Paused); reason != "" {
-		return reason, message
-	}
-
-	if len(stale) > 0 {
-		return BlockNotCurrent, "waiting for current status of " + strings.Join(stale, ", ")
-	}
-
-	if r.AbortStands {
-		return BlockAborted, "the rollout of this config was aborted; change the spec, or revert it, to continue"
-	}
-
-	if len(r.NeedsApproval) > 0 && s.ApprovedChange != r.ChangeHash {
-		return BlockAwaitingApproval, fmt.Sprintf(
-			"the change to %s needs approval: review each machine's status.config.diff, then approve change %s",
-			strings.Join(r.NeedsApproval, ", "), r.ChangeHash)
-	}
-
-	if !gate.Open {
-		return BlockGateClosed, gate.Reason
-	}
-
-	return "", ""
-}
-
-func withClass(machines []Machine, class classify.Class) []Machine {
-	var out []Machine
-
-	for _, m := range machines {
 		if m.Class == class {
-			out = append(out, m)
+			blocked = append(blocked, m)
 		}
 	}
 
-	return out
+	if len(blocked) == 0 {
+		return block{}
+	}
+
+	return block{reason, why + ": " + describe(blocked)}
+}
+
+// approvalBlock: a change that needs a human's approval, which approves exactly this change.
+func approvalBlock(r Rollout, approved string) block {
+	if len(r.NeedsApproval) == 0 || approved == r.Change {
+		return block{}
+	}
+
+	return block{BlockAwaitingApproval, fmt.Sprintf(
+		"the change to %s needs approval: review each machine's status.config.diff, then approve change %s",
+		strings.Join(r.NeedsApproval, ", "), r.Change)}
 }
 
 // describe names machines with the reasons for their class, bounded for a condition message.
@@ -316,19 +213,4 @@ func describe(machines []Machine) string {
 	}
 
 	return strings.Join(parts, "; ")
-}
-
-// changeHash fingerprints a change: which machines go from which live config to which rendered
-// config. It does not depend on the order of machines.
-func changeHash(pending []Machine) string {
-	lines := make([]string, 0, len(pending))
-	for _, m := range pending {
-		lines = append(lines, m.Name+" "+m.LiveHash+" "+m.DesiredHash)
-	}
-
-	slices.Sort(lines)
-
-	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
-
-	return hex.EncodeToString(sum[:8])
 }

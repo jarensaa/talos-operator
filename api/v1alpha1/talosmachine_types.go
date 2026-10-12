@@ -79,8 +79,29 @@ type TalosMachineSpec struct {
 }
 
 // MachinePhase summarises the machine's lifecycle position.
-// +kubebuilder:validation:Enum=Pending;AwaitingIdentity;Provisioning;Joining;Ready;Updating;Draining;Rebooting;Removing;Removed;Failed
+// +kubebuilder:validation:Enum=Pending;AwaitingIdentity;Provisioning;Joining;Ready;Draining;Removing;Removed
 type MachinePhase string
+
+const (
+	// MachinePhasePending: the machine's node does not report itself running and ready, or was not
+	// read in the last pass.
+	MachinePhasePending MachinePhase = "Pending"
+	// MachinePhaseReady: the node said, in the last pass, that it runs and is ready.
+	MachinePhaseReady MachinePhase = "Ready"
+	// MachinePhaseAwaitingIdentity: the machine that waits in maintenance mode at the address is
+	// not the one that was declared. It is sent nothing.
+	MachinePhaseAwaitingIdentity MachinePhase = "AwaitingIdentity"
+	// MachinePhaseProvisioning: the machine is being handed its config.
+	MachinePhaseProvisioning MachinePhase = "Provisioning"
+	// MachinePhaseJoining: the machine took its config and is becoming a member.
+	MachinePhaseJoining MachinePhase = "Joining"
+	// MachinePhaseDraining: the machine is being removed, and its pods are being evicted.
+	MachinePhaseDraining MachinePhase = "Draining"
+	// MachinePhaseRemoving: the machine is leaving the cluster.
+	MachinePhaseRemoving MachinePhase = "Removing"
+	// MachinePhaseRemoved: the machine has left the cluster.
+	MachinePhaseRemoved MachinePhase = "Removed"
+)
 
 // ObservedIdentity is the identity read from the live node.
 type ObservedIdentity struct {
@@ -133,10 +154,6 @@ type ConfigState struct {
 	// rollout is due; LiveHash differing from it means the node drifted.
 	// +optional
 	AppliedHash string `json:"appliedHash,omitempty"`
-	// SkippedHash is a rendered config a human skipped for this machine after a failed rollout.
-	// The same config is not rolled out to it again.
-	// +optional
-	SkippedHash string `json:"skippedHash,omitempty"`
 	// ChangeClass classifies the pending change from live to rendered config, e.g. LiveSafe or
 	// Connectivity (docs/scope.md §6.3). Empty when they are equal.
 	// +optional

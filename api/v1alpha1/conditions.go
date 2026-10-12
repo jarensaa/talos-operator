@@ -167,8 +167,6 @@ const (
 	// Reasons of Provisionable, and of the conditions of a machine that is no member.
 	// ReasonNotAMember: the machine is not a member of the cluster, so there is no node to read.
 	ReasonNotAMember = "NotAMember"
-	// ReasonMember: the machine is a member of the cluster already.
-	ReasonMember = "Member"
 	// ReasonMembershipDisabled: spec.management.membership is not Enabled, so nothing is asked of
 	// a machine that is not a member.
 	ReasonMembershipDisabled = "MembershipDisabled"
@@ -177,6 +175,8 @@ const (
 	ReasonNotInMaintenance = "NotInMaintenance"
 	// ReasonIdentityMismatch: the machine at the address is not the one that was declared.
 	ReasonIdentityMismatch = "IdentityMismatch"
+	// ReasonRoleMismatch: the node at the address is not of the role its machine's pool declares.
+	ReasonRoleMismatch = "RoleMismatch"
 	// ReasonConfigDoesNotFit: the rendered config names a disk or a link the machine does not have.
 	ReasonConfigDoesNotFit = "ConfigDoesNotFit"
 	// Reasons of EtcdMaintained. A defragmentation that is due and does not start has the reason

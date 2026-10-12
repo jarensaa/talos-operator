@@ -31,12 +31,10 @@ import (
 	"github.com/jarensaa/talos-operator/internal/talos"
 )
 
-// proofNode is a TalosMachine bound to its live node, ready to be proven.
+// proofNode is a machine with its live node and that node's config, ready to be proven.
 type proofNode struct {
-	machine *talosv1alpha1.TalosMachine
-	pool    *talosv1alpha1.TalosMachinePool
-	node    nodeFacts
-	live    *render.Config
+	boundMachine
+	live *render.Config
 }
 
 // proofGate decides whether the adoption proof can run (docs/scope.md §7.1 stage 3). It is pure
@@ -64,19 +62,15 @@ func proofGate(tc *talosv1alpha1.TalosCluster, facts *clusterFacts, unmatched []
 		return nil, "the cluster has no TalosMachines"
 	}
 
-	byUUID := make(map[string]nodeFacts, len(facts.nodes))
-	for _, n := range facts.nodes {
-		byUUID[strings.ToLower(n.systemUUID)] = n
-	}
-
+	f := newFleet(tc, nil, facts, pools, machines)
 	nodes := make([]proofNode, 0, len(machines))
 
 	for i := range machines {
 		tm := &machines[i]
 		st := tm.Status
 
-		pool := pools[tm.Spec.PoolRef.Name]
-		if pool == nil {
+		m := f.of(tm)
+		if m.pool == nil {
 			return nil, fmt.Sprintf("TalosMachinePool %s of TalosMachine %s not found", tm.Spec.PoolRef.Name, tm.Name)
 		}
 
@@ -92,37 +86,23 @@ func proofGate(tc *talosv1alpha1.TalosCluster, facts *clusterFacts, unmatched []
 			return nil, fmt.Sprintf("TalosMachine %s does not match its live config (see its ConfigMatchesLive)", tm.Name)
 		}
 
-		node, ok := byUUID[strings.ToLower(tm.Spec.Identity.SystemUUID)]
-		if !ok {
+		if m.node == nil {
 			return nil, fmt.Sprintf("no live node has the systemUUID of TalosMachine %s", tm.Name)
 		}
 
-		live, err := normalizedLive(node)
+		live, err := normalizedLive(*m.node)
 		if err != nil {
-			return nil, fmt.Sprintf("live config of %s: %v", node.hostname, err)
+			return nil, fmt.Sprintf("live config of %s: %v", m.node.hostname, err)
 		}
 
 		if st.Config == nil || st.Config.LiveHash != live.Hash || st.Config.DesiredHash != live.Hash {
 			return nil, fmt.Sprintf("TalosMachine %s was compared against an older live config", tm.Name)
 		}
 
-		nodes = append(nodes, proofNode{machine: tm, pool: pool, node: node, live: live})
+		nodes = append(nodes, proofNode{boundMachine: m, live: live})
 	}
 
 	return nodes, ""
-}
-
-func normalizedLive(n nodeFacts) (*render.Config, error) {
-	if len(n.activeConfig) == 0 {
-		return nil, errors.New("not read")
-	}
-
-	parsed, err := talos.ParseMachineConfig(n.activeConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	return render.Normalize(parsed)
 }
 
 // prove sets Adopted (docs/scope.md §7.1 stage 3). Once every machine matches its live config,
@@ -155,7 +135,7 @@ func (r *TalosClusterReconciler) prove(ctx context.Context, tc *talosv1alpha1.Ta
 
 	hashes := make(map[string]string, len(nodes))
 	for _, n := range nodes {
-		hashes[n.machine.Name] = n.live.Hash
+		hashes[n.tm.Name] = n.live.Hash
 	}
 
 	// Desired equals live everywhere (the gate), so the hashes alone tell whether anything moved
@@ -203,11 +183,11 @@ func (r *TalosClusterReconciler) verifyNoChanges(ctx context.Context, tc *talosv
 	var changed []string
 
 	for _, n := range nodes {
-		desired, _, err := renderMachine(ctx, r.Client, tc, n.pool, n.machine)
+		desired, _, err := renderMachine(ctx, r.Client, tc, n.pool, n.tm)
 		if err != nil {
 			var problem *configProblem
 			if errors.As(err, &problem) {
-				return &configProblem{problem.status, problem.reason, n.machine.Name + ": " + problem.msg}, nil
+				return &configProblem{problem.status, problem.reason, n.tm.Name + ": " + problem.msg}, nil
 			}
 
 			return nil, err
@@ -215,17 +195,17 @@ func (r *TalosClusterReconciler) verifyNoChanges(ctx context.Context, tc *talosv
 
 		if desired.Hash != n.live.Hash {
 			return &configProblem{metav1.ConditionFalse, talosv1alpha1.ReasonPreconditionUnmet,
-				fmt.Sprintf("TalosMachine %s renders differently than when it was last compared", n.machine.Name)}, nil
+				fmt.Sprintf("TalosMachine %s renders differently than when it was last compared", n.tm.Name)}, nil
 		}
 
 		result, err := reader.DryRunApply(ctx, n.node.address, desired.BytesOrderedLike(n.live))
 		if err != nil {
 			return &configProblem{metav1.ConditionUnknown, talosv1alpha1.ReasonUnreachable,
-				fmt.Sprintf("dry run on %s: %v", n.machine.Name, err)}, nil
+				fmt.Sprintf("dry run on %s: %v", n.tm.Name, err)}, nil
 		}
 
 		if !result.NoChanges {
-			changed = append(changed, n.machine.Name)
+			changed = append(changed, n.tm.Name)
 		}
 	}
 

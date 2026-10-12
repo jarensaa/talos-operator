@@ -42,28 +42,6 @@ import (
 	"github.com/jarensaa/talos-operator/internal/target"
 )
 
-// Machine phases set in observe mode.
-const (
-	machinePhasePending talosv1alpha1.MachinePhase = "Pending"
-	machinePhaseReady   talosv1alpha1.MachinePhase = "Ready"
-)
-
-// Machine phases of a machine that is being added or removed, or is no member.
-const (
-	machinePhaseAwaitingIdentity talosv1alpha1.MachinePhase = "AwaitingIdentity"
-	machinePhaseProvisioning     talosv1alpha1.MachinePhase = "Provisioning"
-	machinePhaseJoining          talosv1alpha1.MachinePhase = "Joining"
-	machinePhaseDraining         talosv1alpha1.MachinePhase = "Draining"
-	machinePhaseRemoving         talosv1alpha1.MachinePhase = "Removing"
-	machinePhaseRemoved          talosv1alpha1.MachinePhase = "Removed"
-)
-
-// Condition reasons specific to TalosMachine binding.
-const (
-	reasonIdentityMismatch = "IdentityMismatch"
-	reasonRoleMismatch     = "RoleMismatch"
-)
-
 // TalosMachineReconciler binds TalosMachines to live nodes by hardware identity and reports
 // their state. The operator never creates TalosMachines; they come from Git (docs/scope.md §7.1).
 type TalosMachineReconciler struct {
@@ -113,7 +91,7 @@ func (r *TalosMachineReconciler) observe(ctx context.Context, tm *talosv1alpha1.
 	st.ObservedGeneration = gen
 
 	if st.Phase == "" {
-		st.Phase = machinePhasePending
+		st.Phase = talosv1alpha1.MachinePhasePending
 	}
 
 	// The pool decides the cluster and the role.
@@ -193,7 +171,7 @@ func (r *TalosMachineReconciler) observe(ctx context.Context, tm *talosv1alpha1.
 	}
 
 	if !strings.EqualFold(si.UUID, tm.Spec.Identity.SystemUUID) {
-		r.unmatched(tm, metav1.ConditionFalse, reasonIdentityMismatch,
+		r.unmatched(tm, metav1.ConditionFalse, talosv1alpha1.ReasonIdentityMismatch,
 			fmt.Sprintf("node %s has systemUUID %s, not %s", node, si.UUID, tm.Spec.Identity.SystemUUID))
 
 		return nil
@@ -212,7 +190,7 @@ func (r *TalosMachineReconciler) observe(ctx context.Context, tm *talosv1alpha1.
 	}
 
 	if want := roleMachineType(pool.Spec.Role); machineType != want {
-		r.unmatched(tm, metav1.ConditionFalse, reasonRoleMismatch,
+		r.unmatched(tm, metav1.ConditionFalse, talosv1alpha1.ReasonRoleMismatch,
 			fmt.Sprintf("node %s is a %s, but pool %s is %s", node, machineType, pool.Name, pool.Spec.Role))
 
 		return nil
@@ -239,18 +217,6 @@ func (r *TalosMachineReconciler) observe(ctx context.Context, tm *talosv1alpha1.
 	return nil
 }
 
-// isMember reports whether a machine counts as a node of its cluster: it was found to be one, and
-// has not been taken out since. A machine that is not is one to be added, or one that has left;
-// no rollout, no upgrade and no proof waits for it (docs/scope.md §7.6).
-func isMember(tm *talosv1alpha1.TalosMachine) bool {
-	return tm.Status.JoinedAt != nil && tm.Status.RemovedAt == nil
-}
-
-// membershipEnabled reports whether the operator may add and remove machines of tc.
-func membershipEnabled(tc *talosv1alpha1.TalosCluster) bool {
-	return managing(tc) && tc.Spec.Management.Membership == talosv1alpha1.CapabilityEnabled
-}
-
 // observeCandidate reports on a machine that is no member of the cluster: whether it could be
 // added. It asks the machine itself, over a maintenance connection, which carries none of the
 // cluster's credentials and is only made while membership is enabled. Nothing is sent to the
@@ -265,7 +231,7 @@ func (r *TalosMachineReconciler) observeCandidate(ctx context.Context, tc *talos
 	setMachineCondition(tm, talosv1alpha1.ConditionNodeObserved, metav1.ConditionFalse, talosv1alpha1.ReasonNotAMember, notAMember)
 
 	if tm.Status.RemovedAt != nil {
-		tm.Status.Phase = machinePhaseRemoved
+		tm.Status.Phase = talosv1alpha1.MachinePhaseRemoved
 	}
 
 	defer membershipPhase(tc, tm)
@@ -286,33 +252,27 @@ func (r *TalosMachineReconciler) observeCandidate(ctx context.Context, tc *talos
 			"nothing is asked of a machine that is not a member while spec.management.membership is not Enabled")
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, nodeReadTimeout)
-	defer cancel()
-
-	maintenance, err := r.Resolver.ResolveMaintenance(ctx, tc, addr)
-	if err != nil {
-		return provisionable(metav1.ConditionUnknown, talosv1alpha1.ReasonUnreachable, "no maintenance connection to %s: %s", addr, err)
-	}
-
-	defer maintenance.Close() //nolint:errcheck // nothing depends on how a connection that was only read from ends
-
-	found, err := maintenance.Probe(ctx)
+	who := ask(ctx, r.Resolver, tc, tm)
+	defer who.close()
 
 	switch {
-	case err != nil:
-		return provisionable(metav1.ConditionUnknown, talosv1alpha1.ReasonUnreachable,
-			"nothing answers in maintenance mode at %s: boot the machine without a config", addr)
-	case found.Stage != talos.StageMaintenance:
+	case who.connection == nil:
+		return provisionable(metav1.ConditionUnknown, talosv1alpha1.ReasonUnreachable, "%s: boot the machine without a config", who.why)
+	case !who.inMaintenance():
 		return provisionable(metav1.ConditionFalse, talosv1alpha1.ReasonNotInMaintenance,
-			"what answers at %s is in stage %q, not waiting in maintenance mode", addr, found.Stage)
-	case !strings.EqualFold(found.UUID, tm.Spec.Identity.SystemUUID):
-		tm.Status.Phase = machinePhaseAwaitingIdentity
+			"what answers at %s is in stage %q, not waiting in maintenance mode", addr, who.found.Stage)
+	case !who.is(tm):
+		tm.Status.Phase = talosv1alpha1.MachinePhaseAwaitingIdentity
 
 		// The config carries every secret of the cluster, and this machine is not the one it was
 		// meant for.
 		return provisionable(metav1.ConditionFalse, talosv1alpha1.ReasonIdentityMismatch,
-			"the machine in maintenance mode at %s has systemUUID %s, not %s; it is sent nothing", addr, found.UUID, tm.Spec.Identity.SystemUUID)
+			"the machine in maintenance mode at %s has systemUUID %s, not %s; it is sent nothing", addr, who.found.UUID,
+			tm.Spec.Identity.SystemUUID)
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, nodeReadTimeout)
+	defer cancel()
 
 	rendered, _, err := renderMachine(ctx, r.Client, tc, pool, tm)
 	if err != nil {
@@ -324,7 +284,7 @@ func (r *TalosMachineReconciler) observeCandidate(ctx context.Context, tc *talos
 		return provisionable(problem.status, problem.reason, "%s", problem.msg)
 	}
 
-	problems, err := maintenance.Fits(ctx, rendered.Bytes)
+	problems, err := who.connection.Fits(ctx, rendered.Bytes)
 
 	switch {
 	case err != nil:
@@ -348,16 +308,16 @@ func membershipPhase(tc *talosv1alpha1.TalosCluster, tm *talosv1alpha1.TalosMach
 
 	switch op.Type { //nolint:exhaustive // the other operations leave the phase to what the node says
 	case talosv1alpha1.OperationAddMachine:
-		tm.Status.Phase = machinePhaseJoining
+		tm.Status.Phase = talosv1alpha1.MachinePhaseJoining
 
 		if op.Current.Step == plan.StepProvisioning {
-			tm.Status.Phase = machinePhaseProvisioning
+			tm.Status.Phase = talosv1alpha1.MachinePhaseProvisioning
 		}
 	case talosv1alpha1.OperationRemoveMachine:
-		tm.Status.Phase = machinePhaseRemoving
+		tm.Status.Phase = talosv1alpha1.MachinePhaseRemoving
 
 		if op.Current.Step == plan.StepDraining {
-			tm.Status.Phase = machinePhaseDraining
+			tm.Status.Phase = talosv1alpha1.MachinePhaseDraining
 		}
 	}
 }
@@ -415,13 +375,9 @@ func (r *TalosMachineReconciler) observeNode(ctx context.Context, tgt *target.Ta
 	})
 
 	reads.read("schematic", func(ctx context.Context) error {
-		sc, err := tgt.Talos.ImageFactorySchematic(ctx, node)
-
-		// A node that was not installed from Image Factory has none: that is an answer.
-		if err == nil || errors.Is(err, talos.ErrNotFound) {
-			talosState.SchematicID = sc.ID
-
-			return nil
+		id, err := schematicOf(ctx, tgt.Talos, node)
+		if err == nil {
+			talosState.SchematicID = id
 		}
 
 		return err
@@ -480,7 +436,7 @@ func (r *TalosMachineReconciler) observeNode(ctx context.Context, tgt *target.Ta
 				etcd := &talosv1alpha1.EtcdState{
 					MemberID:  fmt.Sprintf("%x", es.MemberID),
 					IsLearner: es.IsLearner,
-					Leader:    es.Leader != 0 && es.Leader == es.MemberID,
+					Leader:    leads(es),
 					DBSize:    es.DBSize, DBSizeInUse: es.DBSizeInUse,
 				}
 
@@ -510,9 +466,9 @@ func (r *TalosMachineReconciler) observeNode(ctx context.Context, tgt *target.Ta
 
 	// Only what the node said in this pass makes a machine Ready.
 	if talosState.Stage == stageRunning && talosState.Ready {
-		st.Phase = machinePhaseReady
+		st.Phase = talosv1alpha1.MachinePhaseReady
 	} else {
-		st.Phase = machinePhasePending
+		st.Phase = talosv1alpha1.MachinePhasePending
 	}
 
 	return nil
@@ -574,7 +530,7 @@ func (r *TalosMachineReconciler) unmatched(tm *talosv1alpha1.TalosMachine, statu
 	forgetEtcdMoment(tm)
 
 	tm.Status.Health = nil
-	tm.Status.Phase = machinePhasePending
+	tm.Status.Phase = talosv1alpha1.MachinePhasePending
 }
 
 func setMachineCondition(tm *talosv1alpha1.TalosMachine, condType string, status metav1.ConditionStatus, reason, message string) {

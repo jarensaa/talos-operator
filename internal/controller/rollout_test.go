@@ -710,7 +710,7 @@ var _ = Describe("Config rollout", func() {
 			Expect(applies()).To(Equal([]string{tried(worker1), tried(worker2), confirmed(worker2)}))
 			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
 			Expect(tc.Status.History[0].Skipped).To(Equal([]string{worker1}))
-			Expect(getMachine(worker1).Status.Config.SkippedHash).To(Equal(target))
+			Expect(tc.Status.Holds[talosv1alpha1.OperationConfigRollout].Skipped).To(HaveKeyWithValue(worker1, target))
 
 			advance(time.Hour)
 			Expect(operation()).To(BeNil(), "a skipped config is not rolled out to the machine again")
@@ -727,7 +727,7 @@ var _ = Describe("Config rollout", func() {
 
 			settle(nil)
 			Expect(inSync().Status).To(Equal(metav1.ConditionTrue), inSync().Message)
-			Expect(getMachine(worker1).Status.Config.SkippedHash).To(BeEmpty())
+			Expect(tc.Status.Holds).To(BeEmpty(), "a skip is spent once the machine renders another config")
 		})
 
 		It("ends the rollout on abort and does not start the same one again", func() {
@@ -737,7 +737,7 @@ var _ = Describe("Config rollout", func() {
 			settle(idle)
 
 			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-			Expect(tc.Status.AbortedTargets).To(HaveLen(2))
+			Expect(tc.Status.Holds[talosv1alpha1.OperationConfigRollout].Aborted).To(HaveLen(2))
 
 			advance(time.Hour)
 			Expect(operation()).To(BeNil())
@@ -752,7 +752,7 @@ var _ = Describe("Config rollout", func() {
 
 			Expect(inSync().Status).To(Equal(metav1.ConditionTrue), inSync().Message)
 			Expect(blocked()).To(BeNil())
-			Expect(tc.Status.AbortedTargets).To(BeEmpty())
+			Expect(tc.Status.Holds).To(BeEmpty())
 			Expect(applies()).To(Equal([]string{tried(worker1)}))
 		})
 	})
@@ -1527,14 +1527,14 @@ var _ = Describe("Config rollout", func() {
 
 			Expect(operation()).To(BeNil())
 			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-			Expect(tc.Status.Upgrades.Aborted).To(HaveKeyWithValue(worker1, newerImage))
+			Expect(tc.Status.Holds[talosv1alpha1.OperationTalosUpgrade].Aborted).To(HaveKeyWithValue(worker1, newerImage))
 			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonAborted))
 			Expect(called(fake.MethodImagePull)).To(HaveLen(1), "an aborted upgrade is not started again as it is")
 
 			By("asking for what the nodes run again")
 			upgradeTo(talosVersion)
 			settle(nil)
-			Expect(tc.Status.Upgrades).To(BeNil(), "the abort is spent")
+			Expect(tc.Status.Holds).To(BeEmpty(), "the abort is spent")
 			Expect(upToDate().Status).To(Equal(metav1.ConditionTrue), upToDate().Message)
 		})
 
@@ -1555,7 +1555,7 @@ var _ = Describe("Config rollout", func() {
 			runUntil("the upgrade ends", func() bool { return idle() && len(tc.Status.History) >= 1 })
 
 			advance(time.Hour)
-			Expect(tc.Status.Upgrades.Skipped).To(HaveKeyWithValue(worker1, newerImage))
+			Expect(tc.Status.Holds[talosv1alpha1.OperationTalosUpgrade].Skipped).To(HaveKeyWithValue(worker1, newerImage))
 			Expect(upToDate().Status).To(Equal(metav1.ConditionFalse))
 			Expect(upToDate().Message).To(ContainSubstring(worker1))
 			Expect(called(fake.MethodInstall)).To(Equal([]string{worker1, worker2, cp1Machine}), "the skipped machine is not tried again")
@@ -2534,7 +2534,7 @@ var _ = Describe("Config rollout", func() {
 				settle(idle)
 
 				Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-				Expect(tc.Status.Upgrades.Kubernetes).To(Equal(patch))
+				Expect(tc.Status.Holds[talosv1alpha1.OperationKubernetesUpgrade].Aborted).To(HaveKeyWithValue(talosv1alpha1.HoldEverything, patch))
 
 				sent := len(applies())
 				advance(time.Hour)
@@ -2544,7 +2544,7 @@ var _ = Describe("Config rollout", func() {
 
 				upgradeKubernetes("1.37.2")
 				runUntil("the upgrade to the other version ends", func() bool { return len(kubernetesOperations()) == 2 })
-				Expect(tc.Status.Upgrades).To(BeNil())
+				Expect(tc.Status.Holds).To(BeEmpty())
 				Expect(imagesOf(cp1Machine)[plan.ComponentControllerManager]).To(HaveSuffix(":v1.37.2"))
 			})
 		})
@@ -2905,11 +2905,11 @@ var _ = Describe("Config rollout", func() {
 	It("refuses a rollout whose timings could never confirm a try", func() {
 		// The API server refuses these too; this is what an operator would do with a spec that
 		// predates the rule.
-		Expect(rolloutTiming(talosv1alpha1.Rollout{
+		Expect(plan.TimingOf(talosv1alpha1.Rollout{
 			TryTimeout: &metav1.Duration{Duration: time.Minute}, Soak: &metav1.Duration{Duration: time.Minute},
 		}).Validate()).NotTo(Succeed())
 
-		Expect(rolloutTiming(talosv1alpha1.Rollout{}).Validate()).To(Succeed())
-		Expect(rolloutTiming(talosv1alpha1.Rollout{Soak: &metav1.Duration{}}).Soak).To(BeZero(), "a soak set to zero is zero, not the default")
+		Expect(plan.TimingOf(talosv1alpha1.Rollout{}).Validate()).To(Succeed())
+		Expect(plan.TimingOf(talosv1alpha1.Rollout{Soak: &metav1.Duration{}}).Soak).To(BeZero(), "a soak set to zero is zero, not the default")
 	})
 })

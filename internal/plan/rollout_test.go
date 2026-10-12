@@ -21,6 +21,7 @@ import (
 	"strings"
 	"testing"
 
+	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/classify"
 )
 
@@ -66,7 +67,7 @@ func TestPlanRolloutOrdersWorkersBeforeControlPlanes(t *testing.T) {
 		changed(cp2, true, classify.LiveSafe), changed("worker-b", false, classify.LiveSafe),
 		changed(cp1, true, classify.LiveSafe), changed("worker-a", false, classify.LiveSafe),
 		inSync("cp-3", true),
-	}, Settings{DriftPolicy: DriftReport}, openPass)
+	}, Settings{DriftPolicy: talosv1alpha1.DriftPolicyReport}, openPass)
 
 	if want := []string{"worker-a", "worker-b", cp1, cp2}; !slices.Equal(got.Pending, want) {
 		t.Fatalf("order: got %v, want %v", got.Pending, want)
@@ -115,8 +116,8 @@ func TestPlanRolloutRepairsAnUnhealthyNodeFirst(t *testing.T) {
 	}
 
 	healthy := PlanRollout(machines, Settings{}, healthyPass())
-	if want := []string{w1, cp1, cp2}; !slices.Equal(healthy.Pending, want) || healthy.ChangeHash != got.ChangeHash {
-		t.Fatalf("health decides the order and nothing else: %v, %s vs %s", healthy.Pending, healthy.ChangeHash, got.ChangeHash)
+	if want := []string{w1, cp1, cp2}; !slices.Equal(healthy.Pending, want) || healthy.Change != got.Change {
+		t.Fatalf("health decides the order and nothing else: %v, %s vs %s", healthy.Pending, healthy.Change, got.Change)
 	}
 }
 
@@ -152,18 +153,18 @@ func TestPlanRolloutNothingToDo(t *testing.T) {
 func TestPlanRolloutDriftPolicy(t *testing.T) {
 	machines := []Machine{drifted(w1), inSync(cp1, true)}
 
-	report := PlanRollout(machines, Settings{DriftPolicy: DriftReport}, openPass)
+	report := PlanRollout(machines, Settings{DriftPolicy: talosv1alpha1.DriftPolicyReport}, openPass)
 	if report.MayStart() || !slices.Equal(report.Drifted, []string{w1}) {
 		t.Fatalf("Report must leave a drifted node alone and name it: %+v", report)
 	}
 
-	enforce := PlanRollout(machines, Settings{DriftPolicy: DriftEnforce}, openPass)
+	enforce := PlanRollout(machines, Settings{DriftPolicy: talosv1alpha1.DriftPolicyEnforce}, openPass)
 	if !enforce.MayStart() || !slices.Equal(enforce.Pending, []string{w1}) || len(enforce.Drifted) != 0 {
 		t.Fatalf("Enforce must roll a drifted node back: %+v", enforce)
 	}
 
 	// A spec change is rolled out whatever the drift policy says.
-	spec := PlanRollout([]Machine{changed(w1, false, classify.LiveSafe)}, Settings{DriftPolicy: DriftReport}, openPass)
+	spec := PlanRollout([]Machine{changed(w1, false, classify.LiveSafe)}, Settings{DriftPolicy: talosv1alpha1.DriftPolicyReport}, openPass)
 	if !spec.MayStart() {
 		t.Fatalf("a spec change must roll out under Report: %+v", spec)
 	}
@@ -183,21 +184,21 @@ func TestPlanRolloutBlocks(t *testing.T) {
 		reason   string
 		message  string
 	}{
-		{wordPaused, change, Settings{Paused: true}, openPass, BlockPaused, "spec.paused"},
+		{wordPaused, change, Settings{Policy: pausedPolicy}, openPass, BlockPaused, "spec.paused"},
 		{"a closed gate", change, Settings{}, closedPass, BlockGateClosed, closedPass.HealthMessage},
-		{"an aborted change is not started again", change, Settings{AbortedTargets: map[string]string{w1: "b", "w-9": "b"}}, openPass,
+		{"an aborted change is not started again", change, Settings{Aborted: map[string]string{w1: "b", "w-9": "b"}}, openPass,
 			BlockAborted, wordAborted},
 		{"stale status", append(slices.Clone(change), stale), Settings{}, openPass, BlockNotCurrent, w2},
 		{"a protected field", []Machine{changed(cp1, true, classify.Protected)}, Settings{}, openPass, BlockProtected, "cp-1 (v1alpha1/Example)"},
 		{"a boot-time change", []Machine{changed(w1, false, classify.BootTime)}, Settings{}, openPass, BlockRequiresReinstall, w1},
 		// An installer the node does not run yet is an upgrade's to bring about, whatever else is set.
-		{"an installer not installed yet", []Machine{changed(w1, false, classify.Installer)}, Settings{Paused: true}, openPass,
+		{"an installer not installed yet", []Machine{changed(w1, false, classify.Installer)}, Settings{Policy: pausedPolicy}, openPass,
 			BlockAwaitingUpgrade, w1},
 		// One blocked machine blocks the rollout for all of them.
 		{"protected on one machine", []Machine{changed(w1, false, classify.LiveSafe), changed(cp1, true, classify.Protected)},
 			Settings{}, openPass, BlockProtected, cp1},
 		// Protected outranks everything a human could lift.
-		{"protected while paused", []Machine{changed(cp1, true, classify.Protected)}, Settings{Paused: true}, closedPass, BlockProtected, cp1},
+		{"protected while paused", []Machine{changed(cp1, true, classify.Protected)}, Settings{Policy: pausedPolicy}, closedPass, BlockProtected, cp1},
 	}
 
 	for _, tt := range tests {
@@ -216,7 +217,7 @@ func TestPlanRolloutBlocks(t *testing.T) {
 
 func TestPlanRolloutAbort(t *testing.T) {
 	// The aborted operation was taking w-1 and w-2 to "b"; w-1 was done before the abort.
-	aborted := Settings{AbortedTargets: map[string]string{w1: "b", w2: "b"}}
+	aborted := Settings{Aborted: map[string]string{w1: "b", w2: "b"}}
 
 	done := inSync(w1, false)
 	done.LiveHash, done.DesiredHash, done.AppliedHash = "b", "b", "b"
@@ -276,11 +277,11 @@ func TestPlanRolloutApproval(t *testing.T) {
 		t.Fatalf("a storage change needs approval: %+v", waiting)
 	}
 
-	if !strings.Contains(waiting.BlockMessage, waiting.ChangeHash) {
+	if !strings.Contains(waiting.BlockMessage, waiting.Change) {
 		t.Fatalf("the message must carry the hash to approve: %q", waiting.BlockMessage)
 	}
 
-	approved := PlanRollout(machines, Settings{ApprovedChange: waiting.ChangeHash}, openPass)
+	approved := PlanRollout(machines, Settings{ApprovedChange: waiting.Change}, openPass)
 	if !approved.MayStart() {
 		t.Fatalf("an approved change may start: %+v", approved)
 	}
@@ -288,8 +289,8 @@ func TestPlanRolloutApproval(t *testing.T) {
 	// The approval names one exact change. Rendering something else needs a new one.
 	machines[0].DesiredHash = "c"
 
-	replayed := PlanRollout(machines, Settings{ApprovedChange: waiting.ChangeHash}, openPass)
-	if replayed.MayStart() || replayed.ChangeHash == waiting.ChangeHash {
+	replayed := PlanRollout(machines, Settings{ApprovedChange: waiting.Change}, openPass)
+	if replayed.MayStart() || replayed.Change == waiting.Change {
 		t.Fatalf("an approval must not carry over to a different change: %+v", replayed)
 	}
 }
@@ -299,9 +300,9 @@ func TestPlanRolloutHeldMachines(t *testing.T) {
 	held.Hold = true
 
 	skipped := changed(w2, false, classify.LiveSafe)
-	skipped.SkippedHash = skipped.DesiredHash
+	leftOut := Settings{Skipped: map[string]string{w2: skipped.DesiredHash}}
 
-	got := PlanRollout([]Machine{held, skipped, changed("w-3", false, classify.LiveSafe)}, Settings{}, openPass)
+	got := PlanRollout([]Machine{held, skipped, changed("w-3", false, classify.LiveSafe)}, leftOut, openPass)
 	if !slices.Equal(got.Pending, []string{"w-3"}) || !slices.Equal(got.Held, []string{w1, w2}) {
 		t.Fatalf("held and skipped machines are left out and named: %+v", got)
 	}
@@ -309,7 +310,7 @@ func TestPlanRolloutHeldMachines(t *testing.T) {
 	// A skip is for one rendered config only.
 	skipped.DesiredHash = "c"
 
-	again := PlanRollout([]Machine{skipped}, Settings{}, openPass)
+	again := PlanRollout([]Machine{skipped}, leftOut, openPass)
 	if !slices.Equal(again.Pending, []string{w2}) {
 		t.Fatalf("a new config rolls out to a previously skipped machine: %+v", again)
 	}
@@ -319,12 +320,12 @@ func TestChangeHashIdentifiesTheChange(t *testing.T) {
 	a := PlanRollout([]Machine{changed(w1, false, classify.LiveSafe), changed(w2, false, classify.LiveSafe)}, Settings{}, openPass)
 	b := PlanRollout([]Machine{changed(w2, false, classify.LiveSafe), changed(w1, false, classify.LiveSafe)}, Settings{}, openPass)
 
-	if a.ChangeHash == "" || a.ChangeHash != b.ChangeHash {
-		t.Fatalf("the hash must not depend on order: %q vs %q", a.ChangeHash, b.ChangeHash)
+	if a.Change == "" || a.Change != b.Change {
+		t.Fatalf("the hash must not depend on order: %q vs %q", a.Change, b.Change)
 	}
 
 	fewer := PlanRollout([]Machine{changed(w1, false, classify.LiveSafe)}, Settings{}, openPass)
-	if fewer.ChangeHash == a.ChangeHash {
+	if fewer.Change == a.Change {
 		t.Fatal("a different set of machines is a different change")
 	}
 }

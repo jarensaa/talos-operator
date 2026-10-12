@@ -46,7 +46,12 @@ const gateReadTimeout = 10 * time.Second
 // Nothing here is an error of the pass. A window that cannot be understood and a gate that
 // cannot be read are both answers: closed, with the reason.
 func (r *TalosClusterReconciler) policy(ctx context.Context, tc *talosv1alpha1.TalosCluster) (plan.Policy, time.Time) {
-	var policy plan.Policy
+	policy := plan.Policy{Paused: tc.Spec.Paused}
+
+	// Timings under which a tried config could never be confirmed start nothing.
+	if err := plan.TimingOf(tc.Spec.Rollout).Validate(); err != nil {
+		policy.Invalid = "spec.rollout: " + err.Error()
+	}
 
 	windows := make([]plan.Window, 0, len(tc.Spec.Rollout.MaintenanceWindows))
 	for _, w := range tc.Spec.Rollout.MaintenanceWindows {
