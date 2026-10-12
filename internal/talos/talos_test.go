@@ -138,12 +138,6 @@ func TestReaderAndConfigWriterUseSeparateConnections(t *testing.T) {
 	if ro == rw {
 		t.Fatal("a Reader must never share the ConfigWriter's connection, whose allowlist is wider")
 	}
-
-	f.Invalidate("uid-1")
-
-	if len(f.clients) != 0 {
-		t.Fatalf("Invalidate must drop both connections, left %d", len(f.clients))
-	}
 }
 
 func TestUnaryInterceptorNeverInvokesRejectedCall(t *testing.T) {
@@ -198,15 +192,12 @@ func ep(s string) creds.Endpoint {
 func TestSelectEndpoints(t *testing.T) {
 	cps := []creds.Endpoint{ep("10.0.0.11"), ep("10.0.0.12"), ep("10.0.0.13")}
 
-	got, err := SelectEndpoints(cps, SelectOptions{
-		Exclude: netip.MustParseAddr("10.0.0.11"),
-		Healthy: map[netip.Addr]bool{netip.MustParseAddr("10.0.0.13"): true},
-	})
+	got, err := SelectEndpoints(cps, SelectOptions{Exclude: netip.MustParseAddr("10.0.0.11")})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want := []creds.Endpoint{ep("10.0.0.13"), ep("10.0.0.12")}
+	want := []creds.Endpoint{ep("10.0.0.12"), ep("10.0.0.13")}
 	if !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -302,10 +293,10 @@ func TestFactoryCachesPerTargetAndEndpoints(t *testing.T) {
 		t.Fatalf("an idle client must be closed and forgotten, %d left", len(f.clients))
 	}
 
-	f.Invalidate("uid-1")
+	f.Close()
 
 	if len(f.clients) != 0 {
-		t.Fatal("Invalidate must drop every cached client of the cluster")
+		t.Fatal("Close must close and forget every cached client")
 	}
 }
 

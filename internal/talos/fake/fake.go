@@ -212,11 +212,8 @@ type Scenario struct {
 	errors map[errorKey]error
 	calls  []Call
 
-	// members and etcdMembers override the views derived from nodes when non-nil.
-	members     []talos.Member
-	etcdMembers []talos.EtcdMember
-	etcdLeader  uint64
-	health      talos.HealthResult
+	etcdLeader uint64
+	health     talos.HealthResult
 	// removed is what the Kubernetes upgrade checks find, by the version checked.
 	removed map[string][]string
 }
@@ -266,22 +263,6 @@ func (s *Scenario) UpdateNode(addr netip.Addr, update func(*Node)) {
 	if n, ok := s.nodes[addr]; ok {
 		update(n)
 	}
-}
-
-// SetMembers overrides the discovery member list (default: derived from nodes).
-func (s *Scenario) SetMembers(members []talos.Member) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.members = members
-}
-
-// SetEtcdMembers overrides the etcd member list (default: derived from control-plane nodes).
-func (s *Scenario) SetEtcdMembers(members []talos.EtcdMember) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.etcdMembers = members
 }
 
 // SetHealth sets the result of HealthCheck.
@@ -451,15 +432,6 @@ func (s *Scenario) Add(n Node) {
 	defer s.mu.Unlock()
 
 	s.nodes[n.Addr] = &n
-}
-
-// Forget takes a node out of the scenario altogether, as when its machine is switched off for
-// good and the cluster's discovery has dropped it.
-func (s *Scenario) Forget(addr netip.Addr) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	delete(s.nodes, addr)
 }
 
 // Kill makes a node answer nothing from now on, with no reboot to come back from. It stays a
@@ -675,11 +647,8 @@ func (s *Scenario) handOffLeaderLocked(from *Node) bool {
 	return false
 }
 
+// membersLocked is what discovery lists: every node that has joined.
 func (s *Scenario) membersLocked() []talos.Member {
-	if s.members != nil {
-		return slices.Clone(s.members)
-	}
-
 	out := make([]talos.Member, 0, len(s.nodes))
 	for _, n := range s.sortedNodesLocked() {
 		if n.Maintenance || n.joining {
@@ -697,11 +666,8 @@ func (s *Scenario) membersLocked() []talos.Member {
 	return out
 }
 
+// etcdMembersLocked is etcd's member list: every node that is a member now.
 func (s *Scenario) etcdMembersLocked() []talos.EtcdMember {
-	if s.etcdMembers != nil {
-		return slices.Clone(s.etcdMembers)
-	}
-
 	var out []talos.EtcdMember
 
 	for _, n := range s.sortedNodesLocked() {

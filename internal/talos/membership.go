@@ -26,7 +26,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
@@ -244,7 +243,7 @@ var _ Maintenance = (*machineryMaintenance)(nil)
 // (client.WithMaintenanceMode, pkg/machinery/client/options.go:178): TLS without a client
 // certificate and without verifying the server's, to that one address. Nothing is sent until the
 // first call.
-func newMaintenance(ctx context.Context, addr netip.Addr, timeout time.Duration) (*machineryMaintenance, error) {
+func newMaintenance(ctx context.Context, addr netip.Addr) (*machineryMaintenance, error) {
 	pin := &keyPin{}
 
 	c, err := client.New(ctx,
@@ -259,7 +258,7 @@ func newMaintenance(ctx context.Context, addr netip.Addr, timeout time.Duration)
 		return nil, fmt.Errorf("create a maintenance client for %s: %w", addr, err)
 	}
 
-	return &machineryMaintenance{machineryReader: machineryReader{client: c, timeout: timeout}, addr: addr}, nil
+	return &machineryMaintenance{machineryReader: machineryReader{client: c, timeout: DefaultCallTimeout}, addr: addr}, nil
 }
 
 // Probe implements Maintenance.

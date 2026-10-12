@@ -55,9 +55,6 @@ const idleClientTTL = 10 * time.Minute
 // client is not closed when another is asked for: it is closed once it has not been used for
 // idleClientTTL, which is also how the client of a rotated certificate goes away.
 type Factory struct {
-	// CallTimeout overrides DefaultCallTimeout when non-zero.
-	CallTimeout time.Duration
-
 	mu      sync.Mutex
 	clients map[clientKey]*cachedClient
 	// now is the clock; tests replace it.
@@ -145,7 +142,7 @@ func (f *Factory) Keeper(ctx context.Context, t Target) (Keeper, error) {
 // Callers ask for it only while spec.management.membership is Enabled, and close it when they
 // are done: it is not cached, because the key it pins is that of one conversation.
 func (f *Factory) Maintenance(ctx context.Context, addr netip.Addr) (Maintenance, error) {
-	return newMaintenance(ctx, addr, f.callTimeout())
+	return newMaintenance(ctx, addr)
 }
 
 // reader returns what every client for a target is built on: the reads, over the cached
@@ -157,28 +154,7 @@ func (f *Factory) reader(ctx context.Context, t Target, a access) (machineryRead
 		return machineryReader{}, err
 	}
 
-	return machineryReader{client: c, timeout: f.callTimeout()}, nil
-}
-
-func (f *Factory) callTimeout() time.Duration {
-	if f.CallTimeout != 0 {
-		return f.CallTimeout
-	}
-
-	return DefaultCallTimeout
-}
-
-// Invalidate closes and forgets every cached client of the cluster key.
-func (f *Factory) Invalidate(key string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	for k, cached := range f.clients {
-		if k.key == key {
-			_ = cached.client.Close() //nolint:errcheck // best effort on a client being discarded
-			delete(f.clients, k)
-		}
-	}
+	return machineryReader{client: c, timeout: DefaultCallTimeout}, nil
 }
 
 // Close closes all cached clients.
