@@ -137,6 +137,7 @@ func AuthorityCertificates(b *secrets.Bundle) map[string]*x509.Certificate {
 	return out
 }
 
+// missingParts names what a bundle lacks of what a cluster's configs are generated from.
 func missingParts(b *secrets.Bundle) []string {
 	var missing []string
 
@@ -146,7 +147,13 @@ func missingParts(b *secrets.Bundle) []string {
 		}
 	}
 
-	certs := b.Certs
+	// A bundle recovered from a config has every section. One that a person wrote into a Secret
+	// may lack any of them, or be nothing at all: a section that is not there lacks all its parts.
+	if b == nil {
+		b = &secrets.Bundle{}
+	}
+
+	certs, cluster, trustd, tokens := orEmpty(b.Certs), orEmpty(b.Cluster), orEmpty(b.TrustdInfo), orEmpty(b.Secrets)
 
 	for _, ca := range authorities {
 		crt, key := ca.pem(certs)
@@ -154,13 +161,21 @@ func missingParts(b *secrets.Bundle) []string {
 	}
 
 	check("service account key", certs.K8sServiceAccount != nil && len(certs.K8sServiceAccount.Key) > 0)
-	check("cluster ID", b.Cluster.ID != "")
-	check("cluster secret", b.Cluster.Secret != "")
-	check("trustd token", b.TrustdInfo.Token != "")
-	check("bootstrap token", b.Secrets.BootstrapToken != "" && b.Secrets.BootstrapToken != ".")
-	check("secretbox encryption secret", b.Secrets.SecretboxEncryptionSecret != "")
+	check("cluster ID", cluster.ID != "")
+	check("cluster secret", cluster.Secret != "")
+	check("trustd token", trustd.Token != "")
+	check("bootstrap token", tokens.BootstrapToken != "" && tokens.BootstrapToken != ".")
+	check("secretbox encryption secret", tokens.SecretboxEncryptionSecret != "")
 
 	return missing
+}
+
+func orEmpty[T any](section *T) *T {
+	if section == nil {
+		return new(T)
+	}
+
+	return section
 }
 
 // Node is one node's live config, named for error messages.
@@ -181,7 +196,14 @@ func (e *MismatchError) Error() string {
 // Verify checks that every node's config carries the bundle's secrets: all of them on control
 // planes, and the CA certificates and tokens on workers. Certificates and keys are compared by
 // public key, so re-encoded PEM still matches.
+//
+// A bundle that lacks a part is refused before anything is compared: it is not the bundle of a
+// cluster, and no config could be rendered from it.
 func Verify(b *secrets.Bundle, nodes []Node) error {
+	if missing := missingParts(b); len(missing) > 0 {
+		return fmt.Errorf("secrets bundle is incomplete: missing %s", strings.Join(missing, ", "))
+	}
+
 	want, err := fingerprints(b)
 	if err != nil {
 		return fmt.Errorf("fingerprint bundle: %w", err)

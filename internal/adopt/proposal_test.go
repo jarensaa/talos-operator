@@ -192,6 +192,19 @@ func TestBuildVerifiesASuppliedBundleInsteadOfTrustingIt(t *testing.T) {
 	if _, err := adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster(), Bundle: other}); !errors.As(err, &mismatch) {
 		t.Fatalf("expected MismatchError for a stale secrets.yaml, got %v", err)
 	}
+
+	// A Secret that decodes and is not a whole bundle is refused too, and is not read through.
+	for _, text := range []string{"{}\n", "cluster:\n  id: a\n  secret: b\n"} {
+		partial, err := adopt.DecodeBundle([]byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster(), Bundle: partial})
+		if err == nil || !strings.Contains(err.Error(), "secrets bundle is incomplete: missing Talos API CA key") {
+			t.Fatalf("expected a bundle without certificates to be refused, got %v", err)
+		}
+	}
 }
 
 func TestBuildNeedsAControlPlane(t *testing.T) {

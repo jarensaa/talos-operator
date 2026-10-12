@@ -185,3 +185,63 @@ func TestAuthorityCertificates(t *testing.T) {
 		t.Fatal("no bundle, and a bundle without certificates, have no authorities")
 	}
 }
+
+// A bundle read from a Secret is whatever someone put there. One that lacks a part is refused by
+// name, and never read through a section it does not have.
+func TestVerifyRefusesABundleThatLacksAPart(t *testing.T) {
+	b := talostest.Bundle(t)
+	nodes := []bundle.Node{{Name: "cp-1", Config: generateConfig(t, b, config.TalosVersion1_14, machine.TypeControlPlane)}}
+
+	noCerts := *b
+	noCerts.Certs = nil
+
+	noEtcd := *b
+	certs := *b.Certs
+	certs.Etcd = nil
+	noEtcd.Certs = &certs
+
+	noCluster := *b
+	noCluster.Cluster = nil
+
+	noTokens := *b
+	noTokens.Secrets, noTokens.TrustdInfo = nil, nil
+
+	for name, tt := range map[string]struct {
+		bundle *secrets.Bundle
+		want   []string
+	}{
+		"nothing":         {&secrets.Bundle{}, []string{"Talos API CA key", "service account key", "cluster ID", "trustd token"}},
+		"no bundle":       {nil, []string{"Talos API CA key", "secretbox encryption secret"}},
+		"no certs":        {&noCerts, []string{"Talos API CA key, etcd CA key, Kubernetes CA key, aggregator CA key, service account key"}},
+		"no etcd CA":      {&noEtcd, []string{"missing etcd CA key"}},
+		"no cluster":      {&noCluster, []string{"missing cluster ID, cluster secret"}},
+		"no tokens":       {&noTokens, []string{"missing trustd token, bootstrap token, secretbox encryption secret"}},
+		"the whole of it": {b, nil},
+	} {
+		err := bundle.Verify(tt.bundle, nodes)
+
+		if tt.want == nil {
+			if err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+
+			continue
+		}
+
+		if err == nil || !strings.HasPrefix(err.Error(), "secrets bundle is incomplete: missing ") {
+			t.Errorf("%s: got %v", name, err)
+
+			continue
+		}
+
+		for _, part := range tt.want {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("%s: %q is not named in: %v", name, part, err)
+			}
+		}
+
+		if strings.Contains(err.Error(), b.TrustdInfo.Token) || strings.Contains(err.Error(), "BEGIN") {
+			t.Fatalf("%s: the message leaks a secret", name)
+		}
+	}
+}
