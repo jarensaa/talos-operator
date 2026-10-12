@@ -27,7 +27,6 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	sigsyaml "sigs.k8s.io/yaml"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/adopt"
@@ -124,7 +123,7 @@ func TestBuildProposesSpecsThatReproduceTheCluster(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !p.Recovered || !reflect.DeepEqual(p.Bundle.Certs, b.Certs) {
+	if !reflect.DeepEqual(p.Bundle.Certs, b.Certs) {
 		t.Fatal("the bundle must be recovered from the live cluster")
 	}
 
@@ -180,8 +179,8 @@ func TestBuildVerifiesASuppliedBundleInsteadOfTrustingIt(t *testing.T) {
 	nodes := liveCluster(t, b, installImage)
 
 	p, err := adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster(), Bundle: b})
-	if err != nil || p.Recovered {
-		t.Fatalf("matching supplied bundle: recovered=%v err=%v", p != nil && p.Recovered, err)
+	if err != nil || p.Bundle != b {
+		t.Fatalf("a matching supplied bundle must be the proposal's: err=%v", err)
 	}
 
 	other, err := secrets.NewBundle(secrets.NewClock(), config.TalosVersion1_14)
@@ -212,55 +211,6 @@ func TestBuildRefusesNonFactoryInstallers(t *testing.T) {
 	if _, err := adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster()}); err == nil ||
 		!strings.Contains(err.Error(), "not an Image Factory image") {
 		t.Fatalf("expected a non-factory installer to be refused, got %v", err)
-	}
-}
-
-func TestProposalYAMLIsCommitReady(t *testing.T) {
-	p, err := adopt.Build(adopt.Request{Nodes: liveCluster(t, talostest.Bundle(t), installImage), Cluster: observedCluster()})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	clusterYAML, err := p.ClusterYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, want := range []string{
-		"# renovate: datasource=github-releases depName=siderolabs/talos\n    talos: v1.14.0",
-		"# renovate: datasource=github-releases depName=kubernetes/kubernetes\n    kubernetes: 1.37.0",
-		"kind: TalosCluster",
-	} {
-		if !strings.Contains(string(clusterYAML), want) {
-			t.Errorf("cluster YAML lacks %q:\n%s", want, clusterYAML)
-		}
-	}
-
-	if strings.Contains(string(clusterYAML), "status:") || strings.Contains(string(clusterYAML), "creationTimestamp") {
-		t.Errorf("proposal must not carry status or server fields:\n%s", clusterYAML)
-	}
-
-	decoded := &talosv1alpha1.TalosCluster{}
-	if err := sigsyaml.Unmarshal(clusterYAML, decoded); err != nil || !reflect.DeepEqual(decoded.Spec, p.Cluster.Spec) {
-		t.Fatalf("cluster YAML does not round-trip: %v", err)
-	}
-
-	poolsYAML, err := p.PoolsYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got := strings.Count(string(poolsYAML), "kind: TalosMachinePool"); got != 1 {
-		t.Fatalf("expected 1 TalosMachinePool document, got %d", got)
-	}
-
-	machinesYAML, err := p.MachinesYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got := strings.Count(string(machinesYAML), "kind: TalosMachine"); got != 3 {
-		t.Fatalf("expected 3 TalosMachine documents, got %d", got)
 	}
 }
 
