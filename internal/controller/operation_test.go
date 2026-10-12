@@ -50,8 +50,10 @@ func operationTypes(t *testing.T) []talosv1alpha1.OperationType {
 		t.Fatal("the enum marker of OperationType was not found")
 	}
 
-	var types []talosv1alpha1.OperationType
-	for _, name := range strings.Split(string(marker[1]), ";") {
+	names := strings.Split(string(marker[1]), ";")
+	types := make([]talosv1alpha1.OperationType, 0, len(names))
+
+	for _, name := range names {
 		types = append(types, talosv1alpha1.OperationType(name))
 	}
 
@@ -66,7 +68,7 @@ func TestEveryTypeOfOperationIsAKind(t *testing.T) {
 		t.Fatalf("the API admits %d types of operation and the operator knows %d kinds", len(types), len(kinds))
 	}
 
-	events, done := map[string]talosv1alpha1.OperationType{}, map[string]talosv1alpha1.OperationType{}
+	named, done := map[string]talosv1alpha1.OperationType{}, map[string]talosv1alpha1.OperationType{}
 
 	for _, of := range types {
 		k, known := kinds[of]
@@ -92,7 +94,7 @@ func TestEveryTypeOfOperationIsAKind(t *testing.T) {
 		}
 
 		// The Events of two kinds must not be told apart by their message alone.
-		if other, taken := events[k.event]; taken {
+		if other, taken := named[k.event]; taken {
 			t.Errorf("%s and %s are both called %s in their Events", of, other, k.event)
 		}
 
@@ -100,7 +102,7 @@ func TestEveryTypeOfOperationIsAKind(t *testing.T) {
 			t.Errorf("a turn of %s and one of %s are both reported as %s", of, other, k.done)
 		}
 
-		events[k.event], done[k.done] = of, of
+		named[k.event], done[k.done] = of, of
 	}
 
 	// Config management is all a rollout needs, and what ends one is its return to Observe.

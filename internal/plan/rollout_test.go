@@ -198,7 +198,8 @@ func TestPlanRolloutBlocks(t *testing.T) {
 		{"protected on one machine", []Machine{changed(w1, false, classify.LiveSafe), changed(cp1, true, classify.Protected)},
 			Settings{}, openPass, BlockProtected, cp1},
 		// Protected outranks everything a human could lift.
-		{"protected while paused", []Machine{changed(cp1, true, classify.Protected)}, Settings{Policy: pausedPolicy}, closedPass, BlockProtected, cp1},
+		{"protected while paused", []Machine{changed(cp1, true, classify.Protected)}, Settings{Policy: pausedPolicy}, closedPass,
+			BlockProtected, cp1},
 	}
 
 	for _, tt := range tests {

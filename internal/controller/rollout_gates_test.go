@@ -205,12 +205,12 @@ func TestStepNodeConcludesNothingFromAPartialView(t *testing.T) {
 		t.Fatalf("a node booted from disk has no persistent config: %+v", got)
 	}
 
-	unreadable := []byte("not: [a config")
+	unreadable := &nodeFacts{activeConfig: raw, persistentConfig: []byte("not: [a config")}
 
 	for name, v := range map[string]machineView{
 		"no node with the machine's identity": {live: live},
 		"active config not read":              {boundMachine: boundMachine{node: &nodeFacts{}}},
-		"persistent config unreadable":        {boundMachine: boundMachine{node: &nodeFacts{activeConfig: raw, persistentConfig: unreadable}}, live: live},
+		"persistent config unreadable":        {boundMachine: boundMachine{node: unreadable}, live: live},
 	} {
 		if got := stepNode(v); got != (plan.Node{}) {
 			t.Errorf("%s: expected an unreachable node, got %+v", name, got)

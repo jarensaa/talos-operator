@@ -281,7 +281,9 @@ func PlanUpgrade(machines []UpgradeMachine, s UpgradeSettings, p Pass) Upgrade {
 		)
 	})
 
-	var lines, problems []string
+	var problems []string
+
+	lines := make([]string, 0, len(pending))
 
 	for _, m := range pending {
 		out.Pending = append(out.Pending, m.Name)
