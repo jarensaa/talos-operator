@@ -40,6 +40,15 @@ spec:
       schematicID: 376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba
 `
 
+// nowhere is an Image Factory and a release site that nothing listens at: asking fails at once.
+const nowhere = "https://127.0.0.1:1"
+
+// unreachableCluster names that Image Factory. Part of its config is in a Secret, which the check
+// does not have: no config is rendered, so no image is found whose registry would be asked, and
+// a test leaves the network alone.
+var unreachableCluster = strings.Replace(validCluster, "https://factory.example.com", nowhere, 1) +
+	"  config:\n    - secretKeyRef: {name: registry-credentials, key: config.yaml}\n"
+
 func manifests(t *testing.T, cluster string) string {
 	t.Helper()
 
@@ -57,9 +66,7 @@ func TestValidateCommand(t *testing.T) {
 	good := manifests(t, validCluster)
 	older := manifests(t, strings.Replace(validCluster, "kubernetes: 1.37.1", "kubernetes: 1.37.0", 1))
 	unsupported := manifests(t, strings.Replace(validCluster, "talos: v1.14.2", "talos: v1.19.0", 1))
-	// Nothing listens there: asking it fails at once, and leaves the network alone.
-	const nowhere = "https://127.0.0.1:1"
-	unreachable := manifests(t, strings.Replace(validCluster, "https://factory.example.com", nowhere, 1))
+	unreachable := manifests(t, unreachableCluster)
 
 	tests := []struct {
 		name   string

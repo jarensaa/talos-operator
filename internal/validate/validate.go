@@ -75,6 +75,9 @@ type Options struct {
 	// the step from the one to the other is checked: no downgrade, and no version the cluster
 	// could not get to from where the base left it.
 	Base []string
+	// Edited holds what to check in place of a file's own content, by the file's name as Files
+	// lists it: a change that is not written yet. The base is read as it is.
+	Edited map[string][]byte
 	// Source answers what exists upstream. Nil checks offline.
 	Source catalog.Source
 	// Now is the clock; nil means time.Now.
@@ -95,7 +98,7 @@ type manifests struct {
 // Run checks the manifests and returns what it found, problems first. An error is a failure to
 // read them at all.
 func Run(ctx context.Context, opts Options) ([]Finding, error) {
-	loaded, err := load(opts.Paths)
+	loaded, err := load(opts.Paths, opts.Edited)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +109,7 @@ func Run(ctx context.Context, opts Options) ([]Finding, error) {
 
 	var base *manifests
 	if len(opts.Base) > 0 {
-		if base, err = load(opts.Base); err != nil {
+		if base, err = load(opts.Base, nil); err != nil {
 			return nil, fmt.Errorf("base: %w", err)
 		}
 	}
@@ -166,10 +169,10 @@ func find[T client.Object](objects []T, namespace, name string) T {
 	return none
 }
 
-// load reads every YAML document under paths and keeps the operator's kinds. Everything else a
-// repository holds next to them is none of this check's business.
-func load(paths []string) (*manifests, error) {
-	out := &manifests{}
+// Files lists the files under paths that Run reads: every .yaml and .yml file, in the order it
+// reads them.
+func Files(paths []string) ([]string, error) {
+	var out []string
 
 	for _, path := range paths {
 		err := filepath.WalkDir(path, func(file string, entry fs.DirEntry, err error) error {
@@ -177,18 +180,40 @@ func load(paths []string) (*manifests, error) {
 				return err
 			}
 
-			if entry.IsDir() || !slices.Contains([]string{".yaml", ".yml"}, filepath.Ext(file)) {
-				return nil
+			if !entry.IsDir() && slices.Contains([]string{".yaml", ".yml"}, filepath.Ext(file)) {
+				out = append(out, file)
 			}
 
-			raw, err := os.ReadFile(file) //nolint:gosec // the files the caller named
-			if err != nil {
-				return err
-			}
-
-			return out.add(file, raw)
+			return nil
 		})
 		if err != nil {
+			return nil, err
+		}
+	}
+
+	return out, nil
+}
+
+// load reads every YAML document under paths and keeps the operator's kinds. Everything else a
+// repository holds next to them is none of this check's business. A file that edited names is
+// read from there.
+func load(paths []string, edited map[string][]byte) (*manifests, error) {
+	out := &manifests{}
+
+	files, err := Files(paths)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range files {
+		raw, ok := edited[file]
+		if !ok {
+			if raw, err = os.ReadFile(file); err != nil { //nolint:gosec // the files the caller named
+				return nil, err
+			}
+		}
+
+		if err := out.add(file, raw); err != nil {
 			return nil, err
 		}
 	}
@@ -549,9 +574,14 @@ func (c *check) renders() {
 	}
 
 	if rendered == 0 {
-		c.skipped("no machine of it was rendered, so the images of its Kubernetes components were not looked for")
+		named, why := c.alone(reader)
+		if why != "" {
+			c.skipped("no machine of it was rendered, and " + why + ", so the images of its Kubernetes components were not looked for")
 
-		return
+			return
+		}
+
+		images = named
 	}
 
 	if c.opts.Source == nil {
@@ -563,6 +593,44 @@ func (c *check) renders() {
 	for _, image := range images {
 		c.asked("the image "+image, c.opts.Source.Image(c.ctx, image))
 	}
+}
+
+// alone renders a control plane from the cluster and nothing else, and returns the images of the
+// Kubernetes components its config names, or why there is none. It is what is left to look at
+// where the files hold the cluster and none of its machines, as they do where the operator wrote
+// those when it adopted the cluster: a control plane names every image, and names the ones the
+// version brings unless a pool or a machine says otherwise.
+func (c *check) alone(reader client.Reader) (images []string, why string) {
+	pool := &talosv1alpha1.TalosMachinePool{Spec: talosv1alpha1.TalosMachinePoolSpec{Role: talosv1alpha1.MachineRoleControlPlane}}
+	tm := &talosv1alpha1.TalosMachine{ObjectMeta: metav1.ObjectMeta{Namespace: c.tc.Namespace}}
+
+	if slices.ContainsFunc(adopt.ConfigSources(&c.tc.Spec, &pool.Spec, &tm.Spec), func(src talosv1alpha1.ConfigSource) bool {
+		return src.SecretKeyRef != nil
+	}) {
+		return nil, "part of the cluster's own config comes from a Secret, which this check does not have"
+	}
+
+	rendering, problem, err := controller.RenderMachine(c.ctx, reader, c.tc, pool, tm)
+	if err != nil {
+		problem = err.Error()
+	}
+
+	if problem != "" {
+		return nil, "a control plane does not render from the cluster alone (" + problem + ")"
+	}
+
+	named, err := talos.KubernetesImages(rendering.Bytes)
+	if err != nil {
+		return nil, "a control plane rendered from the cluster alone cannot be read back (" + err.Error() + ")"
+	}
+
+	for _, image := range named {
+		if !slices.Contains(images, image) {
+			images = append(images, image)
+		}
+	}
+
+	return images, ""
 }
 
 // files answers the reads of rendering from the manifests: the shared configs they hold, and the
