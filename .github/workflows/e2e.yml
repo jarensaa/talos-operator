@@ -179,6 +179,11 @@ jobs:
           # VM console logs are the first place to look when nodes never come up.
           sudo find ~/.talos/clusters/talos-operator-e2e -name '*.log' -exec cp {} e2e-diagnostics/ \; || true
           sudo chown -R "$(id -u):$(id -g)" e2e-diagnostics || true
+          # The second: whether this runner reaches the registries the nodes pull from, with the
+          # handshake a node sends, and what its links and its forwarding look like.
+          go run ./hack/e2e/reach factory.talos.dev ghcr.io registry.k8s.io > e2e-diagnostics/reach.txt 2>&1 || true
+          ip -details link > e2e-diagnostics/links.txt 2>&1 || true
+          sudo iptables-save > e2e-diagnostics/iptables.txt 2>&1 || true
           # The operator never logs a machine config or a secret, so its logs can be public.
           if [ -s .e2e/kubeconfig ]; then
             export KUBECONFIG="$PWD/.e2e/kubeconfig"
