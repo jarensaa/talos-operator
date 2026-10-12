@@ -24,6 +24,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 
 	"github.com/jarensaa/talos-operator/internal/render"
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 const argBind = "bind-address"
@@ -40,7 +41,7 @@ func TestControlPlaneMetricsAreSwitchedOnInTheFormTheContractHas(t *testing.T) {
 		{"v1alpha1", config.TalosVersion1_13},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			in := input(t)
+			in := talostest.Input(t)
 			in.Contract = tt.contract
 			in.ControlPlaneMetrics = true
 
@@ -68,7 +69,7 @@ func TestControlPlaneMetricsAreSwitchedOnInTheFormTheContractHas(t *testing.T) {
 				t.Fatalf("etcd was given arguments: %v", cfg.Cluster().Etcd().ExtraArgs())
 			}
 
-			plain := input(t)
+			plain := talostest.Input(t)
 			plain.Contract = tt.contract
 
 			if mustRender(t, in).Hash == mustRender(t, plain).Hash {
@@ -79,7 +80,7 @@ func TestControlPlaneMetricsAreSwitchedOnInTheFormTheContractHas(t *testing.T) {
 }
 
 func TestControlPlaneMetricsLeaveTheUsersOwnSettingAlone(t *testing.T) {
-	in := input(t, `apiVersion: v1alpha1
+	in := talostest.Input(t, `apiVersion: v1alpha1
 kind: KubeSchedulerConfig
 extraArgs:
   bind-address: 10.0.0.11
@@ -102,7 +103,7 @@ extraArgs:
 
 // A worker runs neither.
 func TestControlPlaneMetricsChangeNothingOnAWorker(t *testing.T) {
-	plain := input(t)
+	plain := talostest.Input(t)
 	plain.Role = machine.TypeWorker
 
 	switched := plain

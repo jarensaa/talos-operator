@@ -30,10 +30,10 @@ import (
 func filledSpec() *talosv1alpha1.TalosClusterSpec {
 	return &talosv1alpha1.TalosClusterSpec{
 		ClusterName:          clusterName,
-		ControlPlaneEndpoint: "https://cluster.example.com:6443",
-		Versions:             &talosv1alpha1.Versions{Talos: "v1.14.0", Kubernetes: "1.37.0"},
+		ControlPlaneEndpoint: talostest.Endpoint,
+		Versions:             &talosv1alpha1.Versions{Talos: talostest.TalosVersion, Kubernetes: talostest.KubernetesVersion},
 		ConfigGeneration: &talosv1alpha1.ConfigGeneration{
-			VersionContract: "v1.14",
+			VersionContract: talostest.VersionContract,
 			Installer:       &talosv1alpha1.Installer{FactoryURL: "https://factory.talos.dev", Platform: "metal", SchematicID: schematic},
 		},
 	}
@@ -54,7 +54,7 @@ func TestASpecAdoptionHasNotFilledIn(t *testing.T) {
 	half := filledSpec()
 	half.Versions.Kubernetes = ""
 
-	if versions, named := adopt.Versions(half); named || versions.Talos != "v1.14.0" {
+	if versions, named := adopt.Versions(half); named || versions.Talos != talostest.TalosVersion {
 		t.Fatalf("a spec with one version: %+v, %v", versions, named)
 	}
 
@@ -119,7 +119,7 @@ func TestRenderInputOfAFilledSpec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if in.ClusterName != clusterName || in.KubernetesVersion != "1.37.0" || in.Role != machine.TypeWorker ||
+	if in.ClusterName != clusterName || in.KubernetesVersion != talostest.KubernetesVersion || in.Role != machine.TypeWorker ||
 		in.InstallImage != installImage || in.Contract == nil || len(in.Patches) != 2 {
 		t.Fatalf("got %+v", in)
 	}
@@ -129,8 +129,8 @@ func TestRenderInputOfAFilledSpec(t *testing.T) {
 	pool.Installer = &talosv1alpha1.PoolInstaller{SchematicID: own}
 
 	install, err := adopt.InstallTarget(spec, pool)
-	if err != nil || install.SchematicID != own || install.Version != "v1.14.0" ||
-		install.Image != "factory.talos.dev/metal-installer/"+own+":v1.14.0" {
+	if err != nil || install.SchematicID != own || install.Version != talostest.TalosVersion ||
+		install.Image != "factory.talos.dev/metal-installer/"+own+":"+talostest.TalosVersion {
 		t.Fatalf("got %+v, %v", install, err)
 	}
 }

@@ -31,25 +31,15 @@ import (
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/adopt"
 	"github.com/jarensaa/talos-operator/internal/adopt/bundle"
-	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 const (
-	clusterName  = "my-cluster"
-	schematic    = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
-	installImage = "factory.talos.dev/metal-installer/" + schematic + ":v1.14.0"
+	clusterName  = talostest.ClusterName
+	schematic    = talostest.SchematicID
+	installImage = talostest.InstallImage
 
-	networkPatch = `apiVersion: v1alpha1
-kind: BondConfig
-name: bond0
-links: [eth0, eth1]
-bondMode: 802.3ad
----
-apiVersion: v1alpha1
-kind: DHCPv4Config
-name: bond0
----
+	networkPatch = talostest.NetworkPatch + `---
 apiVersion: v1alpha1
 kind: KubeProxyConfig
 enabled: false
@@ -70,32 +60,16 @@ func liveCluster(t *testing.T, b *secrets.Bundle, image string) []adopt.LiveNode
 	nodes := make([]adopt.LiveNode, 0, len(wwids))
 
 	for i, wwid := range wwids {
-		cfg, err := render.Generate(render.Input{
-			ClusterName:       clusterName,
-			Endpoint:          "https://cluster.example.com:6443",
-			KubernetesVersion: "1.37.0",
-			Contract:          config.TalosVersion1_14,
-			Bundle:            b,
-			Role:              machine.TypeControlPlane,
-			InstallImage:      image,
-			Patches:           [][]byte{[]byte(fmt.Sprintf(diskPatch, wwid)), []byte(networkPatch)},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		raw, err := cfg.Bytes()
-		if err != nil {
-			t.Fatal(err)
-		}
+		in := talostest.Input(t, fmt.Sprintf(diskPatch, wwid), networkPatch)
+		in.Bundle, in.InstallImage = b, image
 
 		nodes = append(nodes, adopt.LiveNode{
 			Hostname:     fmt.Sprintf("talos-cp-%d", i+1),
 			Address:      fmt.Sprintf("10.0.0.%d", 11+i),
 			Role:         machine.TypeControlPlane,
 			SystemUUID:   fmt.Sprintf("aaaaaaaa-bbbb-4ccc-8ddd-00000000000%d", i),
-			TalosVersion: "v1.14.0",
-			Config:       raw,
+			TalosVersion: talostest.TalosVersion,
+			Config:       talostest.Config(t, in),
 		})
 	}
 
@@ -128,8 +102,9 @@ func TestBuildProposesSpecsThatReproduceTheCluster(t *testing.T) {
 	}
 
 	spec := p.Cluster.Spec
-	if spec.ClusterName != clusterName || spec.Versions.Talos != "v1.14.0" || spec.Versions.Kubernetes != "1.37.0" ||
-		spec.ConfigGeneration.VersionContract != "v1.14" || spec.ConfigGeneration.Installer.SchematicID != schematic {
+	if spec.ClusterName != clusterName || spec.Versions.Talos != talostest.TalosVersion ||
+		spec.Versions.Kubernetes != talostest.KubernetesVersion ||
+		spec.ConfigGeneration.VersionContract != talostest.VersionContract || spec.ConfigGeneration.Installer.SchematicID != schematic {
 		t.Fatalf("unexpected spec: %+v", spec)
 	}
 

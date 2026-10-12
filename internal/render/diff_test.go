@@ -17,7 +17,6 @@ limitations under the License.
 package render_test
 
 import (
-	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -26,11 +25,12 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 
 	"github.com/jarensaa/talos-operator/internal/render"
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 func TestDiffOfEqualConfigsIsEmpty(t *testing.T) {
-	a := mustRender(t, input(t, bondPatch))
-	b := mustRender(t, input(t, bondPatch))
+	a := mustRender(t, talostest.Input(t, talostest.NetworkPatch))
+	b := mustRender(t, talostest.Input(t, talostest.NetworkPatch))
 
 	diffs, err := render.Diff(a, b)
 	if err != nil || len(diffs) != 0 {
@@ -39,8 +39,8 @@ func TestDiffOfEqualConfigsIsEmpty(t *testing.T) {
 }
 
 func TestDiffReportsDocumentsByKeyAndOp(t *testing.T) {
-	base := mustRender(t, input(t, strings.ReplaceAll(labelPatch, "%s", "one")))
-	changed := mustRender(t, input(t, strings.ReplaceAll(labelPatch, "%s", "two"), bondPatch))
+	base := mustRender(t, talostest.Input(t, strings.ReplaceAll(labelPatch, "%s", "one")))
+	changed := mustRender(t, talostest.Input(t, strings.ReplaceAll(labelPatch, "%s", "two"), talostest.NetworkPatch))
 
 	diffs, err := render.Diff(base, changed)
 	if err != nil {
@@ -75,23 +75,6 @@ func TestDiffReportsDocumentsByKeyAndOp(t *testing.T) {
 	}
 }
 
-// secretStrings returns every secret a config generated from b could contain, in the encodings
-// configs use (raw, and base64 of PEM for certificates and keys).
-func secretStrings(b *secrets.Bundle) []string {
-	keys := [][]byte{
-		b.Certs.OS.Key, b.Certs.Etcd.Key, b.Certs.K8s.Key, b.Certs.K8sAggregator.Key, b.Certs.K8sServiceAccount.Key,
-	}
-
-	out := make([]string, 0, 4+len(keys))
-	out = append(out, b.TrustdInfo.Token, b.Secrets.BootstrapToken, b.Secrets.SecretboxEncryptionSecret, b.Cluster.Secret)
-
-	for _, pem := range keys {
-		out = append(out, base64.StdEncoding.EncodeToString(pem)[:40])
-	}
-
-	return out
-}
-
 // TestDiffNeverLeaksSecrets diffs configs from two different bundles, the worst case where every
 // secret differs, for both roles, and scans the output for any secret or key material.
 func TestDiffNeverLeaksSecrets(t *testing.T) {
@@ -102,7 +85,7 @@ func TestDiffNeverLeaksSecrets(t *testing.T) {
 
 	for _, role := range []machine.Type{machine.TypeControlPlane, machine.TypeWorker} {
 		t.Run(role.String(), func(t *testing.T) {
-			ia := input(t, bondPatch)
+			ia := talostest.Input(t, talostest.NetworkPatch)
 			ia.Role = role
 
 			ib := ia
@@ -131,8 +114,8 @@ func TestDiffNeverLeaksSecrets(t *testing.T) {
 				t.Fatal("diff contains PEM material")
 			}
 
-			for _, s := range append(secretStrings(ia.Bundle), secretStrings(other)...) {
-				if s != "" && strings.Contains(out, s) {
+			for _, s := range append(talostest.SecretValues(ia.Bundle), talostest.SecretValues(other)...) {
+				if strings.Contains(out, s) {
 					t.Fatal("diff leaks a secret value")
 				}
 			}
@@ -163,7 +146,7 @@ func TestRedactFailsClosedOnUnparsableInput(t *testing.T) {
 }
 
 func TestPatchDocKeysMatchDiffKeys(t *testing.T) {
-	keys, err := render.PatchDocKeys([]byte(bondPatch + "---\n" + strings.ReplaceAll(labelPatch, "%s", "x")))
+	keys, err := render.PatchDocKeys([]byte(talostest.NetworkPatch + "---\n" + strings.ReplaceAll(labelPatch, "%s", "x")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +157,7 @@ func TestPatchDocKeysMatchDiffKeys(t *testing.T) {
 	}
 
 	legacy, err := render.PatchDocKeys([]byte("machine:\n  nodeLabels:\n    a: b\n"))
-	if err != nil || len(legacy) != 1 || legacy[0] != keyV1alpha1 {
+	if err != nil || len(legacy) != 1 || legacy[0] != render.RootKey {
 		t.Fatalf("legacy patch keys: %v err=%v", legacy, err)
 	}
 
@@ -184,8 +167,8 @@ func TestPatchDocKeysMatchDiffKeys(t *testing.T) {
 }
 
 func TestWithholdHidesSensitiveDocuments(t *testing.T) {
-	base := mustRender(t, input(t, strings.ReplaceAll(labelPatch, "%s", "public")))
-	changed := mustRender(t, input(t, strings.ReplaceAll(labelPatch, "%s", "hunter2"), bondPatch))
+	base := mustRender(t, talostest.Input(t, strings.ReplaceAll(labelPatch, "%s", "public")))
+	changed := mustRender(t, talostest.Input(t, strings.ReplaceAll(labelPatch, "%s", "hunter2"), talostest.NetworkPatch))
 
 	diffs, err := render.Diff(base, changed)
 	if err != nil {

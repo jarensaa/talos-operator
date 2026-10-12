@@ -31,12 +31,12 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/config"
-	"github.com/siderolabs/talos/pkg/machinery/config/generate"
-	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
 	"go.yaml.in/yaml/v4"
 	"k8s.io/client-go/rest"
+
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 const (
@@ -53,28 +53,10 @@ const (
 func generated(t *testing.T, contract *config.VersionContract, role machine.Type) []byte {
 	t.Helper()
 
-	bundle, err := secrets.NewBundle(secrets.NewClock(), contract)
-	if err != nil {
-		t.Fatal(err)
-	}
+	in := talostest.Input(t)
+	in.Contract, in.Role, in.KubernetesVersion = contract, role, kubeFrom
 
-	input, err := generate.NewInput("c", "https://10.5.0.2:6443", kubeFrom,
-		generate.WithSecretsBundle(bundle), generate.WithVersionContract(contract))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := input.Config(role)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	raw, err := cfg.Bytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return raw
+	return talostest.Config(t, in)
 }
 
 var contracts = map[string]*config.VersionContract{"1.14": config.TalosVersion1_14, "1.13": config.TalosVersion1_13}

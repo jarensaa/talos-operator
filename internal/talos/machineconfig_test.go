@@ -25,42 +25,13 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource/protobuf"
 	configres "github.com/siderolabs/talos/pkg/machinery/resources/config"
 
-	"github.com/siderolabs/talos/pkg/machinery/config"
-	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
-func generatedControlPlaneConfig(t *testing.T) []byte {
-	t.Helper()
-
-	bundle, err := testBundle()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	input, err := generate.NewInput("e2e", "https://10.5.0.2:6443", "1.37.0",
-		generate.WithSecretsBundle(bundle),
-		generate.WithVersionContract(config.TalosVersion1_14),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := input.Config(machine.TypeControlPlane)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	raw, err := cfg.Bytes()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return raw
-}
-
 func TestParseMachineConfigAcceptsGeneratedMultiDocConfig(t *testing.T) {
-	cfg, err := ParseMachineConfig(generatedControlPlaneConfig(t))
+	cfg, err := ParseMachineConfig(talostest.Config(t, talostest.Input(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +42,7 @@ func TestParseMachineConfigAcceptsGeneratedMultiDocConfig(t *testing.T) {
 }
 
 func TestParseMachineConfigFailsClosedOnUnknownDocumentKind(t *testing.T) {
-	raw := append(generatedControlPlaneConfig(t), []byte("---\napiVersion: v1alpha1\nkind: FutureTalosConfig\nenabled: true\n")...)
+	raw := append(talostest.Config(t, talostest.Input(t)), []byte("---\napiVersion: v1alpha1\nkind: FutureTalosConfig\nenabled: true\n")...)
 
 	_, err := ParseMachineConfig(raw)
 	if !errors.Is(err, ErrUnsupportedConfig) {
@@ -84,7 +55,7 @@ func TestParseMachineConfigFailsClosedOnUnknownDocumentKind(t *testing.T) {
 }
 
 func TestParseMachineConfigErrorsNeverQuoteContent(t *testing.T) {
-	raw := generatedControlPlaneConfig(t)
+	raw := talostest.Config(t, talostest.Input(t))
 
 	// Corrupt the YAML right after the cluster token so a parser error would quote nearby secrets.
 	corrupt := strings.Replace(string(raw), "token: ", "token: [unclosed ", 1)
@@ -100,7 +71,7 @@ func TestParseMachineConfigErrorsNeverQuoteContent(t *testing.T) {
 }
 
 func TestHashConfigIsStableAndIgnoresSurroundingWhitespace(t *testing.T) {
-	raw := generatedControlPlaneConfig(t)
+	raw := talostest.Config(t, talostest.Input(t))
 
 	if HashConfig(raw) != HashConfig(append([]byte("\n"), append(raw, '\n')...)) {
 		t.Fatal("hash must ignore surrounding whitespace")
@@ -132,7 +103,7 @@ func TestPendingConfigChange(t *testing.T) {
 // and checks that the extracted bytes are the original multi-document config. Parsing the YAML
 // spec instead (a string scalar) is what broke e2e.
 func TestMachineConfigBodyFromWireResource(t *testing.T) {
-	raw := generatedControlPlaneConfig(t)
+	raw := talostest.Config(t, talostest.Input(t))
 
 	cfg, err := ParseMachineConfig(raw)
 	if err != nil {

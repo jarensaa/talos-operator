@@ -32,6 +32,7 @@ import (
 
 	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos"
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 // The parity test generates a cluster's configs with a real talosctl (gen config --with-secrets,
@@ -41,11 +42,6 @@ import (
 // material is committed. Run with `make test-parity` (talosctl must match the machinery version).
 
 const (
-	parityCluster  = "my-cluster"
-	parityEndpoint = "https://cluster.example.com:6443"
-	parityK8s      = "1.37.0"
-	parityImage    = "factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.2"
-
 	// A per-node patch and a cluster-wide network patch, of the kinds such clusters carry.
 	nodePatch = `apiVersion: v1alpha1
 kind: DHCPv4Config
@@ -130,10 +126,10 @@ func TestParityWithTalosctl(t *testing.T) {
 			// With a single output type, --output names the file rather than a directory.
 			generated := filepath.Join(dir, role.String()+".yaml")
 
-			talosctl(t, dir, "gen", "config", parityCluster, parityEndpoint,
+			talosctl(t, dir, "gen", "config", talostest.ClusterName, talostest.Endpoint,
 				"--with-secrets", "secrets.yaml",
-				"--install-image", parityImage,
-				"--kubernetes-version", parityK8s,
+				"--install-image", talostest.InstallImage,
+				"--kubernetes-version", talostest.KubernetesVersion,
 				"--output-types", role.String(),
 				"--with-docs=false", "--with-examples=false",
 				"--output", generated,
@@ -166,13 +162,13 @@ func TestParityWithTalosctl(t *testing.T) {
 			}
 
 			got, err := render.Render(render.Input{
-				ClusterName:       parityCluster,
-				Endpoint:          parityEndpoint,
-				KubernetesVersion: parityK8s,
+				ClusterName:       talostest.ClusterName,
+				Endpoint:          talostest.Endpoint,
+				KubernetesVersion: talostest.KubernetesVersion,
 				Contract:          config.TalosVersion1_14,
 				Bundle:            bundle,
 				Role:              role,
-				InstallImage:      parityImage,
+				InstallImage:      talostest.InstallImage,
 				Patches:           patches,
 			})
 			if err != nil {

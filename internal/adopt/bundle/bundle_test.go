@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	"github.com/siderolabs/talos/pkg/machinery/config"
-	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 
@@ -34,20 +33,10 @@ import (
 func generateConfig(t *testing.T, b *secrets.Bundle, contract *config.VersionContract, role machine.Type) config.Provider {
 	t.Helper()
 
-	input, err := generate.NewInput("my-cluster", "https://cluster.example.com:6443", "1.37.0",
-		generate.WithSecretsBundle(b),
-		generate.WithVersionContract(contract),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	in := talostest.Input(t)
+	in.Bundle, in.Contract, in.Role = b, contract, role
 
-	cfg, err := input.Config(role)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return cfg
+	return talostest.Generate(t, in)
 }
 
 func TestRecoverRoundTripsTheBundle(t *testing.T) {

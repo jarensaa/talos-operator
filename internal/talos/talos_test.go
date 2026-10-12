@@ -23,13 +23,10 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
-	"sync"
 	"testing"
 	"time"
 
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
-	"github.com/siderolabs/talos/pkg/machinery/config"
-	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -222,11 +219,6 @@ func TestParseEndpointRejectsHostnames(t *testing.T) {
 		}
 	}
 }
-
-// testBundle is shared by the package: generating a bundle's CA keys takes about a second.
-var testBundle = sync.OnceValues(func() (*secrets.Bundle, error) {
-	return secrets.NewBundle(secrets.NewClock(), config.TalosVersion1_14)
-})
 
 func testCredentials(t *testing.T) *creds.Credentials {
 	t.Helper()
