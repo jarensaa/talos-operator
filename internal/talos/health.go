@@ -268,9 +268,9 @@ var upkeepMethods = map[string]bool{
 }
 
 // checkUpkeep is the allowlist of a Keeper connection.
-func checkUpkeep(method string, req any) error {
+func checkUpkeep(method string, req any) string {
 	if upkeepMethods[method] {
-		return nil
+		return ""
 	}
 
 	return checkReadOnly(method, req)

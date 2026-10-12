@@ -27,7 +27,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
@@ -72,12 +71,7 @@ func TestReaderMethodSetIsReviewed(t *testing.T) {
 }
 
 func TestCheckReadOnly(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
+	checkAllowlist(t, accessReadOnly, []allowCase{
 		{"version", machineapi.MachineService_Version_FullMethodName, &emptypb.Empty{}, true},
 		{"cosi get", cosiGetMethod, nil, true},
 		{"reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, false},
@@ -94,64 +88,26 @@ func TestCheckReadOnly(t *testing.T) {
 		{"apply", machineapi.MachineService_ApplyConfiguration_FullMethodName, &machineapi.ApplyConfigurationRequest{}, false},
 		{"apply without typed request", machineapi.MachineService_ApplyConfiguration_FullMethodName, nil, false},
 		{"bootstrap", machineapi.MachineService_Bootstrap_FullMethodName, &machineapi.BootstrapRequest{}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			before := testutil.ToFloat64(rejectedRPCs.WithLabelValues(tt.method))
-
-			err := checkReadOnly(tt.method, tt.req)
-
-			after := testutil.ToFloat64(rejectedRPCs.WithLabelValues(tt.method))
-
-			if tt.allow {
-				if err != nil {
-					t.Fatalf("expected allowed, got %v", err)
-				}
-
-				if after != before {
-					t.Fatal("allowed call must not count as rejected")
-				}
-
-				return
-			}
-
-			if status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-
-			if after != before+1 {
-				t.Fatalf("rejected counter: before %v after %v", before, after)
-			}
-		})
-	}
+	})
 }
 
 // A ConfigWriter connection may apply config without rebooting or in try mode, and still nothing
 // else that mutates a node.
 func TestCheckConfig(t *testing.T) {
-	apply := machineapi.MachineService_ApplyConfiguration_FullMethodName
-	mode := func(m machineapi.ApplyConfigurationRequest_Mode, dryRun bool) *machineapi.ApplyConfigurationRequest {
-		return &machineapi.ApplyConfigurationRequest{Mode: m, DryRun: dryRun}
-	}
+	const method = machineapi.MachineService_ApplyConfiguration_FullMethodName
 
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
-		{"apply no-reboot", apply, mode(machineapi.ApplyConfigurationRequest_NO_REBOOT, false), true},
-		{"apply try", apply, mode(machineapi.ApplyConfigurationRequest_TRY, false), true},
-		{"dry run in try mode", apply, mode(machineapi.ApplyConfigurationRequest_TRY, true), true},
+	checkAllowlist(t, accessConfig, []allowCase{
+		{"apply no-reboot", method, apply(machineapi.ApplyConfigurationRequest_NO_REBOOT, false), true},
+		{"apply try", method, apply(machineapi.ApplyConfigurationRequest_TRY, false), true},
+		{"dry run in try mode", method, apply(machineapi.ApplyConfigurationRequest_TRY, true), true},
 		// Talos would decide about a reboot itself, or leave a config staged for the next boot.
-		{"apply auto", apply, mode(machineapi.ApplyConfigurationRequest_AUTO, false), false},
-		{"apply staged", apply, mode(machineapi.ApplyConfigurationRequest_STAGED, false), false},
+		{"apply auto", method, apply(machineapi.ApplyConfigurationRequest_AUTO, false), false},
+		{"apply staged", method, apply(machineapi.ApplyConfigurationRequest_STAGED, false), false},
 		//nolint:staticcheck // the deprecated mode must stay refused
-		{"apply reboot", apply, mode(machineapi.ApplyConfigurationRequest_REBOOT, false), false},
+		{"apply reboot", method, apply(machineapi.ApplyConfigurationRequest_REBOOT, false), false},
 		// A dry run in another mode still cancels a pending try rollback.
-		{"dry run in no-reboot mode", apply, mode(machineapi.ApplyConfigurationRequest_NO_REBOOT, true), false},
-		{"apply without typed request", apply, nil, false},
+		{"dry run in no-reboot mode", method, apply(machineapi.ApplyConfigurationRequest_NO_REBOOT, true), false},
+		{"apply without typed request", method, nil, false},
 		{"version", machineapi.MachineService_Version_FullMethodName, &emptypb.Empty{}, true},
 		{"reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, false},
 		{"reset", machineapi.MachineService_Reset_FullMethodName, &machineapi.ResetRequest{}, false},
@@ -159,20 +115,7 @@ func TestCheckConfig(t *testing.T) {
 		{"upgrade", machineapi.MachineService_Upgrade_FullMethodName, &machineapi.UpgradeRequest{}, false},
 		{"etcd leave", machineapi.MachineService_EtcdLeaveCluster_FullMethodName, &machineapi.EtcdLeaveClusterRequest{}, false},
 		{"bootstrap", machineapi.MachineService_Bootstrap_FullMethodName, &machineapi.BootstrapRequest{}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := accessConfig.check(tt.method, tt.req)
-			if tt.allow && err != nil {
-				t.Fatalf("expected allowed, got %v", err)
-			}
-
-			if !tt.allow && status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-		})
-	}
+	})
 }
 
 func TestReaderAndConfigWriterUseSeparateConnections(t *testing.T) {

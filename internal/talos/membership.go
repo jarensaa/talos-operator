@@ -103,17 +103,17 @@ var membershipMethods = map[string]bool{
 // one shape a removal uses: graceful, with a reboot, wiping exactly STATE and EPHEMERAL of the
 // system disk. A reset of the whole system disk, of a user disk, or one that leaves etcd without
 // saying so, is refused here, whatever the caller meant.
-func checkMembership(method string, req any) error {
+func checkMembership(method string, req any) string {
 	if membershipMethods[method] {
-		return nil
+		return ""
 	}
 
 	if method == machineapi.MachineService_Reset_FullMethodName {
 		if reset, ok := req.(*machineapi.ResetRequest); ok && removalReset(reset) {
-			return nil
+			return ""
 		}
 
-		return status.Errorf(codes.PermissionDenied, "talos-operator: this reset is not the one a removal is allowed")
+		return "this reset is not the one a removal is allowed"
 	}
 
 	return checkReadOnly(method, req)
@@ -144,18 +144,18 @@ func removalReset(req *machineapi.ResetRequest) bool {
 // checkMaintenance is the allowlist of a Maintenance connection: reading resources, and applying
 // a config without a reboot, which is the only mode that makes a machine in maintenance mode take
 // one. The machine itself allows an unauthenticated caller little more.
-func checkMaintenance(method string, req any) error {
+func checkMaintenance(method string, req any) string {
 	switch method {
 	case cosiGetMethod, cosiListMethod:
-		return nil
+		return ""
 	case machineapi.MachineService_ApplyConfiguration_FullMethodName:
 		if apply, ok := req.(*machineapi.ApplyConfigurationRequest); ok && !apply.GetDryRun() &&
 			apply.GetMode() == machineapi.ApplyConfigurationRequest_NO_REBOOT {
-			return nil
+			return ""
 		}
 	}
 
-	return status.Errorf(codes.PermissionDenied, "talos-operator: %s is not allowed on a maintenance connection", method)
+	return method + " is not allowed on a maintenance connection"
 }
 
 // machineryRemover implements Remover with the machinery client.

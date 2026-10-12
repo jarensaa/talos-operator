@@ -787,12 +787,6 @@ func TestMachineryConnectionsRefuseWhatTheirAccessDoesNotAllow(t *testing.T) {
 	cfg := []byte(strings.Replace(workerConfig, "%s", "new", 1))
 	ctx := client.WithNode(context.Background(), apiNode.String())
 
-	dial := func(a access) []grpc.DialOption {
-		return []grpc.DialOption{
-			grpc.WithChainUnaryInterceptor(a.unaryInterceptor()), grpc.WithChainStreamInterceptor(a.streamInterceptor()),
-		}
-	}
-
 	api, readOnly := serve(t, dial(accessReadOnly)...)
 
 	for _, mode := range []machineapi.ApplyConfigurationRequest_Mode{

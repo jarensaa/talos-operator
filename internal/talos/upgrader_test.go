@@ -26,19 +26,12 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const installerImage = "factory.example.com/metal-installer/aaa:" + apiVersion
-
-func upgradeDial() []grpc.DialOption {
-	return []grpc.DialOption{
-		grpc.WithChainUnaryInterceptor(accessUpgrade.unaryInterceptor()), grpc.WithChainStreamInterceptor(accessUpgrade.streamInterceptor()),
-	}
-}
 
 func progress(message string) *machineapi.LifecycleServiceUpgradeResponse {
 	return &machineapi.LifecycleServiceUpgradeResponse{Progress: &machineapi.LifecycleServiceInstallProgress{
@@ -65,7 +58,7 @@ func pulling() *machineapi.ImageServicePullResponse {
 // The requests an upgrade is made of, as they reach a node: the installer pulled to and installed
 // from Talos's own image store, each call addressed to the node and to nobody else.
 func TestUpgraderSendsWhatAnUpgradeIsMadeOf(t *testing.T) {
-	api, c := serve(t, upgradeDial()...)
+	api, c := serve(t, dial(accessUpgrade)...)
 	api.pull = []*machineapi.ImageServicePullResponse{pulling(), pulling(), pulled(installerImage)}
 	api.install = []*machineapi.LifecycleServiceUpgradeResponse{progress("writing the boot slot"), exitCode(0)}
 
@@ -118,7 +111,7 @@ func TestUpgraderSendsWhatAnUpgradeIsMadeOf(t *testing.T) {
 // An installer's failure is a message on the stream, not an error of the call, and a stream that
 // just ends has not succeeded either.
 func TestUpgraderTellsAFailedInstallFromOneThatFinished(t *testing.T) {
-	api, c := serve(t, upgradeDial()...)
+	api, c := serve(t, dial(accessUpgrade)...)
 	u := &machineryUpgrader{*reader(c)}
 	ctx := context.Background()
 
@@ -142,16 +135,7 @@ func TestUpgraderTellsAFailedInstallFromOneThatFinished(t *testing.T) {
 }
 
 func TestCheckUpgrade(t *testing.T) {
-	apply := func(m machineapi.ApplyConfigurationRequest_Mode, dryRun bool) *machineapi.ApplyConfigurationRequest {
-		return &machineapi.ApplyConfigurationRequest{Mode: m, DryRun: dryRun}
-	}
-
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
+	checkAllowlist(t, accessUpgrade, []allowCase{
 		{"pull", machineapi.ImageService_Pull_FullMethodName, &machineapi.ImageServicePullRequest{}, true},
 		{"install", machineapi.LifecycleService_Upgrade_FullMethodName, &machineapi.LifecycleServiceUpgradeRequest{}, true},
 		{"forfeit leadership", machineapi.MachineService_EtcdForfeitLeadership_FullMethodName, &machineapi.EtcdForfeitLeadershipRequest{}, true},
@@ -174,34 +158,12 @@ func TestCheckUpgrade(t *testing.T) {
 		{"etcd remove member", machineapi.MachineService_EtcdRemoveMemberByID_FullMethodName, &machineapi.EtcdRemoveMemberByIDRequest{}, false},
 		{"image import", machineapi.ImageService_Import_FullMethodName, nil, false},
 		{"image remove", machineapi.ImageService_Remove_FullMethodName, &machineapi.ImageServiceRemoveRequest{}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := accessUpgrade.check(tt.method, tt.req)
-			if tt.allow && err != nil {
-				t.Fatalf("expected allowed, got %v", err)
-			}
-
-			if !tt.allow && status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-		})
-	}
-
-	// And what an upgrade may do, the other connections may not.
-	for method := range upgradeMethods {
-		for _, a := range []access{accessReadOnly, accessConfig} {
-			if status.Code(a.check(method, nil)) != codes.PermissionDenied {
-				t.Fatalf("%s must be refused on a connection with access %d", method, a)
-			}
-		}
-	}
+	})
 }
 
 // The interceptors really are on the connection: what the access does not allow never leaves.
 func TestUpgradeConnectionRefusesWhatIsNotAnUpgrade(t *testing.T) {
-	api, c := serve(t, upgradeDial()...)
+	api, c := serve(t, dial(accessUpgrade)...)
 	ctx := client.WithNode(context.Background(), apiNode.String())
 	cfg := []byte(strings.Replace(workerConfig, "%s", "new", 1))
 
@@ -220,7 +182,7 @@ func TestUpgradeConnectionRefusesWhatIsNotAnUpgrade(t *testing.T) {
 }
 
 func TestUpgraderLeavesTheCallersDeadlineOnLongCalls(t *testing.T) {
-	api, c := serve(t, upgradeDial()...)
+	api, c := serve(t, dial(accessUpgrade)...)
 	api.pull = []*machineapi.ImageServicePullResponse{pulled(installerImage)}
 
 	// The reader's own timeout is for reads. A pull takes as long as a download takes.

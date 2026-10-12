@@ -409,7 +409,7 @@ func TestKubernetesUpgradeChecksReadTheNodes(t *testing.T) {
 // The image of a static pod goes where the kubelet runs pods from, the kubelet's own where Talos
 // runs its services from.
 func TestUpgraderPullsKubernetesImagesToWhereTheyRun(t *testing.T) {
-	api, c := serve(t, upgradeDial()...)
+	api, c := serve(t, dial(accessUpgrade)...)
 	api.pull = []*machineapi.ImageServicePullResponse{pulling(), pulled("image")}
 
 	u := &machineryUpgrader{*reader(c)}
