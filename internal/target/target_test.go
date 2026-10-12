@@ -276,39 +276,151 @@ func TestIssuedCredentialsSecretEnqueuesItsCluster(t *testing.T) {
 	}
 }
 
-func TestResolveWriterNeedsConfigManage(t *testing.T) {
-	tc := cluster("happy", "talosconfig")
-	r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
+// A client that can change a node is handed out only while spec.management enables what it does,
+// on a cluster whose config the operator owns. Nothing that only observes gets one, and enabling
+// one capability hands out no client of another (docs/scope.md §8.1, invariant 6).
+func TestClientsThatChangeANodeNeedTheirCapability(t *testing.T) {
+	const (
+		observe  = talosv1alpha1.ConfigManagementObserve
+		manage   = talosv1alpha1.ConfigManagementManage
+		enabled  = talosv1alpha1.CapabilityEnabled
+		disabled = talosv1alpha1.CapabilityDisabled
+	)
+
+	ctx := context.Background()
 	outside := talos.SelectOptions{Exclude: netip.MustParseAddr("10.0.0.11")}
+	candidate := netip.MustParseAddr("10.0.0.19")
 
-	// Observing never yields a client that can write: not by default, not when asked nicely.
-	for _, mode := range []talosv1alpha1.ConfigManagement{"", talosv1alpha1.ConfigManagementObserve} {
-		tc.Spec.Management.Config = mode
-
-		if _, err := r.ResolveWriter(context.Background(), tc, outside); !errors.Is(err, target.ErrNotManaged) {
-			t.Fatalf("config %q: expected ErrNotManaged, got %v", mode, err)
-		}
+	// Upgrades being enabled is not enough to add or remove a machine.
+	withoutMembership := []talosv1alpha1.Management{
+		{},
+		{Config: observe, Membership: enabled},
+		{Config: manage},
+		{Config: manage, Upgrades: enabled},
+		{Config: manage, Membership: disabled},
 	}
 
-	if len(f.WriterTargets()) != 0 {
-		t.Fatal("no write client may even be built while observing")
-	}
+	for _, tt := range []struct {
+		name string
+		// refused is every spec.management the client is refused under, with the error it is refused with.
+		refused []talosv1alpha1.Management
+		refusal error
+		// allowed is the spec.management that hands the client out.
+		allowed talosv1alpha1.Management
+		resolve func(*target.Resolver, *talosv1alpha1.TalosCluster) (any, error)
+		// built is what the factory was asked to build a client of this kind for. The maintenance
+		// connection has none: it is made to an address, without the cluster's credentials.
+		built func(*fake.Factory) []talos.Target
+	}{
+		{
+			name: "a config writer",
+			// Observing never yields a client that can write: not by default, not when asked nicely.
+			refused: []talosv1alpha1.Management{{}, {Config: observe}},
+			refusal: target.ErrNotManaged,
+			allowed: talosv1alpha1.Management{Config: manage},
+			resolve: func(r *target.Resolver, tc *talosv1alpha1.TalosCluster) (any, error) {
+				return r.ResolveWriter(ctx, tc, outside)
+			},
+			built: (*fake.Factory).WriterTargets,
+		},
+		{
+			// A client that can reboot a node: nothing that only manages config gets one.
+			name: "an upgrader",
+			refused: []talosv1alpha1.Management{
+				{},
+				{Config: observe, Upgrades: enabled},
+				{Config: manage},
+				{Config: manage, Upgrades: disabled},
+			},
+			refusal: target.ErrUpgradesDisabled,
+			allowed: talosv1alpha1.Management{Config: manage, Upgrades: enabled},
+			resolve: func(r *target.Resolver, tc *talosv1alpha1.TalosCluster) (any, error) {
+				return r.ResolveUpgrader(ctx, tc, outside)
+			},
+			built: (*fake.Factory).UpgraderTargets,
+		},
+		{
+			// A client that can reset a node.
+			name:    "a remover",
+			refused: withoutMembership,
+			refusal: target.ErrMembershipDisabled,
+			allowed: talosv1alpha1.Management{Config: manage, Membership: enabled},
+			resolve: func(r *target.Resolver, tc *talosv1alpha1.TalosCluster) (any, error) {
+				return r.ResolveRemover(ctx, tc, outside)
+			},
+			built: (*fake.Factory).RemoverTargets,
+		},
+		{
+			name:    "a maintenance connection",
+			refused: withoutMembership,
+			refusal: target.ErrMembershipDisabled,
+			allowed: talosv1alpha1.Management{Config: manage, Membership: enabled},
+			resolve: func(r *target.Resolver, tc *talosv1alpha1.TalosCluster) (any, error) {
+				return r.ResolveMaintenance(ctx, tc, candidate)
+			},
+		},
+		{
+			// The client that defragments etcd.
+			name: "a keeper",
+			refused: []talosv1alpha1.Management{
+				{},
+				{Config: observe, Maintenance: enabled},
+				{Config: manage},
+				{Config: manage, Upgrades: enabled, Membership: enabled},
+			},
+			refusal: target.ErrMaintenanceDisabled,
+			allowed: talosv1alpha1.Management{Config: manage, Maintenance: enabled},
+			resolve: func(r *target.Resolver, tc *talosv1alpha1.TalosCluster) (any, error) {
+				return r.ResolveKeeper(ctx, tc, outside)
+			},
+			built: (*fake.Factory).KeeperTargets,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := cluster("happy", "talosconfig")
+			r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
 
-	tc.Spec.Management.Config = talosv1alpha1.ConfigManagementManage
+			// Every client the factory was asked for, of whatever kind.
+			asked := func() int {
+				return len(f.Targets()) + len(f.WriterTargets()) + len(f.UpgraderTargets()) + len(f.RemoverTargets()) + len(f.KeeperTargets())
+			}
 
-	w, err := r.ResolveWriter(context.Background(), tc, outside)
-	if err != nil || w == nil {
-		t.Fatalf("expected a writer once config is Manage: %v", err)
-	}
+			for _, m := range tt.refused {
+				tc.Spec.Management = m
 
-	// It reaches the node through the same endpoints as the reads: never the node being changed.
-	targets := f.WriterTargets()
-	if len(targets) != 1 || len(targets[0].Endpoints) != 1 || targets[0].Endpoints[0].Addr != netip.MustParseAddr("10.0.0.12") {
-		t.Fatalf("writer targets: %+v", targets)
-	}
+				if got, err := tt.resolve(r, tc); !errors.Is(err, tt.refusal) || got != nil {
+					t.Fatalf("management %+v: expected %v and no client, got %v, %v", m, tt.refusal, got, err)
+				}
+			}
 
-	if len(f.Targets()) != 0 {
-		t.Fatal("a writer is its own client, not the reader's")
+			if asked() != 0 {
+				t.Fatal("no client may even be built while what it does is not enabled")
+			}
+
+			tc.Spec.Management = tt.allowed
+
+			if got, err := tt.resolve(r, tc); err != nil || got == nil {
+				t.Fatalf("management %+v: expected a client, got %v, %v", tt.allowed, got, err)
+			}
+
+			if tt.built == nil {
+				if asked() != 0 {
+					t.Fatal("a maintenance connection is made to an address: no client of the cluster's is built for it")
+				}
+
+				return
+			}
+
+			// It reaches a node through another one, like the reads: never through the node being changed.
+			targets := tt.built(f)
+			if len(targets) != 1 || len(targets[0].Endpoints) != 1 || targets[0].Endpoints[0].Addr != netip.MustParseAddr("10.0.0.12") {
+				t.Fatalf("targets: %+v", targets)
+			}
+
+			if asked() != 1 {
+				t.Fatal("the client is its own, not the reader's and not any other's")
+			}
+		})
 	}
 }
 
@@ -354,137 +466,5 @@ func TestResolveMarksKubernetesAPIFailures(t *testing.T) {
 
 	if _, err := r.Resolve(context.Background(), tc, talos.SelectOptions{}); errors.Is(err, target.ErrKubernetesAPI) {
 		t.Fatalf("a missing Secret must stay a credentials problem: %v", err)
-	}
-}
-
-// A client that can reboot a node is handed out only while upgrades are enabled, on a cluster
-// whose config the operator owns. Nothing that only observes, or only manages config, gets one.
-func TestResolveUpgraderNeedsUpgradesEnabled(t *testing.T) {
-	tc := cluster("happy", "talosconfig")
-	r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
-	outside := talos.SelectOptions{Exclude: netip.MustParseAddr("10.0.0.11")}
-
-	refused := []talosv1alpha1.Management{
-		{},
-		{Config: talosv1alpha1.ConfigManagementObserve, Upgrades: talosv1alpha1.CapabilityEnabled},
-		{Config: talosv1alpha1.ConfigManagementManage},
-		{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityDisabled},
-	}
-
-	for _, m := range refused {
-		tc.Spec.Management = m
-
-		if _, err := r.ResolveUpgrader(context.Background(), tc, outside); !errors.Is(err, target.ErrUpgradesDisabled) {
-			t.Fatalf("management %+v: expected ErrUpgradesDisabled, got %v", m, err)
-		}
-	}
-
-	if len(f.UpgraderTargets()) != 0 {
-		t.Fatal("no upgrade client may even be built while upgrades are off")
-	}
-
-	tc.Spec.Management = talosv1alpha1.Management{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityEnabled}
-
-	u, err := r.ResolveUpgrader(context.Background(), tc, outside)
-	if err != nil || u == nil {
-		t.Fatalf("expected an upgrader once upgrades are enabled: %v", err)
-	}
-
-	// It reaches the node through another one, like every other client.
-	targets := f.UpgraderTargets()
-	if len(targets) != 1 || len(targets[0].Endpoints) != 1 || targets[0].Endpoints[0].Addr != netip.MustParseAddr("10.0.0.12") {
-		t.Fatalf("upgrader targets: %+v", targets)
-	}
-
-	if len(f.Targets())+len(f.WriterTargets()) != 0 {
-		t.Fatal("an upgrader is its own client, not the reader's or the config writer's")
-	}
-}
-
-// The clients that add and remove machines are handed out only while membership is enabled, on a
-// cluster whose config the operator owns. Upgrades being enabled is not enough.
-func TestMembershipClientsNeedMembershipEnabled(t *testing.T) {
-	tc := cluster("happy", "talosconfig")
-	r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
-	outside := talos.SelectOptions{Exclude: netip.MustParseAddr("10.0.0.11")}
-	candidate := netip.MustParseAddr("10.0.0.19")
-
-	refused := []talosv1alpha1.Management{
-		{},
-		{Config: talosv1alpha1.ConfigManagementObserve, Membership: talosv1alpha1.CapabilityEnabled},
-		{Config: talosv1alpha1.ConfigManagementManage},
-		{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityEnabled},
-		{Config: talosv1alpha1.ConfigManagementManage, Membership: talosv1alpha1.CapabilityDisabled},
-	}
-
-	for _, m := range refused {
-		tc.Spec.Management = m
-
-		if _, err := r.ResolveRemover(context.Background(), tc, outside); !errors.Is(err, target.ErrMembershipDisabled) {
-			t.Fatalf("management %+v: expected ErrMembershipDisabled for a remover, got %v", m, err)
-		}
-
-		if _, err := r.ResolveMaintenance(context.Background(), tc, candidate); !errors.Is(err, target.ErrMembershipDisabled) {
-			t.Fatalf("management %+v: expected ErrMembershipDisabled for a maintenance connection, got %v", m, err)
-		}
-	}
-
-	if len(f.RemoverTargets()) != 0 {
-		t.Fatal("no client that can reset a node may even be built while membership is off")
-	}
-
-	tc.Spec.Management = talosv1alpha1.Management{Config: talosv1alpha1.ConfigManagementManage, Membership: talosv1alpha1.CapabilityEnabled}
-
-	remover, err := r.ResolveRemover(context.Background(), tc, outside)
-	if err != nil || remover == nil {
-		t.Fatalf("expected a remover once membership is enabled: %v", err)
-	}
-
-	// It reaches the node through another one, like every other client.
-	targets := f.RemoverTargets()
-	if len(targets) != 1 || len(targets[0].Endpoints) != 1 || targets[0].Endpoints[0].Addr != netip.MustParseAddr("10.0.0.12") {
-		t.Fatalf("remover targets: %+v", targets)
-	}
-
-	if len(f.Targets())+len(f.WriterTargets())+len(f.UpgraderTargets()) != 0 {
-		t.Fatal("a remover is its own client, not anyone else's")
-	}
-
-	maintenance, err := r.ResolveMaintenance(context.Background(), tc, candidate)
-	if err != nil || maintenance == nil {
-		t.Fatalf("expected a maintenance connection once membership is enabled: %v", err)
-	}
-}
-
-// The client that defragments etcd is handed out only while maintenance is enabled.
-func TestResolveKeeperNeedsMaintenanceEnabled(t *testing.T) {
-	tc := cluster("happy", "talosconfig")
-	r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
-
-	for _, m := range []talosv1alpha1.Management{
-		{},
-		{Config: talosv1alpha1.ConfigManagementObserve, Maintenance: talosv1alpha1.CapabilityEnabled},
-		{Config: talosv1alpha1.ConfigManagementManage},
-		{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityEnabled, Membership: talosv1alpha1.CapabilityEnabled},
-	} {
-		tc.Spec.Management = m
-
-		if _, err := r.ResolveKeeper(context.Background(), tc, talos.SelectOptions{}); !errors.Is(err, target.ErrMaintenanceDisabled) {
-			t.Fatalf("management %+v: expected ErrMaintenanceDisabled, got %v", m, err)
-		}
-	}
-
-	if len(f.KeeperTargets()) != 0 {
-		t.Fatal("no client that can defragment may even be built while maintenance is off")
-	}
-
-	tc.Spec.Management = talosv1alpha1.Management{Config: talosv1alpha1.ConfigManagementManage, Maintenance: talosv1alpha1.CapabilityEnabled}
-
-	if keeper, err := r.ResolveKeeper(context.Background(), tc, talos.SelectOptions{}); err != nil || keeper == nil {
-		t.Fatalf("expected a keeper once maintenance is enabled: %v", err)
-	}
-
-	if len(f.Targets())+len(f.WriterTargets())+len(f.UpgraderTargets())+len(f.RemoverTargets()) != 0 {
-		t.Fatal("a keeper is its own client, not anyone else's")
 	}
 }
