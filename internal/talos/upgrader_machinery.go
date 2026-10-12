@@ -29,9 +29,7 @@ import (
 )
 
 // machineryUpgrader implements Upgrader on a connection opened with accessUpgrade.
-type machineryUpgrader struct {
-	machineryReader
-}
+type machineryUpgrader struct{ forfeiter }
 
 var _ Upgrader = (*machineryUpgrader)(nil)
 
@@ -55,14 +53,12 @@ func (u *machineryUpgrader) PullImage(ctx context.Context, node netip.Addr, imag
 
 // PullKubernetesImage implements Upgrader.
 func (u *machineryUpgrader) PullKubernetesImage(ctx context.Context, node netip.Addr, component, image string) error {
-	switch component {
-	case ComponentKubelet:
-		return u.pull(ctx, node, systemContainerd(), image)
-	case ComponentAPIServer, ComponentControllerManager, ComponentScheduler:
-		return u.pull(ctx, node, criContainerd(), image)
+	store, err := imageStore(component)
+	if err != nil {
+		return err
 	}
 
-	return fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
+	return u.pull(ctx, node, store, image)
 }
 
 // pull fetches an image. The stream reports progress and ends with the image's name.
@@ -139,18 +135,6 @@ func (u *machineryUpgrader) Install(ctx context.Context, node netip.Addr, image 
 		return fmt.Errorf("install %s on %s: the node ended the install without an exit code", image, node)
 	case *exitCode != 0:
 		return fmt.Errorf("install %s on %s: %w", image, node, &InstallError{ExitCode: *exitCode, Detail: last})
-	}
-
-	return nil
-}
-
-// ForfeitEtcdLeadership implements Upgrader.
-func (u *machineryUpgrader) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
-	ctx, cancel := u.callContext(ctx, node)
-	defer cancel()
-
-	if _, err := u.client.EtcdForfeitLeadership(ctx, &machineapi.EtcdForfeitLeadershipRequest{}); err != nil {
-		return fmt.Errorf("forfeit etcd leadership on %s: %w", node, err)
 	}
 
 	return nil

@@ -20,14 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/netip"
 	"slices"
 	"sort"
 	"strings"
 
 	"github.com/siderolabs/go-kubernetes/kubernetes/upgrade"
-	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
-	"github.com/siderolabs/talos/pkg/machinery/compatibility"
+	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
@@ -54,10 +52,49 @@ const (
 	ComponentProxy = "kube-proxy"
 )
 
-// KubernetesComponents lists the components in the order an upgrade takes them, which is
-// talosctl's (pkg/cluster/kubernetes/talos_managed.go:138-152 in Talos v1.14).
-var KubernetesComponents = []string{
-	ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentProxy, ComponentKubelet,
+// kubernetesComponents is what is known of each component, in the order an upgrade takes them,
+// which is talosctl's (pkg/cluster/kubernetes/talos_managed.go:138-152 in Talos v1.14).
+var kubernetesComponents = []struct {
+	name string
+	// runsFrom is where Talos runs the component from on a node, which is where its image is
+	// pulled to. It is nil for a component Talos does not run.
+	runsFrom func() *common.ContainerdInstance
+}{
+	{ComponentAPIServer, criContainerd},
+	{ComponentControllerManager, criContainerd},
+	{ComponentScheduler, criContainerd},
+	{ComponentProxy, nil},
+	{ComponentKubelet, systemContainerd},
+}
+
+// KubernetesComponents lists the components in the order an upgrade takes them.
+var KubernetesComponents = func() []string {
+	names := make([]string, 0, len(kubernetesComponents))
+	for _, component := range kubernetesComponents {
+		names = append(names, component.name)
+	}
+
+	return names
+}()
+
+// imageStore returns where a node keeps the image of a Kubernetes component Talos runs on it.
+// What Talos does not run has none, and that is an error: kube-proxy, and what is no component.
+func imageStore(component string) (*common.ContainerdInstance, error) {
+	for _, known := range kubernetesComponents {
+		if known.name == component && known.runsFrom != nil {
+			return known.runsFrom(), nil
+		}
+	}
+
+	return nil, fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
+}
+
+// RunsKubernetesComponent returns an error unless component is one Talos itself runs on a node,
+// from the node's machine config. Those are the components an image is pulled for.
+func RunsKubernetesComponent(component string) error {
+	_, err := imageStore(component)
+
+	return err
 }
 
 // KubernetesImages returns the image a machine config names for each Kubernetes component: the
@@ -175,11 +212,9 @@ func KubernetesUpgradeProblem(from, to string, talosVersions map[string]string) 
 // KubernetesSupportProblem says which of the nodes, by the Talos versions they run (node name to
 // tag), does not support Kubernetes version, or returns "".
 func KubernetesSupportProblem(version string, talosVersions map[string]string) string {
-	to := strings.TrimPrefix(version, "v")
-
-	target, err := compatibility.ParseKubernetesVersion(to)
-	if err != nil {
-		return fmt.Sprintf("unparsable Kubernetes version %q", version)
+	// A version that is none is a problem whichever nodes there are, and with none.
+	if _, problem := kubernetesRelease(version); problem != "" {
+		return problem
 	}
 
 	nodes := make([]string, 0, len(talosVersions))
@@ -194,18 +229,17 @@ func KubernetesSupportProblem(version string, talosVersions map[string]string) s
 	for _, node := range nodes {
 		tag := talosVersions[node]
 
-		host, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: tag})
-		if err != nil {
-			return fmt.Sprintf("%s: unparsable Talos version %q", node, tag)
-		}
-
-		if err := target.SupportedWith(host); err != nil {
+		switch why, problem := runsKubernetes(tag, version); {
+		case problem != "":
+			return node + ": " + problem
+		case why != "":
 			unsupported = append(unsupported, fmt.Sprintf("%s (%s)", node, tag))
 		}
 	}
 
 	if len(unsupported) > 0 {
-		return fmt.Sprintf("Talos on %s does not support Kubernetes %s: upgrade Talos first", strings.Join(unsupported, ", "), to)
+		return fmt.Sprintf("Talos on %s does not support Kubernetes %s: upgrade Talos first",
+			strings.Join(unsupported, ", "), strings.TrimPrefix(version, "v"))
 	}
 
 	return ""
@@ -271,24 +305,12 @@ func (r *machineryReader) KubernetesUpgradeChecks(ctx context.Context, from, to 
 		return nil, err
 	}
 
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-
-		ctx, cancel = context.WithTimeout(ctx, r.timeout)
-		defer cancel()
-	}
-
-	addrs := func(in []netip.Addr) []string {
-		out := make([]string, 0, len(in))
-		for _, a := range in {
-			out = append(out, a.String())
-		}
-
-		return out
-	}
+	ctx, cancel := r.bounded(ctx)
+	defer cancel()
 
 	// Without a Kubernetes client, the checks ask the nodes only (client.WithNode for each).
-	checks, err := upgrade.NewChecks(path, r.client.COSI, nil, addrs(nodes.ControlPlanes), addrs(nodes.Workers), func(string, ...any) {})
+	checks, err := upgrade.NewChecks(path, r.client.COSI, nil, addrStrings(nodes.ControlPlanes), addrStrings(nodes.Workers),
+		func(string, ...any) {})
 	if err != nil {
 		return nil, err
 	}

@@ -28,7 +28,6 @@ import (
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/client"
-	"google.golang.org/grpc"
 
 	"github.com/jarensaa/talos-operator/internal/talos/creds"
 )
@@ -86,67 +85,79 @@ func NewFactory() *Factory {
 
 // Reader returns a read-only client for the target.
 func (f *Factory) Reader(ctx context.Context, t Target) (Reader, error) {
-	c, err := f.client(ctx, t, accessReadOnly)
+	r, err := f.reader(ctx, t, accessReadOnly)
 	if err != nil {
 		return nil, err
 	}
 
-	return &machineryReader{client: c, timeout: f.callTimeout()}, nil
+	return &r, nil
 }
 
 // ConfigWriter returns a client that can also apply machine config. Callers hand it out only
 // while spec.management.config is Manage (docs/scope.md §8.1, invariant 6). Its connection is
 // separate from the Reader's and allows nothing else that mutates a node.
 func (f *Factory) ConfigWriter(ctx context.Context, t Target) (ConfigWriter, error) {
-	c, err := f.client(ctx, t, accessConfig)
+	r, err := f.reader(ctx, t, accessConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	return &machineryWriter{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+	return &machineryWriter{r}, nil
 }
 
 // Upgrader returns a client that can also upgrade and reboot nodes. Callers hand it out only
 // while spec.management.upgrades is Enabled (docs/scope.md §8.1, invariant 6). Its connection is
 // separate from the others and cannot apply config.
 func (f *Factory) Upgrader(ctx context.Context, t Target) (Upgrader, error) {
-	c, err := f.client(ctx, t, accessUpgrade)
+	r, err := f.reader(ctx, t, accessUpgrade)
 	if err != nil {
 		return nil, err
 	}
 
-	return &machineryUpgrader{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+	return &machineryUpgrader{forfeiter{r}}, nil
 }
 
 // Remover returns a client that can also take a machine out of the cluster. Callers hand it out
 // only while spec.management.membership is Enabled (docs/scope.md §8.1, invariant 6). Its
 // connection is separate from the others and cannot apply config, upgrade or reboot.
 func (f *Factory) Remover(ctx context.Context, t Target) (Remover, error) {
-	c, err := f.client(ctx, t, accessMembership)
+	r, err := f.reader(ctx, t, accessMembership)
 	if err != nil {
 		return nil, err
 	}
 
-	return &machineryRemover{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+	return &machineryRemover{forfeiter{r}}, nil
 }
 
 // Keeper returns a client that can also defragment etcd. Callers hand it out only while
 // spec.management.maintenance is Enabled (docs/scope.md §8.1, invariant 6). Its connection is
 // separate from the others and can do nothing else to a node.
 func (f *Factory) Keeper(ctx context.Context, t Target) (Keeper, error) {
-	c, err := f.client(ctx, t, accessUpkeep)
+	r, err := f.reader(ctx, t, accessUpkeep)
 	if err != nil {
 		return nil, err
 	}
 
-	return &machineryKeeper{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+	return &machineryKeeper{forfeiter{r}}, nil
 }
 
 // Maintenance returns a connection to the machine that waits in maintenance mode at addr.
 // Callers ask for it only while spec.management.membership is Enabled, and close it when they
 // are done: it is not cached, because the key it pins is that of one conversation.
 func (f *Factory) Maintenance(ctx context.Context, addr netip.Addr) (Maintenance, error) {
-	return newMaintenance(ctx, addr, f)
+	return newMaintenance(ctx, addr, f.callTimeout())
+}
+
+// reader returns what every client for a target is built on: the reads, over the cached
+// connection that has the allowlist of a on it. What a client can do besides reading is the
+// methods its own type adds, and never more than that allowlist lets through.
+func (f *Factory) reader(ctx context.Context, t Target, a access) (machineryReader, error) {
+	c, err := f.client(ctx, t, a)
+	if err != nil {
+		return machineryReader{}, err
+	}
+
+	return machineryReader{client: c, timeout: f.callTimeout()}, nil
 }
 
 func (f *Factory) callTimeout() time.Duration {
@@ -227,10 +238,7 @@ func (f *Factory) client(ctx context.Context, t Target, a access) (*client.Clien
 	c, err := client.New(ctx,
 		client.WithConfigContext(&configContext),
 		client.WithEndpoints(endpoints...),
-		client.WithGRPCDialOptions(
-			grpc.WithChainUnaryInterceptor(a.unaryInterceptor()),
-			grpc.WithChainStreamInterceptor(a.streamInterceptor()),
-		),
+		client.WithGRPCDialOptions(a.dialOptions()...),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create Talos client: %w", err)

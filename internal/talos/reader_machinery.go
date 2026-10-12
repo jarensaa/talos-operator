@@ -55,14 +55,20 @@ type machineryReader struct {
 
 var _ Reader = (*machineryReader)(nil)
 
-func (r *machineryReader) callContext(ctx context.Context, node netip.Addr) (context.Context, context.CancelFunc) {
+// bounded gives a call the reader's timeout, unless the caller set a deadline of its own.
+func (r *machineryReader) bounded(ctx context.Context) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); !ok {
-		ctx, cancel := context.WithTimeout(ctx, r.timeout)
-
-		return client.WithNode(ctx, node.String()), cancel
+		return context.WithTimeout(ctx, r.timeout)
 	}
 
-	return client.WithNode(ctx, node.String()), func() {}
+	return ctx, func() {}
+}
+
+// callContext is the context of one bounded call to node.
+func (r *machineryReader) callContext(ctx context.Context, node netip.Addr) (context.Context, context.CancelFunc) {
+	ctx, cancel := r.bounded(ctx)
+
+	return client.WithNode(ctx, node.String()), cancel
 }
 
 // cosiGet reads a singleton COSI resource from node, mapping missing resources to ErrNotFound.
@@ -82,6 +88,20 @@ func cosiGet[T meta.ResourceWithRD](r *machineryReader, ctx context.Context, nod
 	}
 
 	return res, nil
+}
+
+// cosiList reads every COSI resource of one type from node. what begins the error of a read that
+// failed, and is followed by the node: "links on", "members seen by".
+func cosiList[T meta.ResourceWithRD](r *machineryReader, ctx context.Context, node netip.Addr, what string) (safe.List[T], error) {
+	ctx, cancel := r.callContext(ctx, node)
+	defer cancel()
+
+	list, err := safe.StateListAll[T](ctx, r.client.COSI)
+	if err != nil {
+		return safe.List[T]{}, fmt.Errorf("%s %s: %w", what, node, err)
+	}
+
+	return list, nil
 }
 
 // Version implements Reader.
@@ -184,12 +204,9 @@ func (r *machineryReader) UnattendedInstallStatus(ctx context.Context, node neti
 
 // Services implements Reader.
 func (r *machineryReader) Services(ctx context.Context, node netip.Addr) ([]ServiceStatus, error) {
-	ctx, cancel := r.callContext(ctx, node)
-	defer cancel()
-
-	list, err := safe.StateListAll[*v1alpha1.Service](ctx, r.client.COSI)
+	list, err := cosiList[*v1alpha1.Service](r, ctx, node, "services on")
 	if err != nil {
-		return nil, fmt.Errorf("services on %s: %w", node, err)
+		return nil, err
 	}
 
 	out := make([]ServiceStatus, 0, list.Len())
@@ -288,12 +305,9 @@ func machineConfigBody(res resource.Resource) ([]byte, error) {
 
 // Members implements Reader.
 func (r *machineryReader) Members(ctx context.Context, node netip.Addr) ([]Member, error) {
-	ctx, cancel := r.callContext(ctx, node)
-	defer cancel()
-
-	list, err := safe.StateListAll[*cluster.Member](ctx, r.client.COSI)
+	list, err := cosiList[*cluster.Member](r, ctx, node, "members seen by")
 	if err != nil {
-		return nil, fmt.Errorf("members seen by %s: %w", node, err)
+		return nil, err
 	}
 
 	out := make([]Member, 0, list.Len())
@@ -462,6 +476,25 @@ func parseDryRun(resp *machineapi.ApplyConfigurationResponse) (DryRunResult, err
 	}
 
 	return DryRunResult{NoChanges: strings.HasSuffix(strings.TrimRight(details, "\n"), dryRunNoChanges)}, nil
+}
+
+// forfeiter is the one call that three kinds of client share: a control plane hands off etcd
+// leadership before it reboots, before it leaves, and before its member is defragmented. A client
+// has the method by embedding this. Whether the call leaves is up to the allowlist of the client's
+// connection, and each of the three names it for itself (upgradeMethods, membershipMethods,
+// upkeepMethods).
+type forfeiter struct{ machineryReader }
+
+// ForfeitEtcdLeadership implements Upgrader, Remover and Keeper.
+func (f *forfeiter) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
+	ctx, cancel := f.callContext(ctx, node)
+	defer cancel()
+
+	if _, err := f.client.EtcdForfeitLeadership(ctx, &machineapi.EtcdForfeitLeadershipRequest{}); err != nil {
+		return fmt.Errorf("forfeit etcd leadership on %s: %w", node, err)
+	}
+
+	return nil
 }
 
 // machineryWriter implements ConfigWriter on a connection opened with accessConfig.

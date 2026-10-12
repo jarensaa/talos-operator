@@ -412,7 +412,7 @@ func TestUpgraderPullsKubernetesImagesToWhereTheyRun(t *testing.T) {
 	api, c := serve(t, dial(accessUpgrade)...)
 	api.pull = []*machineapi.ImageServicePullResponse{pulling(), pulled("image")}
 
-	u := &machineryUpgrader{*reader(c)}
+	u := &machineryUpgrader{forfeiter{*reader(c)}}
 	ctx := context.Background()
 
 	// Everything Talos runs from a node's config. kube-proxy is not: see below.

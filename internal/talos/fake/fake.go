@@ -70,10 +70,11 @@ const (
 	MethodLogs           = "Logs"
 )
 
-// Machine types as Talos reports them.
-const (
-	TypeControlPlane = "controlplane"
-	TypeWorker       = "worker"
+// Machine types as Talos reports them: talos.MachineTypeControlPlane and talos.MachineTypeWorker,
+// under the names the tests have for them.
+var (
+	TypeControlPlane = talos.MachineTypeControlPlane
+	TypeWorker       = talos.MachineTypeWorker
 )
 
 // mutatingMethods lists recorded methods that change node state. A dry-run apply is recorded
@@ -1181,10 +1182,9 @@ func (u *upgrader) PullImage(ctx context.Context, node netip.Addr, image string)
 
 // PullKubernetesImage implements talos.Upgrader.
 func (u *upgrader) PullKubernetesImage(ctx context.Context, node netip.Addr, component, image string) error {
-	// Talos runs these from a node's config. kube-proxy is not among them: nothing pulls it here.
-	runs := []string{talos.ComponentAPIServer, talos.ComponentControllerManager, talos.ComponentScheduler, talos.ComponentKubelet}
-	if !slices.Contains(runs, component) {
-		return fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
+	// Only what Talos runs from a node's config. kube-proxy is not among it: nothing pulls it here.
+	if err := talos.RunsKubernetesComponent(component); err != nil {
+		return err
 	}
 
 	_, err := u.image(ctx, MethodKubernetesImagePull, node, image)

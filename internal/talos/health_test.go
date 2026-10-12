@@ -149,7 +149,7 @@ func TestMachineryReadsTheEndOfLogs(t *testing.T) {
 
 func TestKeeperDefragmentsTheMemberItIsAskedFor(t *testing.T) {
 	api, c := serve(t, dial(accessUpkeep)...)
-	keeper := &machineryKeeper{*reader(c)}
+	keeper := &machineryKeeper{forfeiter{*reader(c)}}
 	ctx := context.Background()
 
 	if err := keeper.DefragmentEtcd(ctx, apiNode); err != nil || api.defrags != 1 {

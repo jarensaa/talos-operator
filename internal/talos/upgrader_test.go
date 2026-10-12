@@ -62,7 +62,7 @@ func TestUpgraderSendsWhatAnUpgradeIsMadeOf(t *testing.T) {
 	api.pull = []*machineapi.ImageServicePullResponse{pulling(), pulling(), pulled(installerImage)}
 	api.install = []*machineapi.LifecycleServiceUpgradeResponse{progress("writing the boot slot"), exitCode(0)}
 
-	u := &machineryUpgrader{*reader(c)}
+	u := &machineryUpgrader{forfeiter{*reader(c)}}
 	ctx := context.Background()
 
 	if err := u.PullImage(ctx, apiNode, installerImage); err != nil {
@@ -112,7 +112,7 @@ func TestUpgraderSendsWhatAnUpgradeIsMadeOf(t *testing.T) {
 // just ends has not succeeded either.
 func TestUpgraderTellsAFailedInstallFromOneThatFinished(t *testing.T) {
 	api, c := serve(t, dial(accessUpgrade)...)
-	u := &machineryUpgrader{*reader(c)}
+	u := &machineryUpgrader{forfeiter{*reader(c)}}
 	ctx := context.Background()
 
 	api.install = []*machineapi.LifecycleServiceUpgradeResponse{progress("no space left on device"), exitCode(1)}
@@ -186,7 +186,7 @@ func TestUpgraderLeavesTheCallersDeadlineOnLongCalls(t *testing.T) {
 	api.pull = []*machineapi.ImageServicePullResponse{pulled(installerImage)}
 
 	// The reader's own timeout is for reads. A pull takes as long as a download takes.
-	u := &machineryUpgrader{machineryReader{client: c, timeout: time.Nanosecond}}
+	u := &machineryUpgrader{forfeiter{machineryReader{client: c, timeout: time.Nanosecond}}}
 
 	if err := u.PullImage(context.Background(), apiNode, installerImage); err != nil {
 		t.Fatalf("a pull must not be cut short by the timeout of a read: %v", err)

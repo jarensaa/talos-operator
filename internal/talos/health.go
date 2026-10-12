@@ -24,8 +24,8 @@ import (
 	"io"
 	"net/netip"
 	"slices"
+	"strings"
 
-	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
@@ -69,20 +69,14 @@ type Volume struct {
 	Error string
 }
 
-// VolumeReady is the phase of a volume that is in order.
-const VolumeReady = "ready"
-
 // maxLog bounds what is kept of one log: the end of it, where what went wrong is.
 const maxLog = 128 << 10
 
 // Diagnostics implements Reader.
 func (r *machineryReader) Diagnostics(ctx context.Context, node netip.Addr) ([]Diagnostic, error) {
-	ctx, cancel := r.callContext(ctx, node)
-	defer cancel()
-
-	list, err := safe.StateListAll[*runtime.Diagnostic](ctx, r.client.COSI)
+	list, err := cosiList[*runtime.Diagnostic](r, ctx, node, "diagnostics on")
 	if err != nil {
-		return nil, fmt.Errorf("diagnostics on %s: %w", node, err)
+		return nil, err
 	}
 
 	out := make([]Diagnostic, 0, list.Len())
@@ -90,7 +84,7 @@ func (r *machineryReader) Diagnostics(ctx context.Context, node netip.Addr) ([]D
 		out = append(out, Diagnostic{ID: d.Metadata().ID(), Message: d.TypedSpec().Message})
 	}
 
-	slices.SortFunc(out, func(a, b Diagnostic) int { return cmpString(a.ID, b.ID) })
+	slices.SortFunc(out, func(a, b Diagnostic) int { return strings.Compare(a.ID, b.ID) })
 
 	return out, nil
 }
@@ -108,12 +102,9 @@ func (r *machineryReader) TimeSynced(ctx context.Context, node netip.Addr) (bool
 
 // Links implements Reader.
 func (r *machineryReader) Links(ctx context.Context, node netip.Addr) ([]Link, error) {
-	ctx, cancel := r.callContext(ctx, node)
-	defer cancel()
-
-	list, err := safe.StateListAll[*network.LinkStatus](ctx, r.client.COSI)
+	list, err := cosiList[*network.LinkStatus](r, ctx, node, "links on")
 	if err != nil {
-		return nil, fmt.Errorf("links on %s: %w", node, err)
+		return nil, err
 	}
 
 	names := map[uint32]string{}
@@ -142,19 +133,16 @@ func (r *machineryReader) Links(ctx context.Context, node netip.Addr) ([]Link, e
 		out = append(out, l)
 	}
 
-	slices.SortFunc(out, func(a, b Link) int { return cmpString(a.Name, b.Name) })
+	slices.SortFunc(out, func(a, b Link) int { return strings.Compare(a.Name, b.Name) })
 
 	return out, nil
 }
 
 // Volumes implements Reader.
 func (r *machineryReader) Volumes(ctx context.Context, node netip.Addr) ([]Volume, error) {
-	ctx, cancel := r.callContext(ctx, node)
-	defer cancel()
-
-	list, err := safe.StateListAll[*block.VolumeStatus](ctx, r.client.COSI)
+	list, err := cosiList[*block.VolumeStatus](r, ctx, node, "volumes on")
 	if err != nil {
-		return nil, fmt.Errorf("volumes on %s: %w", node, err)
+		return nil, err
 	}
 
 	out := make([]Volume, 0, list.Len())
@@ -164,7 +152,7 @@ func (r *machineryReader) Volumes(ctx context.Context, node netip.Addr) ([]Volum
 		out = append(out, Volume{Name: volume.Metadata().ID(), Phase: spec.Phase.String(), Error: spec.ErrorMessage})
 	}
 
-	slices.SortFunc(out, func(a, b Volume) int { return cmpString(a.Name, b.Name) })
+	slices.SortFunc(out, func(a, b Volume) int { return strings.Compare(a.Name, b.Name) })
 
 	return out, nil
 }
@@ -237,17 +225,6 @@ func theEnd(stream client.MachineStream, what string, node netip.Addr) ([]byte, 
 	return kept, nil
 }
 
-func cmpString(a, b string) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-
-	return 0
-}
-
 // Keeper is the Talos access of maintenance: Enabled: everything a Reader can do, plus what the
 // upkeep of etcd is made of (docs/scope.md §14.6). It cannot apply config, upgrade, reboot or
 // reset a node, change etcd's members, or disarm an alarm.
@@ -276,22 +253,10 @@ func checkUpkeep(method string, req any) string {
 	return checkReadOnly(method, req)
 }
 
-// machineryKeeper implements Keeper with the machinery client.
-type machineryKeeper struct{ machineryReader }
+// machineryKeeper implements Keeper on a connection opened with accessUpkeep.
+type machineryKeeper struct{ forfeiter }
 
 var _ Keeper = (*machineryKeeper)(nil)
-
-// ForfeitEtcdLeadership implements Keeper.
-func (k *machineryKeeper) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
-	ctx, cancel := k.callContext(ctx, node)
-	defer cancel()
-
-	if _, err := k.client.EtcdForfeitLeadership(ctx, &machineapi.EtcdForfeitLeadershipRequest{}); err != nil {
-		return fmt.Errorf("forfeit etcd leadership on %s: %w", node, err)
-	}
-
-	return nil
-}
 
 // DefragmentEtcd implements Keeper. Talos defragments the member of the node that is asked
 // (v1alpha1_server.go:2172-2195 in Talos v1.14), and answers when etcd is done.

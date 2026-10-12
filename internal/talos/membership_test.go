@@ -127,7 +127,7 @@ func TestCheckMaintenance(t *testing.T) {
 // What the operator really sends when a machine leaves.
 func TestRemoverSendsTheResetOfARemovalAndNothingElse(t *testing.T) {
 	api, c := serve(t, dial(accessMembership)...)
-	remover := &machineryRemover{*reader(c)}
+	remover := &machineryRemover{forfeiter{*reader(c)}}
 	ctx := context.Background()
 
 	if err := remover.Reset(ctx, apiNode); err != nil {

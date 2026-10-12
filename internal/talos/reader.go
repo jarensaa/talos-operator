@@ -54,7 +54,7 @@ type Reader interface {
 	UnattendedInstallStatus(ctx context.Context, node netip.Addr) (InstallStatus, error)
 	// Services returns the state of every Talos service on the node.
 	Services(ctx context.Context, node netip.Addr) ([]ServiceStatus, error)
-	// MachineType returns "controlplane" or "worker".
+	// MachineType returns MachineTypeControlPlane or MachineTypeWorker.
 	MachineType(ctx context.Context, node netip.Addr) (string, error)
 	// MachineConfig returns the node's active machine config and, if one was applied in this boot,
 	// the persistent one, as raw bytes. The resource is sensitive: it needs the os:admin role.
@@ -154,7 +154,7 @@ type VersionInfo struct {
 
 // MachineStatus is the node's position in its boot sequence.
 type MachineStatus struct {
-	// Stage is the Talos machine stage, e.g. "running" or "maintenance".
+	// Stage is the Talos machine stage, e.g. StageRunning or StageMaintenance.
 	Stage string
 	// Ready is true once every readiness condition is met.
 	Ready bool
