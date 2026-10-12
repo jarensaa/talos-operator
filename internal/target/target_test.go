@@ -455,3 +455,36 @@ func TestMembershipClientsNeedMembershipEnabled(t *testing.T) {
 		t.Fatalf("expected a maintenance connection once membership is enabled: %v", err)
 	}
 }
+
+// The client that defragments etcd is handed out only while maintenance is enabled.
+func TestResolveKeeperNeedsMaintenanceEnabled(t *testing.T) {
+	tc := cluster("happy", "talosconfig")
+	r, f := resolver(t, tc, secret("talosconfig", talostest.AdminTalosconfig(t, "10.0.0.11", "10.0.0.12")))
+
+	for _, m := range []talosv1alpha1.Management{
+		{},
+		{Config: talosv1alpha1.ConfigManagementObserve, Maintenance: talosv1alpha1.CapabilityEnabled},
+		{Config: talosv1alpha1.ConfigManagementManage},
+		{Config: talosv1alpha1.ConfigManagementManage, Upgrades: talosv1alpha1.CapabilityEnabled, Membership: talosv1alpha1.CapabilityEnabled},
+	} {
+		tc.Spec.Management = m
+
+		if _, err := r.ResolveKeeper(context.Background(), tc, talos.SelectOptions{}); !errors.Is(err, target.ErrMaintenanceDisabled) {
+			t.Fatalf("management %+v: expected ErrMaintenanceDisabled, got %v", m, err)
+		}
+	}
+
+	if len(f.KeeperTargets()) != 0 {
+		t.Fatal("no client that can defragment may even be built while maintenance is off")
+	}
+
+	tc.Spec.Management = talosv1alpha1.Management{Config: talosv1alpha1.ConfigManagementManage, Maintenance: talosv1alpha1.CapabilityEnabled}
+
+	if keeper, err := r.ResolveKeeper(context.Background(), tc, talos.SelectOptions{}); err != nil || keeper == nil {
+		t.Fatalf("expected a keeper once maintenance is enabled: %v", err)
+	}
+
+	if len(f.Targets())+len(f.WriterTargets())+len(f.UpgraderTargets())+len(f.RemoverTargets()) != 0 {
+		t.Fatal("a keeper is its own client, not anyone else's")
+	}
+}

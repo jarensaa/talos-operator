@@ -207,6 +207,36 @@ spec:
                 - message: secretRef is required for source Secret and not allowed
                     otherwise
                   rule: (has(self.source) && self.source == 'Secret') == has(self.secretRef)
+              maintenance:
+                description: Maintenance tunes the upkeep that management.maintenance
+                  enables.
+                properties:
+                  etcd:
+                    description: Etcd is the upkeep of etcd.
+                    properties:
+                      freePercent:
+                        description: |-
+                          FreePercent is how much of a member's database file must be free space before etcd is
+                          defragmented. Defaults to 50.
+                        format: int32
+                        maximum: 99
+                        minimum: 1
+                        type: integer
+                      interval:
+                        description: Interval is the least time between two defragmentations.
+                          Defaults to 24h.
+                        type: string
+                      minimumSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          MinimumSize is the size a member's database file must have before it is worth
+                          defragmenting. Defaults to 100Mi.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    type: object
+                type: object
               management:
                 default: {}
                 description: Management enables operator capabilities. Defaults to
@@ -219,6 +249,15 @@ spec:
                     enum:
                     - Observe
                     - Manage
+                    type: string
+                  maintenance:
+                    default: Disabled
+                    description: |-
+                      Maintenance enables the upkeep the operator does by itself: defragmenting etcd before a
+                      member's database reaches its quota (docs/scope.md §14.6).
+                    enum:
+                    - Disabled
+                    - Enabled
                     type: string
                   membership:
                     default: Disabled
@@ -243,6 +282,29 @@ spec:
                 - message: 'membership can be Enabled only with config: Manage'
                   rule: '!has(self.membership) || self.membership != ''Enabled'' ||
                     (has(self.config) && self.config == ''Manage'')'
+                - message: 'maintenance can be Enabled only with config: Manage'
+                  rule: '!has(self.maintenance) || self.maintenance != ''Enabled''
+                    || (has(self.config) && self.config == ''Manage'')'
+              observability:
+                default: {}
+                description: Observability is what the cluster exposes for a Prometheus
+                  to read.
+                properties:
+                  controlPlaneMetrics:
+                    default: Disabled
+                    description: |-
+                      ControlPlaneMetrics makes every control plane serve the metrics of the controller manager
+                      and the scheduler where a Prometheus in the cluster can reach them: Talos binds both to
+                      localhost, and with this they listen on every interface. It is a config change, rolled out
+                      like any other, and a layer of the spec that sets the same argument wins over it.
+
+                      etcd's metrics are not part of it: etcd takes a changed argument only when it is
+                      restarted, which a rollout does not do (docs/scope.md §14.2).
+                    enum:
+                    - Disabled
+                    - Enabled
+                    type: string
+                type: object
               paused:
                 description: Paused stops all mutating actions immediately.
                 type: boolean
@@ -640,6 +702,39 @@ spec:
                 required:
                 - hash
                 type: object
+              certificates:
+                description: |-
+                  Certificates lists the certificates the cluster depends on with the end of their validity:
+                  the operator's own client certificate, and the cluster's certificate authorities.
+                items:
+                  description: Certificate is a certificate the cluster depends on,
+                    and when it stops being valid.
+                  properties:
+                    expiresAt:
+                      format: date-time
+                      type: string
+                    issuedAt:
+                      description: |-
+                        IssuedAt and ExpiresAt are the start and the end of the certificate's validity. How much of
+                        it is left says more than a date does: Talos issues the operator's certificate for hours and
+                        renews it, an authority lasts ten years.
+                      format: date-time
+                      type: string
+                    name:
+                      description: |-
+                        Name says which: operator for the client certificate the operator reaches the Talos API
+                        with, and os, kubernetes, kubernetes-aggregator and etcd for the cluster's certificate
+                        authorities.
+                      type: string
+                  required:
+                  - expiresAt
+                  - issuedAt
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               conditions:
                 description: Conditions represent the latest observations of the cluster.
                 items:
@@ -737,6 +832,7 @@ spec:
                       - KubernetesUpgrade
                       - AddMachine
                       - RemoveMachine
+                      - EtcdDefragment
                       type: string
                   required:
                   - finishedAt
@@ -747,6 +843,15 @@ spec:
                   type: object
                 maxItems: 10
                 type: array
+              maintenance:
+                description: Maintenance records the upkeep the operator did.
+                properties:
+                  etcdDefragmentedAt:
+                    description: EtcdDefragmentedAt is when etcd was last defragmented
+                      by the operator.
+                    format: date-time
+                    type: string
+                type: object
               membership:
                 description: Membership records what a human decided about machines
                   that were to be added or removed.
@@ -922,6 +1027,12 @@ spec:
                         description: At is when the failure was recorded.
                         format: date-time
                         type: string
+                      bundle:
+                        description: |-
+                          Bundle names the Secret that holds what was collected from the machine when the operation
+                          failed: the state of its services, and the last of their logs and of the kernel's. It is
+                          empty until that was tried, and says so when nothing could be collected.
+                        type: string
                       hook:
                         description: Hook is the stage of the hook that failed, if
                           a hook did.
@@ -1036,6 +1147,7 @@ spec:
                     - KubernetesUpgrade
                     - AddMachine
                     - RemoveMachine
+                    - EtcdDefragment
                     type: string
                 required:
                 - id

@@ -60,6 +60,10 @@ metadata:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 data:
+  # What the operator does: operations, drift, versions, machines.
   talos-operator.json: |-
     {{- .Files.Get "files/dashboard.json" | nindent 4 }}
+  # What Talos says about the nodes: services, clocks, links, volumes, etcd, certificates.
+  talos-nodes.json: |-
+    {{- .Files.Get "files/dashboard-nodes.json" | nindent 4 }}
 {{- end }}

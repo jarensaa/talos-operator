@@ -64,6 +64,10 @@ const (
 	MethodMaintenanceProbe = "MaintenanceProbe"
 	MethodMaintenanceFits  = "MaintenanceFits"
 	MethodMaintenanceApply = "MaintenanceApply"
+	// What the upkeep of etcd sends, and what is read of a node's health and logs.
+	MethodEtcdDefragment = "EtcdDefragment"
+	MethodNodeHealth     = "NodeHealth"
+	MethodLogs           = "Logs"
 )
 
 // Machine types as Talos reports them.
@@ -77,6 +81,7 @@ const (
 var mutatingMethods = map[string]bool{
 	MethodApplyConfiguration: true, MethodImagePull: true, MethodInstall: true, MethodEtcdForfeitLeadership: true, MethodReboot: true,
 	MethodKubernetesImagePull: true, MethodReset: true, MethodEtcdRemoveMember: true, MethodMaintenanceApply: true,
+	MethodEtcdDefragment: true,
 }
 
 func (n *Node) unhealthy() bool { return n.UnhealthyWhen != nil && n.UnhealthyWhen(n.Config.Active) }
@@ -123,6 +128,17 @@ type Node struct {
 	// EtcdMemberID identifies the node's etcd member; 0 means none (workers).
 	EtcdMemberID uint64
 	EtcdLearner  bool
+	// What Talos says about the node besides whether it is ready. A node with none of it is one
+	// with nothing to say: no warnings, a clock in sync, no links or volumes listed.
+	Diagnostics  []talos.Diagnostic
+	TimeUnsynced bool
+	Links        []talos.Link
+	Volumes      []talos.Volume
+	// EtcdDBSize and EtcdDBInUse are the size of the member's database file and what of it
+	// holds data. Defragmenting makes the first the second.
+	EtcdDBSize, EtcdDBInUse int64
+	// Logs are the node's logs, by service; "dmesg" is the kernel's.
+	Logs map[string]string
 	// Maintenance is true for a machine that has no config and waits for one: it answers nobody
 	// who comes with the cluster's credentials, is no member of anything, and takes a config
 	// from whoever hands it one over a maintenance connection. Everything else the Node says is
@@ -806,7 +822,94 @@ func (r *reader) EtcdStatus(ctx context.Context, node netip.Addr) (talos.EtcdSta
 	r.s.mu.Lock()
 	defer r.s.mu.Unlock()
 
-	return talos.EtcdStatus{MemberID: n.EtcdMemberID, Leader: r.s.etcdLeader, IsLearner: n.EtcdLearner}, nil
+	return talos.EtcdStatus{
+		MemberID: n.EtcdMemberID, Leader: r.s.etcdLeader, IsLearner: n.EtcdLearner, DBSize: n.EtcdDBSize, DBSizeInUse: n.EtcdDBInUse,
+	}, nil
+}
+
+// Diagnostics implements talos.Reader.
+func (r *reader) Diagnostics(ctx context.Context, node netip.Addr) ([]talos.Diagnostic, error) {
+	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return slices.Clone(n.Diagnostics), nil
+}
+
+// TimeSynced implements talos.Reader.
+func (r *reader) TimeSynced(ctx context.Context, node netip.Addr) (bool, error) {
+	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	if err != nil {
+		return false, err
+	}
+
+	return !n.TimeUnsynced, nil
+}
+
+// Links implements talos.Reader.
+func (r *reader) Links(ctx context.Context, node netip.Addr) ([]talos.Link, error) {
+	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return slices.Clone(n.Links), nil
+}
+
+// Volumes implements talos.Reader.
+func (r *reader) Volumes(ctx context.Context, node netip.Addr) ([]talos.Volume, error) {
+	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return slices.Clone(n.Volumes), nil
+}
+
+// Logs implements talos.Reader.
+func (r *reader) Logs(ctx context.Context, node netip.Addr, service string, _ int32) ([]byte, error) {
+	n, err := r.s.record(ctx, MethodLogs, node)
+	if err != nil {
+		return nil, err
+	}
+
+	return []byte(n.Logs[service]), nil
+}
+
+// Dmesg implements talos.Reader.
+func (r *reader) Dmesg(ctx context.Context, node netip.Addr) ([]byte, error) {
+	return r.Logs(ctx, node, "dmesg", 0)
+}
+
+// Keeper returns a talos.Keeper backed by the scenario.
+func (s *Scenario) Keeper() talos.Keeper { return &keeper{reader{s: s}} }
+
+// keeper is the Keeper of a scenario.
+type keeper struct{ reader }
+
+// ForfeitEtcdLeadership implements talos.Keeper.
+func (k *keeper) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
+	return (&upgrader{k.reader}).ForfeitEtcdLeadership(ctx, node)
+}
+
+// DefragmentEtcd implements talos.Keeper: the member's file shrinks to what it holds.
+func (k *keeper) DefragmentEtcd(ctx context.Context, node netip.Addr) error {
+	n, err := k.s.record(ctx, MethodEtcdDefragment, node)
+	if err != nil {
+		return err
+	}
+
+	if n.EtcdMemberID == 0 {
+		return fmt.Errorf("%s on %s: %w", MethodEtcdDefragment, node, status.Error(codes.FailedPrecondition, "fake: not a member of etcd"))
+	}
+
+	k.s.mu.Lock()
+	defer k.s.mu.Unlock()
+
+	k.s.nodes[node].EtcdDBSize = k.s.nodes[node].EtcdDBInUse
+
+	return nil
 }
 
 func (r *reader) HealthCheck(ctx context.Context, node netip.Addr, _ talos.ClusterInfo, _ time.Duration) (talos.HealthResult, error) {
@@ -852,6 +955,25 @@ type Factory struct {
 	writerTargets   []talos.Target
 	upgraderTargets []talos.Target
 	removerTargets  []talos.Target
+	keeperTargets   []talos.Target
+}
+
+// Keeper implements target.ClientFactory.
+func (f *Factory) Keeper(_ context.Context, t talos.Target) (talos.Keeper, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.keeperTargets = append(f.keeperTargets, t)
+
+	return f.Scenario.Keeper(), nil
+}
+
+// KeeperTargets returns the targets a Keeper was requested for.
+func (f *Factory) KeeperTargets() []talos.Target {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return slices.Clone(f.keeperTargets)
 }
 
 // Remover implements target.ClientFactory.

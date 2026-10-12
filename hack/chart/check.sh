@@ -124,8 +124,10 @@ diff <(yq -o json -I0 'sort_keys(..)' "$chart/files/alerts.yaml") \
 [ "$(yq -o json -I0 'select(.kind == "ServiceMonitor") | .spec.selector.matchLabels' <<<"$monitored")" = \
   "$(yq -o json -I0 'select(.kind == "Service") | .spec.selector' <<<"$monitored")" ] ||
   fail "the ServiceMonitor does not select the metrics Service"
-yq -N 'select(.metadata.name == "talos-operator-dashboard") | .data["talos-operator.json"]' <<<"$monitored" |
-  yq -p json -e '.panels | length > 0' >/dev/null || fail "the dashboard is not JSON with panels"
+for dashboard in talos-operator talos-nodes; do
+  yq -N 'select(.metadata.name == "talos-operator-dashboard") | .data["'"$dashboard"'.json"]' <<<"$monitored" |
+    yq -p json -e '.panels | length > 0 and .uid == "'"$dashboard"'"' >/dev/null || fail "the dashboard $dashboard is not JSON with panels"
+done
 [ "$(yq -N 'select(.metadata.name == "talos-operator-dashboard") | .metadata.labels.grafana_dashboard' <<<"$monitored")" = "1" ] ||
   fail "the dashboard must carry the label Grafana's sidecar looks for"
 

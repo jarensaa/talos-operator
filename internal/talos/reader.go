@@ -78,6 +78,20 @@ type Reader interface {
 	// Kubernetes from to to removes. Empty means nothing stands in the way; an error, that it
 	// could not be told.
 	KubernetesUpgradeChecks(ctx context.Context, from, to string, nodes ClusterInfo) ([]string, error)
+
+	// Diagnostics returns the warnings Talos raises about node's configuration right now.
+	Diagnostics(ctx context.Context, node netip.Addr) ([]Diagnostic, error)
+	// TimeSynced reports whether node's clock is synchronised.
+	TimeSynced(ctx context.Context, node netip.Addr) (bool, error)
+	// Links returns node's physical network links.
+	Links(ctx context.Context, node netip.Addr) ([]Link, error)
+	// Volumes returns Talos's volumes on node.
+	Volumes(ctx context.Context, node netip.Addr) ([]Volume, error)
+	// Logs returns the end of the log of one of node's Talos services: its last lines, and of
+	// those the last 128 KiB.
+	Logs(ctx context.Context, node netip.Addr, service string, lines int32) ([]byte, error)
+	// Dmesg returns the end of node's kernel log.
+	Dmesg(ctx context.Context, node netip.Addr) ([]byte, error)
 }
 
 // Upgrader is the Talos access of upgrades: Enabled: everything a Reader can do, plus the calls an

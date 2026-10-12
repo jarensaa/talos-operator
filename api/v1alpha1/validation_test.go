@@ -30,6 +30,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -137,12 +138,36 @@ func TestMinimalObserveClusterIsDefaulted(t *testing.T) {
 	}
 
 	want := talosv1alpha1.Management{
-		Config:     talosv1alpha1.ConfigManagementObserve,
-		Upgrades:   talosv1alpha1.CapabilityDisabled,
-		Membership: talosv1alpha1.CapabilityDisabled,
+		Config:      talosv1alpha1.ConfigManagementObserve,
+		Upgrades:    talosv1alpha1.CapabilityDisabled,
+		Membership:  talosv1alpha1.CapabilityDisabled,
+		Maintenance: talosv1alpha1.CapabilityDisabled,
 	}
 	if got.Spec.Management != want {
 		t.Fatalf("management defaults: got %+v, want %+v", got.Spec.Management, want)
+	}
+
+	// Nothing about a control plane's config changes unless it is asked for.
+	if got.Spec.Observability.ControlPlaneMetrics != talosv1alpha1.CapabilityDisabled {
+		t.Fatalf("observability defaults: got %+v", got.Spec.Observability)
+	}
+}
+
+func TestEtcdMaintenanceIsBounded(t *testing.T) {
+	for name, percent := range map[string]int32{"none": 0, "all": 100} {
+		tc := minimalCluster("defrag-" + name)
+		tc.Spec.Maintenance.Etcd.FreePercent = &percent
+
+		requireRejected(t, k8sClient.Create(context.Background(), tc), "spec.maintenance.etcd.freePercent")
+	}
+
+	tc := minimalCluster("defrag-tuned")
+	tc.Spec.Maintenance.Etcd = talosv1alpha1.EtcdMaintenance{
+		FreePercent: new(int32(30)), MinimumSize: new(resource.MustParse("200Mi")), Interval: &metav1.Duration{Duration: 12 * time.Hour},
+	}
+
+	if err := k8sClient.Create(context.Background(), tc); err != nil {
+		t.Fatalf("tuned etcd maintenance: %v", err)
 	}
 }
 
@@ -483,6 +508,7 @@ func TestCapabilitiesNeedManagedConfig(t *testing.T) {
 	for _, set := range []func(*talosv1alpha1.Management){
 		func(m *talosv1alpha1.Management) { m.Upgrades = talosv1alpha1.CapabilityEnabled },
 		func(m *talosv1alpha1.Management) { m.Membership = talosv1alpha1.CapabilityEnabled },
+		func(m *talosv1alpha1.Management) { m.Maintenance = talosv1alpha1.CapabilityEnabled },
 	} {
 		tc := minimalCluster("capability")
 		set(&tc.Spec.Management)

@@ -45,6 +45,11 @@ const (
 // epoch is when everything in a fixture happened: the moment a test of the alert rules starts.
 var epoch = metav1.NewTime(time.Unix(0, 0))
 
+const year = 365 * 24 * time.Hour
+
+// after is a moment that long after the epoch, or before it.
+func after(d time.Duration) metav1.Time { return metav1.NewTime(epoch.Add(d)) }
+
 func condition(kind string, status metav1.ConditionStatus, reason string) metav1.Condition {
 	return metav1.Condition{Type: kind, Status: status, Reason: reason, Message: "a message that is not exported", LastTransitionTime: epoch}
 }
@@ -71,6 +76,14 @@ func healthy() *fixture {
 					condition(talosv1alpha1.ConditionHealthy, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded),
 					condition(talosv1alpha1.ConditionConfigInSync, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded),
 					condition(talosv1alpha1.ConditionVersionsReachable, metav1.ConditionTrue, talosv1alpha1.ReasonUpToDate),
+					condition(talosv1alpha1.ConditionEtcdMaintained, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded),
+				},
+				// Talos issues the operator's certificate for six hours; an authority lasts ten years.
+				Certificates: []talosv1alpha1.Certificate{
+					{Name: "etcd", IssuedAt: epoch, ExpiresAt: after(10 * year)},
+					{Name: "kubernetes", IssuedAt: epoch, ExpiresAt: after(10 * year)},
+					{Name: "operator", IssuedAt: epoch, ExpiresAt: after(6 * time.Hour)},
+					{Name: "os", IssuedAt: epoch, ExpiresAt: after(10 * year)},
 				},
 				Observed: &talosv1alpha1.ObservedState{
 					EtcdMembers: []talosv1alpha1.EtcdMember{
@@ -106,7 +119,17 @@ func healthy() *fixture {
 				JoinedAt: &epoch,
 				Talos:    &talosv1alpha1.TalosState{Version: "v1.14.2", SchematicID: strings.Repeat("a", 64), Ready: true},
 				Kubelet:  &talosv1alpha1.KubeletState{Version: "1.37.1"},
-				Etcd:     &talosv1alpha1.EtcdState{MemberID: fmt.Sprintf("%c%d", 'a'+i, i+1)},
+				Etcd: &talosv1alpha1.EtcdState{
+					MemberID: fmt.Sprintf("%c%d", 'a'+i, i+1), Leader: i == 0, DBSize: 64 << 20, DBSizeInUse: 48 << 20,
+				},
+				Health: &talosv1alpha1.NodeHealth{
+					Services: []talosv1alpha1.ServiceHealth{
+						{Name: "apid", Running: true, Healthy: true}, {Name: "kubelet", Running: true, Healthy: true},
+					},
+					TimeSynced: new(true),
+					Links:      []talosv1alpha1.LinkHealth{{Name: "eth0", Up: true, SpeedMbps: 1000}},
+					Volumes:    []talosv1alpha1.VolumeHealth{{Name: "EPHEMERAL", Phase: "ready"}, {Name: "STATE", Phase: "ready"}},
+				},
 			},
 		}
 
@@ -315,6 +338,14 @@ func TestCollectorExportsWhatStatusSays(t *testing.T) {
 		of("talos_operator_machine_etcd_member", "machine", "node-c", "role", "learner"):                                                  1,
 		of("talos_operator_machine_config_change_info", "machine", "node-d", "class", "LiveSafe"):                                         1,
 		of("talos_operator_machine_condition", "machine", "node-a", "condition", "NodeObserved", "status", "True", "reason", "Succeeded"): 1,
+
+		of("talos_operator_cluster_certificate_issued_timestamp_seconds", "certificate", "operator"): 0,
+		of("talos_operator_cluster_certificate_expiry_timestamp_seconds", "certificate", "operator"): 6 * 3600,
+		of("talos_operator_cluster_certificate_expiry_timestamp_seconds", "certificate", "etcd"):     10 * 365 * 24 * 3600,
+		of("talos_operator_machine_etcd_leader", "machine", "node-a"):                                1,
+		of("talos_operator_machine_etcd_leader", "machine", "node-b"):                                0,
+		of("talos_operator_machine_etcd_db_size_bytes", "machine", "node-a"):                         64 << 20,
+		of("talos_operator_machine_etcd_db_size_in_use_bytes", "machine", "node-a"):                  48 << 20,
 	} {
 		if value, ok := got[series]; !ok || value != want {
 			t.Errorf("%s: got %v (there: %t), want %v", series, value, ok, want)
@@ -323,13 +354,93 @@ func TestCollectorExportsWhatStatusSays(t *testing.T) {
 
 	for series := range got {
 		// A worker is no member of etcd, and nothing says so either way. A message is prose.
-		if strings.HasPrefix(series, `talos_operator_machine_etcd_member{machine="node-d"`) || strings.Contains(series, "message") {
+		if strings.HasPrefix(series, `talos_operator_machine_etcd_`) && strings.Contains(series, `machine="node-d"`) ||
+			strings.Contains(series, "message") {
 			t.Errorf("exported: %s", series)
+		}
+
+		// Nothing was defragmented, and nothing says when.
+		if strings.HasPrefix(series, "talos_operator_cluster_etcd_defragmented") {
+			t.Errorf("exported without a defragmentation: %s", series)
 		}
 
 		// Nothing is in flight, so nothing is said about an operation.
 		if strings.HasPrefix(series, "talos_operator_operation_") {
 			t.Errorf("exported without an operation: %s", series)
+		}
+	}
+}
+
+// What Talos says about a node is exported as status has it, and not at all for a node that
+// was not read: a series that stays where it was would say the node is fine.
+func TestCollectorExportsWhatTalosSaysAboutANode(t *testing.T) {
+	f := healthy()
+
+	a := f.machine("node-a")
+	a.Status.Health = &talosv1alpha1.NodeHealth{
+		Services: []talosv1alpha1.ServiceHealth{
+			{Name: "apid", Running: true, Healthy: true},
+			{Name: "etcd", Running: true},
+			{Name: "kubelet"},
+		},
+		Diagnostics: []talosv1alpha1.Diagnostic{{ID: "address-overlap", Message: "a message that is not exported"}},
+		TimeSynced:  new(false),
+		Links: []talosv1alpha1.LinkHealth{
+			{Name: "eth0", Up: true, SpeedMbps: 10000, Bond: "bond0"},
+			{Name: "eth1", Bond: "bond0"},
+			{Name: "eth2"},
+		},
+		Volumes: []talosv1alpha1.VolumeHealth{
+			{Name: "STATE", Phase: "ready"},
+			{Name: "EPHEMERAL", Phase: "failed", Error: "an error that is not exported"},
+		},
+	}
+
+	// Not read: what it said before is gone from status, and so from the metrics.
+	b := f.machine("node-b")
+	b.Status.Health = nil
+	b.Status.Etcd.Leader, b.Status.Etcd.DBSize, b.Status.Etcd.DBSizeInUse = false, 0, 0
+
+	f.cluster.Status.Maintenance = &talosv1alpha1.MaintenanceStatus{EtcdDefragmentedAt: new(after(time.Hour))}
+
+	got := collect(t, f.objects()...)
+
+	for series, want := range map[string]float64{
+		of("talos_operator_machine_service_healthy", "machine", "node-a", "service", "apid"):                     1,
+		of("talos_operator_machine_service_healthy", "machine", "node-a", "service", "etcd"):                     0,
+		of("talos_operator_machine_service_healthy", "machine", "node-a", "service", "kubelet"):                  0,
+		of("talos_operator_machine_diagnostic_info", "machine", "node-a", "id", "address-overlap"):               1,
+		of("talos_operator_machine_time_synced", "machine", "node-a"):                                            0,
+		of("talos_operator_machine_time_synced", "machine", "node-c"):                                            1,
+		of("talos_operator_machine_link_up", "machine", "node-a", "link", "eth0", "bond", "bond0"):               1,
+		of("talos_operator_machine_link_up", "machine", "node-a", "link", "eth1", "bond", "bond0"):               0,
+		of("talos_operator_machine_link_up", "machine", "node-a", "link", "eth2"):                                0,
+		of("talos_operator_machine_link_speed_mbps", "machine", "node-a", "link", "eth0"):                        10000,
+		of("talos_operator_machine_volume_ready", "machine", "node-a", "volume", "STATE", "phase", "ready"):      1,
+		of("talos_operator_machine_volume_ready", "machine", "node-a", "volume", "EPHEMERAL", "phase", "failed"): 0,
+		of("talos_operator_cluster_etcd_defragmented_timestamp_seconds"):                                         3600,
+		// It is still a member of etcd: that is not a fact of the moment.
+		of("talos_operator_machine_etcd_member", "machine", "node-b", "role", "voter"): 1,
+	} {
+		if value, ok := got[series]; !ok || value != want {
+			t.Errorf("%s: got %v (there: %t), want %v", series, value, ok, want)
+		}
+	}
+
+	for series := range got {
+		for _, name := range []string{
+			"machine_service_healthy", "machine_diagnostic_info", "machine_time_synced", "machine_link_up", "machine_volume_ready",
+			"machine_etcd_leader", "machine_etcd_db_size",
+		} {
+			if strings.HasPrefix(series, "talos_operator_"+name) && strings.Contains(series, `machine="node-b"`) {
+				t.Errorf("exported for a node that was not read: %s", series)
+			}
+		}
+
+		// A link without a speed has none to export, and what Talos says in prose stays in status.
+		if strings.HasPrefix(series, "talos_operator_machine_link_speed_mbps") && strings.Contains(series, `link="eth1"`) ||
+			strings.Contains(series, "not exported") {
+			t.Errorf("exported: %s", series)
 		}
 	}
 }

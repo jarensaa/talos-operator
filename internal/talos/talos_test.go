@@ -49,6 +49,8 @@ var readerMethods = []string{
 	"BootID", "DryRunApply", "EtcdMembers", "EtcdStatus", "HealthCheck", "ImageFactorySchematic", "KubernetesUpgradeChecks", "MachineConfig",
 	"MachineStatus", "MachineType", "Members", "Nodename", "Services", "SystemInformation",
 	"UnattendedInstallStatus", "Version",
+	// What Talos and etcd say about themselves, and the end of a node's logs: all read.
+	"Diagnostics", "Dmesg", "Links", "Logs", "TimeSynced", "Volumes",
 }
 
 func TestReaderMethodSetIsReviewed(t *testing.T) {

@@ -36,6 +36,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	"github.com/cosi-project/runtime/pkg/state/protobuf/server"
 	clusterapi "github.com/siderolabs/talos/pkg/machinery/api/cluster"
+	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
@@ -104,6 +105,39 @@ type testAPI struct {
 	resets    []*machineapi.ResetRequest
 	removals  []uint64
 	removeErr error
+
+	// What the upkeep sends, and what a node's logs hold.
+	defrags int
+	logs    map[string][]string
+}
+
+func (a *testAPI) EtcdDefragment(context.Context, *emptypb.Empty) (*machineapi.EtcdDefragmentResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.defrags++
+
+	return &machineapi.EtcdDefragmentResponse{}, nil
+}
+
+func (a *testAPI) Logs(req *machineapi.LogsRequest, stream grpc.ServerStreamingServer[common.Data]) error {
+	for _, chunk := range a.logs[req.GetId()] {
+		if err := stream.Send(&common.Data{Bytes: []byte(chunk)}); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (a *testAPI) Dmesg(_ *machineapi.DmesgRequest, stream grpc.ServerStreamingServer[common.Data]) error {
+	for _, chunk := range a.logs["dmesg"] {
+		if err := stream.Send(&common.Data{Bytes: []byte(chunk)}); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (a *testAPI) Reset(_ context.Context, req *machineapi.ResetRequest) (*machineapi.ResetResponse, error) {

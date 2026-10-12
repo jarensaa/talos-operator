@@ -159,6 +159,9 @@ func RenderInput(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.Talos
 		in.DNSDomain = opts.DNSDomain
 	}
 
+	// What the spec switches on becomes config of the machine before any layer of the user's.
+	in.ControlPlaneMetrics = spec.Observability.ControlPlaneMetrics == talosv1alpha1.CapabilityEnabled
+
 	return in, nil
 }
 

@@ -161,6 +161,92 @@ type EtcdState struct {
 	MemberID string `json:"memberID,omitempty"`
 	// +optional
 	IsLearner bool `json:"isLearner,omitempty"`
+	// Leader is true when the member led etcd when it was last read.
+	// +optional
+	Leader bool `json:"leader,omitempty"`
+	// DBSize is the size of the member's database file in bytes, and DBSizeInUse how much of it
+	// holds data. The difference is what a defragmentation gives back. Zero unless read in the
+	// last pass.
+	// +optional
+	DBSize int64 `json:"dbSize,omitempty"`
+	// +optional
+	DBSizeInUse int64 `json:"dbSizeInUse,omitempty"`
+}
+
+// NodeHealth is what Talos itself says about a node besides whether it is ready. All of it
+// describes a moment: it is there only when it was read in the last pass.
+type NodeHealth struct {
+	// Services are the Talos services of the node.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Services []ServiceHealth `json:"services,omitempty"`
+	// Diagnostics are the warnings Talos raises about the node's own configuration.
+	// +listType=map
+	// +listMapKey=id
+	// +optional
+	Diagnostics []Diagnostic `json:"diagnostics,omitempty"`
+	// TimeSynced is whether the node's clock is synchronised. A clock that drifts breaks etcd
+	// and every certificate check.
+	// +optional
+	TimeSynced *bool `json:"timeSynced,omitempty"`
+	// Links are the node's physical network links.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Links []LinkHealth `json:"links,omitempty"`
+	// Volumes are Talos's own volumes on the node, such as STATE and EPHEMERAL.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Volumes []VolumeHealth `json:"volumes,omitempty"`
+}
+
+// ServiceHealth is the state of one Talos service.
+type ServiceHealth struct {
+	Name string `json:"name"`
+	// Running is whether the service runs, and Healthy whether its health check passes. A
+	// service without a health check counts as healthy while it runs.
+	// +optional
+	Running bool `json:"running,omitempty"`
+	// +optional
+	Healthy bool `json:"healthy,omitempty"`
+}
+
+// Diagnostic is a warning Talos raises about a node.
+type Diagnostic struct {
+	// ID names the warning, e.g. address-overlap.
+	ID string `json:"id"`
+	// Message is what Talos says about it.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
+// LinkHealth is the state of one physical network link.
+type LinkHealth struct {
+	Name string `json:"name"`
+	// Up is whether the link is operational.
+	// +optional
+	Up bool `json:"up,omitempty"`
+	// SpeedMbps is the link's speed in megabits per second, if it reports one.
+	// +optional
+	SpeedMbps int64 `json:"speedMbps,omitempty"`
+	// Bond names the bond the link is a member of, if it is one.
+	// +optional
+	Bond string `json:"bond,omitempty"`
+}
+
+// VolumeHealth is the state of one of Talos's volumes.
+type VolumeHealth struct {
+	Name string `json:"name"`
+	// Phase is the volume's phase as Talos reports it; ready is the one that is fine.
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// Error is what Talos says went wrong with it, if anything.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Error string `json:"error,omitempty"`
 }
 
 // TalosMachineStatus defines the observed state of TalosMachine.
@@ -183,6 +269,9 @@ type TalosMachineStatus struct {
 	Config *ConfigState `json:"config,omitempty"`
 	// +optional
 	Etcd *EtcdState `json:"etcd,omitempty"`
+	// Health is what Talos says about the node: its services, its clock, its links and volumes.
+	// +optional
+	Health *NodeHealth `json:"health,omitempty"`
 	// JoinedAt is when the machine was first found to be a member of the cluster: its node
 	// answered with the cluster's credentials and carried the pinned identity. Until then it is
 	// a machine that is to be added, and no rollout or upgrade waits for it. It is never unset.

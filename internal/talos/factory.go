@@ -130,6 +130,18 @@ func (f *Factory) Remover(ctx context.Context, t Target) (Remover, error) {
 	return &machineryRemover{machineryReader{client: c, timeout: f.callTimeout()}}, nil
 }
 
+// Keeper returns a client that can also defragment etcd. Callers hand it out only while
+// spec.management.maintenance is Enabled (docs/scope.md §8.1, invariant 6). Its connection is
+// separate from the others and can do nothing else to a node.
+func (f *Factory) Keeper(ctx context.Context, t Target) (Keeper, error) {
+	c, err := f.client(ctx, t, accessUpkeep)
+	if err != nil {
+		return nil, err
+	}
+
+	return &machineryKeeper{machineryReader{client: c, timeout: f.callTimeout()}}, nil
+}
+
 // Maintenance returns a connection to the machine that waits in maintenance mode at addr.
 // Callers ask for it only while spec.management.membership is Enabled, and close it when they
 // are done: it is not cached, because the key it pins is that of one conversation.

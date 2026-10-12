@@ -55,6 +55,7 @@ type ClientFactory interface {
 	ConfigWriter(ctx context.Context, t talos.Target) (talos.ConfigWriter, error)
 	Upgrader(ctx context.Context, t talos.Target) (talos.Upgrader, error)
 	Remover(ctx context.Context, t talos.Target) (talos.Remover, error)
+	Keeper(ctx context.Context, t talos.Target) (talos.Keeper, error)
 	Maintenance(ctx context.Context, addr netip.Addr) (talos.Maintenance, error)
 }
 
@@ -179,6 +180,27 @@ func (r *Resolver) ResolveMaintenance(ctx context.Context, tc *talosv1alpha1.Tal
 	}
 
 	return r.Factory.Maintenance(ctx, addr)
+}
+
+// ErrMaintenanceDisabled is returned for the client that keeps etcd while maintenance is not enabled.
+var ErrMaintenanceDisabled = errors.New("etcd is only defragmented while spec.management.maintenance is Enabled")
+
+// ResolveKeeper returns a client that can defragment tc's etcd. It refuses unless
+// spec.management.maintenance is Enabled and config is Manage, so nothing else can obtain one
+// (docs/scope.md §8.1, invariant 6).
+func (r *Resolver) ResolveKeeper(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions,
+) (talos.Keeper, error) {
+	if tc.Spec.Management.Config != talosv1alpha1.ConfigManagementManage ||
+		tc.Spec.Management.Maintenance != talosv1alpha1.CapabilityEnabled {
+		return nil, ErrMaintenanceDisabled
+	}
+
+	c, endpoints, err := r.identity(ctx, tc, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.Factory.Keeper(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
 }
 
 // identity loads tc's credentials and selects its endpoints.

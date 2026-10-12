@@ -474,15 +474,31 @@ func (r *TalosMachineReconciler) observeNode(ctx context.Context, tgt *target.Ta
 	}
 
 	if pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane {
-		reads.read("etcd status", func(ctx context.Context) error {
+		if !reads.read("etcd status", func(ctx context.Context) error {
 			es, err := tgt.Talos.EtcdStatus(ctx, node)
 			if err == nil {
-				st.Etcd = &talosv1alpha1.EtcdState{MemberID: fmt.Sprintf("%x", es.MemberID), IsLearner: es.IsLearner}
+				etcd := &talosv1alpha1.EtcdState{
+					MemberID:  fmt.Sprintf("%x", es.MemberID),
+					IsLearner: es.IsLearner,
+					Leader:    es.Leader != 0 && es.Leader == es.MemberID,
+					DBSize:    es.DBSize, DBSizeInUse: es.DBSizeInUse,
+				}
+
+				if was := st.Etcd; was != nil {
+					etcd.DBSize = followedSize(was.DBSize, es.DBSize, es.DBSize)
+					etcd.DBSizeInUse = followedSize(was.DBSizeInUse, es.DBSizeInUse, es.DBSize)
+				}
+
+				st.Etcd = etcd
 			}
 
 			return err
-		})
+		}) {
+			forgetEtcdMoment(tm)
+		}
 	}
+
+	st.Health = observeHealth(tgt.Talos, reads)
 
 	if reads.ok() {
 		setMachineCondition(tm, talosv1alpha1.ConditionNodeObserved, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded,
@@ -507,6 +523,14 @@ func (r *TalosMachineReconciler) observeNode(ctx context.Context, tgt *target.Ta
 func forgetLiveConfig(tm *talosv1alpha1.TalosMachine) {
 	if cfg := tm.Status.Config; cfg != nil {
 		cfg.LiveHash, cfg.Diff, cfg.ChangeClass, cfg.ChangeReasons = "", "", "", nil
+	}
+}
+
+// forgetEtcdMoment drops what status says about the member's etcd as it was when last read. Which
+// member the machine is stays: that does not change while nobody looks.
+func forgetEtcdMoment(tm *talosv1alpha1.TalosMachine) {
+	if etcd := tm.Status.Etcd; etcd != nil {
+		etcd.Leader, etcd.DBSize, etcd.DBSizeInUse = false, 0, 0
 	}
 }
 
@@ -547,7 +571,9 @@ func (r *TalosMachineReconciler) unmatched(tm *talosv1alpha1.TalosMachine, statu
 	}
 
 	forgetLiveConfig(tm)
+	forgetEtcdMoment(tm)
 
+	tm.Status.Health = nil
 	tm.Status.Phase = machinePhasePending
 }
 

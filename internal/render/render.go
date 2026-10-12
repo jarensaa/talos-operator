@@ -67,6 +67,11 @@ type Input struct {
 	// ClusterDiscovery mirrors `--with-cluster-discovery` (talosctl default: enabled).
 	ClusterDiscovery *bool
 
+	// ControlPlaneMetrics makes a control plane serve the metrics of the controller manager and
+	// the scheduler on every interface (metricsPatch). It is applied before Patches, so a user's
+	// own setting of the same arguments stands. It changes nothing on a worker.
+	ControlPlaneMetrics bool
+
 	// Patches are strategic merge patches (multi-document YAML), applied in the order given:
 	// cluster-wide, role, machine, then operator overlays.
 	Patches [][]byte
@@ -129,7 +134,16 @@ func Generate(in Input) (config.Provider, error) {
 		return nil, fmt.Errorf("generate %s config: %w", in.Role, err)
 	}
 
-	patches := make([]configpatcher.Patch, 0, len(in.Patches))
+	patches := make([]configpatcher.Patch, 0, len(in.Patches)+1)
+
+	if in.ControlPlaneMetrics && in.Role == machine.TypeControlPlane {
+		p, err := configpatcher.LoadPatch(metricsPatch(in.Contract))
+		if err != nil {
+			return nil, fmt.Errorf("the control-plane metrics config: %w", err)
+		}
+
+		patches = append(patches, p)
+	}
 
 	for i, raw := range in.Patches {
 		p, err := configpatcher.LoadPatch(raw)

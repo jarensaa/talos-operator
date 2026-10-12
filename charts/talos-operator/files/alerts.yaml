@@ -186,3 +186,132 @@ groups:
             The control plane {{ $labels.machine }} of {{ $labels.taloscluster }} has not been a
             voting member of etcd for 15 minutes: it is no member, or still a learner. The cluster
             tolerates one control plane fewer than it should.
+
+      # What Talos itself says about a node. A node that cannot be read exports none of it, so
+      # these are about nodes that answer: TalosMachineNotObserved is about the others.
+      - alert: TalosServiceUnhealthy
+        expr: max by (namespace, taloscluster, machine, service) (talos_operator_machine_service_healthy) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The Talos service {{ $labels.service }} of {{ $labels.machine }} is not healthy."
+          description: >-
+            {{ $labels.service }} on the node of {{ $labels.machine }} in {{ $labels.taloscluster }}
+            has not been running, or has failed its health check, for 15 minutes.
+            status.health.services of the TalosMachine says which; the service's log is on the
+            node.
+
+      - alert: TalosNodeDiagnostic
+        expr: max by (namespace, taloscluster, machine, id) (talos_operator_machine_diagnostic_info) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Talos warns about {{ $labels.machine }}: {{ $labels.id }}."
+          description: >-
+            Talos has raised the warning {{ $labels.id }} about the configuration of the node of
+            {{ $labels.machine }} in {{ $labels.taloscluster }} for 15 minutes.
+            status.health.diagnostics of the TalosMachine has what Talos says about it.
+
+      - alert: TalosNodeClockNotSynced
+        expr: max by (namespace, taloscluster, machine) (talos_operator_machine_time_synced) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The clock of {{ $labels.machine }} is not synchronised."
+          description: >-
+            The node of {{ $labels.machine }} in {{ $labels.taloscluster }} has not had its clock
+            synchronised for 10 minutes. A clock that drifts breaks etcd and every certificate
+            check: look at the node's time servers.
+
+      - alert: TalosBondMemberDown
+        expr: max by (namespace, taloscluster, machine, link, bond) (talos_operator_machine_link_up{bond!=""}) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The link {{ $labels.link }} of {{ $labels.machine }} is down."
+          description: >-
+            {{ $labels.link }}, a member of the bond {{ $labels.bond }} on the node of
+            {{ $labels.machine }} in {{ $labels.taloscluster }}, has been down for 5 minutes. The
+            node is still reached through the rest of the bond, and has no link to spare.
+
+      - alert: TalosVolumeNotReady
+        expr: max by (namespace, taloscluster, machine, volume, phase) (talos_operator_machine_volume_ready) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The volume {{ $labels.volume }} of {{ $labels.machine }} is not ready."
+          description: >-
+            Talos has reported the volume {{ $labels.volume }} on the node of {{ $labels.machine }}
+            in {{ $labels.taloscluster }} as {{ $labels.phase }} for 15 minutes.
+            status.health.volumes of the TalosMachine has what Talos says went wrong.
+
+      # etcd refuses every write once a member's database reaches its quota, and the operator
+      # with it: it can then no longer write down what it does. So the warning comes before.
+      - alert: TalosEtcdDatabaseLarge
+        expr: max by (namespace, taloscluster, machine) (talos_operator_machine_etcd_db_size_bytes) > 1.6 * 1024 * 1024 * 1024
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The etcd database of {{ $labels.machine }} is close to etcd's quota."
+          description: >-
+            The etcd database of {{ $labels.machine }} in {{ $labels.taloscluster }} is
+            {{ $value | humanize1024 }}B, more than four fifths of the 2 GiB etcd allows a
+            database unless told otherwise. At the quota etcd refuses every write, and with it
+            the Kubernetes API. Defragment it if most of it is free space, and find out what
+            fills it if not.
+
+      - alert: TalosEtcdFragmented
+        expr: >-
+          max by (namespace, taloscluster, reason) (
+            talos_operator_cluster_condition{condition="EtcdMaintained", status="False",
+              reason!~"Defragmenting|OperationFailed|TooSoon|Paused|OutsideWindow"}
+          ) == 1
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: The etcd database of {{ $labels.taloscluster }} is fragmented and is not being defragmented.
+          description: >-
+            Much of the etcd database of {{ $labels.taloscluster }} is free space, and for an hour
+            the operator has not defragmented it without being paused, outside its maintenance
+            window or waiting for its interval: {{ $labels.reason }}. The EtcdMaintained condition
+            of the TalosCluster says what it waits for.
+
+      # A tenth of a certificate's validity: half an hour of the six hours Talos issues the
+      # operator's certificate for and renews well before, a year of an authority's ten.
+      - alert: TalosCertificateExpiring
+        expr: >-
+          (max by (namespace, taloscluster, certificate) (talos_operator_cluster_certificate_expiry_timestamp_seconds) - time())
+          <
+          0.1 * (
+            max by (namespace, taloscluster, certificate) (talos_operator_cluster_certificate_expiry_timestamp_seconds)
+            - max by (namespace, taloscluster, certificate) (talos_operator_cluster_certificate_issued_timestamp_seconds)
+          )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The {{ $labels.certificate }} certificate of {{ $labels.taloscluster }} is close to its end."
+          description: >-
+            Less than a tenth of the validity of the {{ $labels.certificate }} certificate of
+            {{ $labels.taloscluster }} is left. The operator's own certificate is renewed by
+            Talos, or replaced by whoever supplied it; an authority that ends takes the cluster
+            with it, and replacing one is a rotation of the cluster's PKI.
+
+      - alert: TalosCertificateExpired
+        expr: max by (namespace, taloscluster, certificate) (talos_operator_cluster_certificate_expiry_timestamp_seconds) - time() < 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The {{ $labels.certificate }} certificate of {{ $labels.taloscluster }} is no longer valid."
+          description: >-
+            The {{ $labels.certificate }} certificate of {{ $labels.taloscluster }} has reached the
+            end of its validity. Without its own certificate the operator reaches no node; without
+            an authority nothing in the cluster trusts anything.
