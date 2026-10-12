@@ -34,7 +34,6 @@ import (
 	"github.com/jarensaa/talos-operator/internal/adopt"
 	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos"
-	"github.com/jarensaa/talos-operator/internal/talos/creds"
 	"github.com/jarensaa/talos-operator/internal/talos/fake"
 	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 	"github.com/jarensaa/talos-operator/internal/target"
@@ -64,23 +63,9 @@ var _ = Describe("TalosMachine binding", func() {
 	}
 
 	BeforeEach(func() {
-		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "bind-"}}
-		Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
-		ns = namespace.Name
+		ns = specCluster("bind-", nil).Namespace
 
 		Expect(k8sClient.Create(ctx, kubeNode(cpNodename))).To(Succeed())
-		DeferCleanup(func() { Expect(k8sClient.DeleteAllOf(ctx, &corev1.Node{})).To(Succeed()) })
-
-		Expect(k8sClient.Create(ctx, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: credentialsSecret, Namespace: ns},
-			Data:       map[string][]byte{creds.DefaultTalosconfigKey: talostest.AdminTalosconfig(GinkgoT(), cpAddr.String())},
-		})).To(Succeed())
-
-		Expect(k8sClient.Create(ctx, &talosv1alpha1.TalosCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns},
-			Spec:       talosv1alpha1.TalosClusterSpec{Credentials: secretCredentials()},
-		})).To(Succeed())
-		createPools(ns)
 
 		scenario = observedCluster()
 		reconciler = &TalosMachineReconciler{
