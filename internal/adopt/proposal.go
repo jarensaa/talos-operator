@@ -137,12 +137,7 @@ func Build(req Request) (*Proposal, error) {
 	for _, n := range nodes {
 		pool, ok := pools[n.Role]
 		if !ok {
-			shared := layers.Worker
-			if n.Role == machine.TypeControlPlane {
-				shared = layers.ControlPlane
-			}
-
-			pool = poolSpec(req.Cluster, n.Role, shared)
+			pool = poolSpec(req.Cluster, n.Role, layers.Role(n.Role))
 			pools[n.Role] = pool
 			p.Pools = append(p.Pools, pool)
 		}
@@ -206,13 +201,15 @@ func poolName(cluster string, role talosv1alpha1.MachineRole) string {
 	return cluster + "-workers"
 }
 
-func poolSpec(cluster *talosv1alpha1.TalosCluster, role machine.Type, shared []string) *talosv1alpha1.TalosMachinePool {
+func poolSpec(cluster *talosv1alpha1.TalosCluster, of machine.Type, shared []string) *talosv1alpha1.TalosMachinePool {
+	role := machineRole(of)
+
 	return &talosv1alpha1.TalosMachinePool{
 		TypeMeta:   metav1.TypeMeta{APIVersion: talosv1alpha1.GroupVersion.String(), Kind: "TalosMachinePool"},
-		ObjectMeta: metav1.ObjectMeta{Name: poolName(cluster.Name, machineRole(role)), Namespace: cluster.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: poolName(cluster.Name, role), Namespace: cluster.Namespace},
 		Spec: talosv1alpha1.TalosMachinePoolSpec{
 			ClusterRef: corev1.LocalObjectReference{Name: cluster.Name},
-			Role:       machineRole(role),
+			Role:       role,
 			Config:     inline(shared),
 		},
 	}
@@ -244,16 +241,11 @@ func inline(documents []string) []talosv1alpha1.ConfigSource {
 	return out
 }
 
-// ConfigSources returns a machine's config sources in the order they apply: the cluster's
-// layer, its pool's, then its own (docs/scope.md §6.1).
+// ConfigSources returns a machine's config sources in the order they apply (render.Layered).
 func ConfigSources(cluster *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.TalosMachinePoolSpec,
 	m *talosv1alpha1.TalosMachineSpec,
 ) []talosv1alpha1.ConfigSource {
-	out := make([]talosv1alpha1.ConfigSource, 0, len(cluster.Config)+len(pool.Config)+len(m.Config))
-	out = append(out, cluster.Config...)
-	out = append(out, pool.Config...)
-
-	return append(out, m.Config...)
+	return render.Layered(cluster.Config, pool.Config, m.Config)
 }
 
 // inlineDocuments returns the contents of inline config sources, which are all a proposal has.
@@ -284,23 +276,8 @@ func proveSpecs(p *Proposal, nodes []LiveNode, parsed map[string]config.Provider
 			return fmt.Errorf("%s: render proposed spec: %w", n.Hostname, err)
 		}
 
-		want, err := render.Normalize(parsed[n.Hostname])
-		if err != nil {
+		if err := render.Reproduces("proposed specs", got, parsed[n.Hostname]); err != nil {
 			return fmt.Errorf("%s: %w", n.Hostname, err)
-		}
-
-		diffs, err := render.Diff(got, want)
-		if err != nil {
-			return fmt.Errorf("%s: %w", n.Hostname, err)
-		}
-
-		if len(diffs) > 0 {
-			var text strings.Builder
-			for _, d := range diffs {
-				text.WriteString(d.Text)
-			}
-
-			return fmt.Errorf("%s: proposed specs do not reproduce the live config:\n%s", n.Hostname, text.String())
 		}
 	}
 

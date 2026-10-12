@@ -317,14 +317,14 @@ func (c *check) skipped(message string) {
 func (c *check) cluster() {
 	c.policy()
 
-	spec := &c.tc.Spec
-	if spec.Versions == nil || spec.Versions.Talos == "" || spec.Versions.Kubernetes == "" {
+	versions, named := adopt.Versions(&c.tc.Spec)
+	if !named {
 		c.skipped("it names no versions yet (adoption fills them in), so there is nothing to check about them")
 
 		return
 	}
 
-	if !c.versions() {
+	if !c.versions(versions) {
 		return
 	}
 
@@ -332,10 +332,10 @@ func (c *check) cluster() {
 	c.renders()
 }
 
-// versions checks what can be told from the versions alone. It reports whether they make sense
-// enough to go on.
-func (c *check) versions() bool {
-	want := plan.VersionState{Talos: c.tc.Spec.Versions.Talos, Kubernetes: c.tc.Spec.Versions.Kubernetes}
+// versions checks what can be told from the versions the spec names alone. It reports whether
+// they make sense enough to go on.
+func (c *check) versions(to talosv1alpha1.Versions) bool {
+	want := plan.VersionState{Talos: to.Talos, Kubernetes: to.Kubernetes}
 
 	if ok, why := talos.SupportsTalos(want.Talos); !ok {
 		c.problem("versions.talos: %s", why)
@@ -349,11 +349,16 @@ func (c *check) versions() bool {
 		return false
 	}
 
-	if c.before == nil || c.before.Spec.Versions == nil || c.before.Spec.Versions.Talos == "" || c.before.Spec.Versions.Kubernetes == "" {
+	if c.before == nil {
 		return true
 	}
 
-	from := plan.VersionState{Talos: c.before.Spec.Versions.Talos, Kubernetes: c.before.Spec.Versions.Kubernetes}
+	before, named := adopt.Versions(&c.before.Spec)
+	if !named {
+		return true
+	}
+
+	from := plan.VersionState{Talos: before.Talos, Kubernetes: before.Kubernetes}
 	rules := plan.VersionRules{TalosUpgrade: talos.UpgradeProblem, Runs: talos.RunsKubernetes}
 
 	way := plan.PlanVersions(from, want, rules, nil)
@@ -427,14 +432,16 @@ func (c *check) upstream() {
 		return
 	}
 
-	installer := c.tc.Spec.ConfigGeneration
-	if installer == nil || installer.Installer == nil {
+	installer := adopt.InstallerOf(&c.tc.Spec)
+	if installer == nil {
 		c.skipped("it names no installer yet (adoption fills it in), so there is none to look for")
-	} else {
-		for _, install := range c.installers() {
-			c.asked("the installer "+install.Image,
-				c.opts.Source.Installer(c.ctx, installer.Installer.FactoryURL, installer.Installer.Platform, install.SchematicID, install.Version))
-		}
+
+		return
+	}
+
+	for _, install := range c.installers() {
+		c.asked("the installer "+install.Image,
+			c.opts.Source.Installer(c.ctx, installer.FactoryURL, installer.Platform, install.SchematicID, install.Version))
 	}
 }
 
@@ -466,13 +473,14 @@ func (c *check) policy() {
 // change would do to a node: that takes the node's own config, which only the operator sees.
 func (c *check) renders() {
 	spec := &c.tc.Spec
-	if spec.ConfigGeneration == nil || spec.ConfigGeneration.VersionContract == "" {
+	pinned := adopt.VersionContract(spec)
+	if pinned == "" {
 		c.skipped("it names no version contract yet (adoption fills it in), so no config was rendered")
 
 		return
 	}
 
-	contract, err := config.ParseContractFromVersion(spec.ConfigGeneration.VersionContract)
+	contract, err := config.ParseContractFromVersion(pinned)
 	if err != nil {
 		c.problem("configGeneration.versionContract: %v", err)
 

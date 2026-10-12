@@ -59,24 +59,61 @@ type Install struct {
 	Image       string
 }
 
+// What a TalosCluster spec has only once adoption filled it in is read through these, so that
+// "not there yet" is asked the same way by everything that reads a spec.
+
+// Versions returns the versions the spec names, and whether it names both of them.
+func Versions(spec *talosv1alpha1.TalosClusterSpec) (talosv1alpha1.Versions, bool) {
+	if spec.Versions == nil {
+		return talosv1alpha1.Versions{}, false
+	}
+
+	return *spec.Versions, spec.Versions.Talos != "" && spec.Versions.Kubernetes != ""
+}
+
+// VersionContract returns the version contract the spec pins; empty while it pins none.
+func VersionContract(spec *talosv1alpha1.TalosClusterSpec) string {
+	if spec.ConfigGeneration == nil {
+		return ""
+	}
+
+	return spec.ConfigGeneration.VersionContract
+}
+
+// InstallerOf returns the installer the spec names; nil while it names none.
+func InstallerOf(spec *talosv1alpha1.TalosClusterSpec) *talosv1alpha1.Installer {
+	if spec.ConfigGeneration == nil {
+		return nil
+	}
+
+	return spec.ConfigGeneration.Installer
+}
+
 // InstallTarget returns what a pool's machines are to be installed from: the cluster's version
 // and installer, with the pool's own schematic if it sets one.
 func InstallTarget(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.TalosMachinePoolSpec) (Install, error) {
-	if spec.Versions == nil || spec.Versions.Talos == "" || spec.ConfigGeneration == nil || spec.ConfigGeneration.Installer == nil {
+	versions, _ := Versions(spec)
+	installer := InstallerOf(spec)
+
+	if versions.Talos == "" || installer == nil {
 		return Install{}, fmt.Errorf("%w: versions.talos and configGeneration.installer", ErrIncompleteSpec)
 	}
 
-	installer := *spec.ConfigGeneration.Installer
+	return installTarget(versions.Talos, *installer, pool)
+}
+
+// installTarget is InstallTarget of a spec that is known to name a Talos version and an installer.
+func installTarget(talosVersion string, installer talosv1alpha1.Installer, pool *talosv1alpha1.TalosMachinePoolSpec) (Install, error) {
 	if pool.Installer != nil && pool.Installer.SchematicID != "" {
 		installer.SchematicID = pool.Installer.SchematicID
 	}
 
-	image, err := InstallerImage(installer, spec.Versions.Talos)
+	image, err := InstallerImage(installer, talosVersion)
 	if err != nil {
 		return Install{}, err
 	}
 
-	return Install{Version: spec.Versions.Talos, SchematicID: installer.SchematicID, Image: image}, nil
+	return Install{Version: talosVersion, SchematicID: installer.SchematicID, Image: image}, nil
 }
 
 // ParseInstallerImage splits an Image Factory installer reference into the spec's fields and the
@@ -120,11 +157,13 @@ func RenderInput(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.Talos
 		missing = append(missing, "controlPlaneEndpoint")
 	}
 
-	if spec.Versions == nil || spec.Versions.Talos == "" || spec.Versions.Kubernetes == "" {
+	versions, named := Versions(spec)
+	if !named {
 		missing = append(missing, "versions")
 	}
 
-	if spec.ConfigGeneration == nil || spec.ConfigGeneration.VersionContract == "" || spec.ConfigGeneration.Installer == nil {
+	installer := InstallerOf(spec)
+	if VersionContract(spec) == "" || installer == nil {
 		missing = append(missing, "configGeneration.versionContract and installer")
 	}
 
@@ -132,26 +171,24 @@ func RenderInput(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.Talos
 		return render.Input{}, fmt.Errorf("%w: %s", ErrIncompleteSpec, strings.Join(missing, ", "))
 	}
 
-	contract, err := config.ParseContractFromVersion(spec.ConfigGeneration.VersionContract)
+	contract, err := config.ParseContractFromVersion(VersionContract(spec))
 	if err != nil {
 		return render.Input{}, fmt.Errorf("versionContract: %w", err)
 	}
 
-	install, err := InstallTarget(spec, pool)
+	install, err := installTarget(versions.Talos, *installer, pool)
 	if err != nil {
 		return render.Input{}, err
 	}
 
-	image := install.Image
-
 	in := render.Input{
 		ClusterName:       spec.ClusterName,
 		Endpoint:          spec.ControlPlaneEndpoint,
-		KubernetesVersion: spec.Versions.Kubernetes,
+		KubernetesVersion: versions.Kubernetes,
 		Contract:          contract,
 		Bundle:            bundle,
 		Role:              machineType(pool.Role),
-		InstallImage:      image,
+		InstallImage:      install.Image,
 		Patches:           documents,
 	}
 
