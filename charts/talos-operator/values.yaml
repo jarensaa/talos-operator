@@ -109,6 +109,10 @@ monitoring:
 # site and the registries of the Kubernetes images: over HTTPS, a few times a day, and never during
 # an upgrade. Nothing is upgraded because of what they answer. These are other people's services:
 # switching this on is a decision to use them (docs/guide.md).
+#
+# One question is asked whether this is on or not: before a Talos upgrade of a machine whose
+# firmware has Secure Boot on, the Image Factory its installer names is asked for the certificate
+# it signs boot images with. A cluster without such a machine asks nobody.
 versionSources:
   enabled: false
   # Where Kubernetes publishes its releases; https://dl.k8s.io if empty.

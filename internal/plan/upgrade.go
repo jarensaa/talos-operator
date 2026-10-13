@@ -335,6 +335,10 @@ type UpgradeMachine struct {
 	Image string
 	// Problem says why the node cannot be taken to Target at all, or is empty.
 	Problem string
+	// Unverified says why it could not be told that the node would boot Target, or is empty. It
+	// is not a problem of the node, and it holds the upgrade up all the same: a node that does
+	// not come back is found out at its reboot, which is too late.
+	Unverified string
 	// EtcdLeader and HostsOperator move a machine to the end of its group: each is a handover
 	// that an upgrade of that node costs, and neither is needed more than once.
 	EtcdLeader, HostsOperator bool
@@ -354,6 +358,8 @@ type UpgradeSettings struct {
 const (
 	// BlockIncompatible: a node cannot be taken to the version or installer its spec asks for.
 	BlockIncompatible = "Incompatible"
+	// BlockUnverified: whether a node would boot what its spec asks for could not be told.
+	BlockUnverified = "Unverified"
 )
 
 // Upgrade is the planner's answer to "is a Talos upgrade due, and may it start?".
@@ -453,6 +459,20 @@ func upgradeBlock(pending []UpgradeMachine, stale []string, s UpgradeSettings, u
 
 	if len(problems) > 0 {
 		return BlockIncompatible, strings.Join(problems, "; ")
+	}
+
+	// Every node is asked about before the first is touched: one that would not boot the new
+	// system refuses the upgrade of all of them, and so does one nobody could ask.
+	var unverified []string
+
+	for _, m := range pending {
+		if m.Unverified != "" {
+			unverified = append(unverified, m.Name+": "+m.Unverified)
+		}
+	}
+
+	if len(unverified) > 0 {
+		return BlockUnverified, strings.Join(unverified, "; ")
 	}
 
 	if reason, message := s.Policy.block(s.Paused); reason != "" {

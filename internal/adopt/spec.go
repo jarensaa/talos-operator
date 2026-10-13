@@ -36,8 +36,13 @@ import (
 // ErrIncompleteSpec means a TalosCluster spec lacks fields rendering needs.
 var ErrIncompleteSpec = errors.New("cluster spec is incomplete")
 
+// secureBootInstaller is what the repository of an installer ends in when Image Factory signs
+// the boot image it carries.
+const secureBootInstaller = "-secureboot"
+
 // InstallerImage builds the Image Factory installer reference for a Talos version, e.g.
-// factory.talos.dev/metal-installer/<schematic>:v1.14.2.
+// factory.talos.dev/metal-installer/<schematic>:v1.14.2, or metal-installer-secureboot for the
+// installer whose boot image is signed.
 func InstallerImage(in talosv1alpha1.Installer, talosVersion string) (string, error) {
 	u, err := url.Parse(in.FactoryURL)
 	if err != nil || u.Host == "" {
@@ -48,7 +53,12 @@ func InstallerImage(in talosv1alpha1.Installer, talosVersion string) (string, er
 		return "", errors.New("installer platform and schematicID are required")
 	}
 
-	return fmt.Sprintf("%s/%s-installer/%s:%s", u.Host, in.Platform, in.SchematicID, talosVersion), nil
+	repository := in.Platform + "-installer"
+	if in.SecureBoot {
+		repository += secureBootInstaller
+	}
+
+	return fmt.Sprintf("%s/%s/%s:%s", u.Host, repository, in.SchematicID, talosVersion), nil
 }
 
 // Install is what a machine is to be installed from: the Talos version and the schematic its
@@ -57,18 +67,29 @@ type Install struct {
 	Version     string
 	SchematicID string
 	Image       string
+	// FactoryURL is the Image Factory the image comes from, and SecureBoot whether it is the
+	// installer whose boot image that factory signs.
+	FactoryURL string
+	SecureBoot bool
 }
 
 // InstallTarget returns what a pool's machines are to be installed from: the cluster's version
-// and installer, with the pool's own schematic if it sets one.
+// and installer, with the pool's own schematic and Secure Boot setting if it sets them.
 func InstallTarget(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.TalosMachinePoolSpec) (Install, error) {
 	if spec.Versions == nil || spec.Versions.Talos == "" || spec.ConfigGeneration == nil || spec.ConfigGeneration.Installer == nil {
 		return Install{}, fmt.Errorf("%w: versions.talos and configGeneration.installer", ErrIncompleteSpec)
 	}
 
 	installer := *spec.ConfigGeneration.Installer
-	if pool.Installer != nil && pool.Installer.SchematicID != "" {
-		installer.SchematicID = pool.Installer.SchematicID
+
+	if pool.Installer != nil {
+		if pool.Installer.SchematicID != "" {
+			installer.SchematicID = pool.Installer.SchematicID
+		}
+
+		if pool.Installer.SecureBoot != nil {
+			installer.SecureBoot = *pool.Installer.SecureBoot
+		}
 	}
 
 	image, err := InstallerImage(installer, spec.Versions.Talos)
@@ -76,7 +97,10 @@ func InstallTarget(spec *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.Tal
 		return Install{}, err
 	}
 
-	return Install{Version: spec.Versions.Talos, SchematicID: installer.SchematicID, Image: image}, nil
+	return Install{
+		Version: spec.Versions.Talos, SchematicID: installer.SchematicID, Image: image,
+		FactoryURL: installer.FactoryURL, SecureBoot: installer.SecureBoot,
+	}, nil
 }
 
 // ParseInstallerImage splits an Image Factory installer reference into the spec's fields and the
@@ -93,15 +117,20 @@ func ParseInstallerImage(ref string) (talosv1alpha1.Installer, string, error) {
 	}
 
 	platformRepo, schematic, ok := strings.Cut(repo, "/")
-	if !ok || !strings.HasSuffix(platformRepo, "-installer") || len(schematic) != 64 {
+
+	platformRepo, secureBoot := strings.CutSuffix(platformRepo, secureBootInstaller)
+
+	platform, isInstaller := strings.CutSuffix(platformRepo, "-installer")
+	if !ok || !isInstaller || platform == "" || len(schematic) != 64 {
 		return talosv1alpha1.Installer{}, "", fmt.Errorf(
-			"installer %q is not an Image Factory image (<host>/<platform>-installer/<schematic>:<version>)", ref)
+			"installer %q is not an Image Factory image (<host>/<platform>-installer[-secureboot]/<schematic>:<version>)", ref)
 	}
 
 	return talosv1alpha1.Installer{
 		FactoryURL:  "https://" + host,
-		Platform:    strings.TrimSuffix(platformRepo, "-installer"),
+		Platform:    platform,
 		SchematicID: schematic,
+		SecureBoot:  secureBoot,
 	}, tag, nil
 }
 
