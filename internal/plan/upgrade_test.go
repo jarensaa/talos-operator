@@ -384,6 +384,13 @@ func TestPlanUpgradeBlocks(t *testing.T) {
 	jump := upgradable(cp1, true)
 	jump.Problem = "v1.12.4 cannot be upgraded to v1.14.2 directly"
 
+	// A machine nobody could ask whether it would boot what it is about to be given.
+	unasked := upgradable(cp1, true)
+	unasked.Unverified = "what its firmware trusts to boot could not be read"
+
+	untrusting := upgradable(w2, false)
+	untrusting.Problem = "its firmware does not trust the certificate"
+
 	change := []UpgradeMachine{upgradable(w1, false), upToDate(cp1, true)}
 
 	tests := []struct {
@@ -397,6 +404,14 @@ func TestPlanUpgradeBlocks(t *testing.T) {
 		{"a jump Talos does not allow", []UpgradeMachine{upgradable(w1, false), jump}, UpgradeSettings{}, openPass,
 			BlockIncompatible, "cp-1: v1.12.4"},
 		{"incompatible outranks paused", []UpgradeMachine{jump}, UpgradeSettings{Paused: true}, openPass, BlockIncompatible, cp1},
+		// One machine that would not boot the new system refuses the upgrade of every machine, and
+		// so does one that could not be asked: the others are not upgraded around it.
+		{"a machine that would not boot it", []UpgradeMachine{upgradable(w1, false), untrusting}, UpgradeSettings{}, openPass,
+			BlockIncompatible, "w-2: its firmware does not trust"},
+		{"a machine that could not be asked", []UpgradeMachine{upgradable(w1, false), unasked}, UpgradeSettings{}, openPass,
+			BlockUnverified, "cp-1: what its firmware trusts"},
+		{"what is known to be wrong outranks what is not known", []UpgradeMachine{unasked, untrusting}, UpgradeSettings{}, openPass,
+			BlockIncompatible, w2},
 		{wordPaused, change, UpgradeSettings{Paused: true}, openPass, BlockPaused, "spec.paused"},
 		{"stale status", append(slices.Clone(change), stale), UpgradeSettings{}, openPass, BlockNotCurrent, w2},
 		{"an aborted upgrade is not started again", change,

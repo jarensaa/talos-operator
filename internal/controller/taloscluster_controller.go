@@ -89,6 +89,11 @@ type TalosClusterReconciler struct {
 	// Catalog answers what exists upstream (docs/scope.md §7.5). Nil means nobody is asked:
 	// nothing is reported as available, and nothing is refused for not existing.
 	Catalog catalog.Source
+	// Signers answers which certificate an Image Factory signs boot images with. It is asked
+	// before an upgrade that would touch a machine with Secure Boot on, whether or not Catalog is
+	// set, and at no other time (docs/scope.md §7.3). Nil means it cannot be asked, and such an
+	// upgrade does not start.
+	Signers catalog.Signer
 	// NodeName is the Kubernetes node this replica runs on, if it knows. An upgrade takes that
 	// node last in its group, so the operator moves house as rarely as it can.
 	NodeName string
@@ -445,6 +450,15 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 	reads.read("boot ID", func(ctx context.Context) error {
 		id, err := r.BootID(ctx, addr)
 		facts.bootID = id
+
+		return err
+	})
+
+	reads.read("security state", func(ctx context.Context) error {
+		enforced, err := r.SecureBoot(ctx, addr)
+		if err == nil {
+			facts.secureBoot = &enforced
+		}
 
 		return err
 	})

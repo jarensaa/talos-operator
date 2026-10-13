@@ -109,6 +109,23 @@ type testAPI struct {
 	// What the upkeep sends, and what a node's logs hold.
 	defrags int
 	logs    map[string][]string
+
+	// The files a node has, and the paths that were read of it.
+	files map[string][]byte
+	reads []string
+}
+
+func (a *testAPI) Read(req *machineapi.ReadRequest, stream grpc.ServerStreamingServer[common.Data]) error {
+	a.mu.Lock()
+	a.reads = append(a.reads, req.GetPath())
+	content, ok := a.files[req.GetPath()]
+	a.mu.Unlock()
+
+	if !ok {
+		return status.Error(codes.NotFound, "no such file")
+	}
+
+	return stream.Send(&common.Data{Bytes: content})
 }
 
 func (a *testAPI) EtcdDefragment(context.Context, *emptypb.Empty) (*machineapi.EtcdDefragmentResponse, error) {

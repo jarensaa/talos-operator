@@ -156,6 +156,9 @@ const (
 	ReasonUpgrading        = "Upgrading"
 	ReasonUpgradesDisabled = "UpgradesDisabled"
 	ReasonIncompatible     = "Incompatible"
+	// ReasonUnverified: whether a node would boot the system an upgrade installs could not be
+	// told, and no node is touched until it can (docs/scope.md §7.3).
+	ReasonUnverified = "Unverified"
 	// ReasonUpToDate: the cluster runs the versions its spec asks for.
 	ReasonUpToDate = "UpToDate"
 	// ReasonPlanned: there is a way to the versions the spec asks for, in status.versions.plan.
