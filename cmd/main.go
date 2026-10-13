@@ -300,10 +300,16 @@ func run(o *options) error {
 }
 
 func main() {
-	// The one subcommand: the check a repository runs before a spec reaches a cluster. It is in
-	// this binary so that the image a cluster runs is the image that checks its manifests.
-	if len(os.Args) > 1 && os.Args[1] == "validate" {
-		os.Exit(validateCommand(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
+	// The subcommands are what a repository runs on the manifests it holds, before a spec reaches
+	// a cluster: the check, and the bump of a version. They are in this binary so that the image a
+	// cluster runs is the image that checks its manifests, and that chooses what it upgrades to.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "validate":
+			os.Exit(validateCommand(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
+		case "bump":
+			os.Exit(bumpCommand(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
+		}
 	}
 
 	o := parseFlags()

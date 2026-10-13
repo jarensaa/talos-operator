@@ -324,6 +324,96 @@ func TestWhatIsNotCheckedIsSaid(t *testing.T) {
 	}
 }
 
+// A repository may hold the cluster and none of its machines: the operator wrote those when it
+// adopted the cluster. The images a Kubernetes version brings are looked for all the same, as a
+// control plane rendered from the cluster alone names them.
+func TestAClusterWithoutItsMachinesNamesItsImages(t *testing.T) {
+	alone := func(r repository) string {
+		dir := r.write(t)
+
+		for _, name := range []string{"pools.yaml", "nested"} {
+			if err := os.RemoveAll(filepath.Join(dir, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		return dir
+	}
+
+	problems, skipped := run(t, validate.Options{Paths: []string{alone(valid())}, Source: upstream()})
+	if len(problems) != 0 || len(skipped) != 0 {
+		t.Fatalf("problems %q, skipped %q", problems, skipped)
+	}
+
+	unpublished := valid()
+	unpublished.kubernetes = "1.37.9"
+
+	problems, _ = run(t, validate.Options{Paths: []string{alone(unpublished)}, Source: upstream()})
+	if len(problems) != 5 || !strings.Contains(strings.Join(problems, "\n"), "the image ghcr.io/siderolabs/kubelet:v1.37.9 does not exist") {
+		t.Fatalf("problems %q", problems)
+	}
+
+	// With part of the cluster's own config in a Secret there is nothing to render, which is said.
+	secret := valid()
+	secret.extra = "config:\n  - secretKeyRef: {name: registry-credentials, key: config.yaml}"
+
+	problems, skipped = run(t, validate.Options{Paths: []string{alone(secret)}, Source: upstream()})
+	if len(problems) != 0 || len(skipped) != 1 || !strings.Contains(skipped[0], "the cluster's own config comes from a Secret") {
+		t.Fatalf("problems %q, skipped %q", problems, skipped)
+	}
+}
+
+// A change that is not written yet is checked in place of the file it would be written to, and
+// against the files as they are.
+func TestAnEditIsCheckedInPlaceOfTheFile(t *testing.T) {
+	dir := valid().write(t)
+
+	files, err := validate.Files([]string{dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var file string
+
+	for _, name := range files {
+		if filepath.Base(name) == "cluster.yaml" {
+			file = name
+		}
+	}
+
+	// Every YAML file is listed, whatever it holds, and nothing else is.
+	if len(files) != 4 || file == "" {
+		t.Fatalf("files %q", files)
+	}
+
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	edit := func(from, to string) map[string][]byte {
+		return map[string][]byte{file: []byte(strings.Replace(string(raw), from, to, 1))}
+	}
+
+	opts := validate.Options{Paths: []string{dir}, Base: []string{dir}, Source: upstream()}
+
+	opts.Edited = edit("kubernetes: 1.37.1", "kubernetes: 1.37.0")
+	if problems, _ := run(t, opts); len(problems) != 1 || !strings.Contains(problems[0], "not downgraded") {
+		t.Fatalf("problems %q", problems)
+	}
+
+	opts.Edited = edit("talos: v1.14.2", "talos: v1.14.9")
+	if problems, _ := run(t, opts); len(problems) != 1 || !strings.Contains(problems[0], "no installer of Talos v1.14.9") {
+		t.Fatalf("problems %q", problems)
+	}
+
+	// The file itself is as it was, and passes.
+	opts.Edited = nil
+	if problems, _ := run(t, opts); len(problems) != 0 {
+		t.Fatalf("problems %q", problems)
+	}
+}
+
 func TestWhatCannotBeReadIsAnError(t *testing.T) {
 	ctx := context.Background()
 

@@ -1983,6 +1983,10 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			// As far as the cluster can tell, a machine that drops everything it would send to the
 			// control planes is dead: its Talos API answers through none of them, and its kubelet
 			// reaches no API server. Nothing short of the harness's own tools gets it back.
+			//
+			// The control planes are the ones the cluster has now. On three, one was replaced
+			// above: the list the cluster was built with names this very machine and leaves out
+			// the control plane that took its place, through which it would go on being a member.
 			By("cutting the machine off for good, behind the operator's back")
 			cfgs, err := harness.MachineConfig(ctx, spare)
 			Expect(err).NotTo(HaveOccurred())
@@ -1990,7 +1994,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			// The config takes away the way its own answer has to come back on, through a control
 			// plane: the call ends with the answer or without one, whichever is first. What says
 			// that it took is the machine no longer answering.
-			isolated := withPatch(cfgs.Active, blackholeDocuments(addrsOf("E2E_CONTROLPLANES")))
+			isolated := withPatch(cfgs.Active, blackholeDocuments(controlPlaneAddrsNow(ctx)))
 			if err := harnessWriter(ctx).ApplyConfig(ctx, spare, isolated, talos.ApplyNoReboot, 0); err != nil {
 				Expect(talos.IsUnreachable(err)).To(BeTrue(), "the config was refused: %v", err)
 			}
