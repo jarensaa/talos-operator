@@ -225,6 +225,10 @@ type UpgradeMachine struct {
 	Image string
 	// Problem says why the node cannot be taken to Target at all, or is empty.
 	Problem string
+	// Unverified says why it could not be told that the node would boot Target, or is empty. It
+	// is not a problem of the node, and it holds the upgrade up all the same: a node that does
+	// not come back is found out at its reboot, which is too late.
+	Unverified string
 	// EtcdLeader and HostsOperator move a machine to the end of its group: each is a handover
 	// that an upgrade of that node costs, and neither is needed more than once.
 	EtcdLeader, HostsOperator bool
@@ -281,7 +285,7 @@ func PlanUpgrade(machines []UpgradeMachine, s UpgradeSettings, p Pass) Upgrade {
 		)
 	})
 
-	var problems []string
+	var problems, unasked []string
 
 	lines := make([]string, 0, len(pending))
 
@@ -293,6 +297,10 @@ func PlanUpgrade(machines []UpgradeMachine, s UpgradeSettings, p Pass) Upgrade {
 		if m.Problem != "" {
 			problems = append(problems, m.Name+": "+m.Problem)
 		}
+
+		if m.Unverified != "" {
+			unasked = append(unasked, m.Name+": "+m.Unverified)
+		}
 	}
 
 	out.AbortStands = abortStands(s.Aborted, stale, out.Targets)
@@ -301,9 +309,17 @@ func PlanUpgrade(machines []UpgradeMachine, s UpgradeSettings, p Pass) Upgrade {
 		return out
 	}
 
+	// Every node is asked about before the first is touched: one that would not boot the new
+	// system refuses the upgrade of all of them, and so does one nobody could ask.
+	var unverified block
+	if len(unasked) > 0 {
+		unverified = block{BlockUnverified, strings.Join(unasked, "; ")}
+	}
+
 	out.Change = fingerprint(lines)
 	out.BlockReason, out.BlockMessage = firstBlock(
 		incompatibleBlock(problems),
+		unverified,
 		s.Policy.block(),
 		staleBlock(stale),
 		abortedBlock(out.AbortStands, "the upgrade to this installer"),

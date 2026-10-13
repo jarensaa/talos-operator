@@ -70,6 +70,9 @@ const (
 	MethodEtcdDefragment = "EtcdDefragment"
 	MethodNodeHealth     = "NodeHealth"
 	MethodLogs           = "Logs"
+	// What is read of a node's firmware.
+	MethodSecureBoot   = "SecureBoot"
+	MethodSecureBootDB = "SecureBootDB"
 )
 
 // Machine types as Talos reports them: talos.MachineTypeControlPlane and talos.MachineTypeWorker,
@@ -96,6 +99,8 @@ var methodReads = map[string]bool{
 	MethodMembers:                 true,
 	MethodEtcdMembers:             true,
 	MethodEtcdStatus:              true,
+	MethodSecureBoot:              true,
+	MethodSecureBootDB:            true,
 	MethodHealthCheck:             true,
 	MethodKubernetesUpgradeChecks: true,
 	MethodMaintenanceProbe:        true,
@@ -181,6 +186,10 @@ type Node struct {
 	EtcdDBSize, EtcdDBInUse int64
 	// Logs are the node's logs, by service; "dmesg" is the kernel's.
 	Logs map[string]string
+	// SecureBoot is whether the node's firmware enforces Secure Boot, and SecureBootDB what that
+	// firmware trusts to boot.
+	SecureBoot   bool
+	SecureBootDB talos.SecureBootDB
 	// Maintenance is true for a machine that has no config and waits for one: it answers nobody
 	// who comes with the cluster's credentials, is no member of anything, and takes a config
 	// from whoever hands it one over a maintenance connection. Everything else the Node says is
@@ -907,6 +916,26 @@ func (r *reader) Volumes(ctx context.Context, node netip.Addr) ([]talos.Volume, 
 	}
 
 	return slices.Clone(n.Volumes), nil
+}
+
+// SecureBoot implements talos.Reader.
+func (r *reader) SecureBoot(ctx context.Context, node netip.Addr) (bool, error) {
+	n, err := r.s.record(ctx, Call{Method: MethodSecureBoot, Node: node})
+	if err != nil {
+		return false, err
+	}
+
+	return n.SecureBoot, nil
+}
+
+// SecureBootDB implements talos.Reader.
+func (r *reader) SecureBootDB(ctx context.Context, node netip.Addr) (talos.SecureBootDB, error) {
+	n, err := r.s.record(ctx, Call{Method: MethodSecureBootDB, Node: node})
+	if err != nil {
+		return talos.SecureBootDB{}, err
+	}
+
+	return n.SecureBootDB, nil
 }
 
 // Logs implements talos.Reader.

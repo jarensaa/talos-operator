@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"crypto/x509"
 	"errors"
 	"time"
 
@@ -32,8 +33,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	"github.com/jarensaa/talos-operator/internal/catalog"
 	"github.com/jarensaa/talos-operator/internal/plan"
+	"github.com/jarensaa/talos-operator/internal/talos"
 	"github.com/jarensaa/talos-operator/internal/talos/fake"
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 // A Talos upgrade: another version, or another installer, installed to every node in turn
@@ -293,6 +297,167 @@ var _ = Describe("Talos upgrade", func() {
 		upgradeTo("v1.14.8")
 		h.runUntil("a node is asked to pull", func() bool { return len(h.scenario.CallsFor(fake.MethodImagePull)) > 0 })
 		Expect(h.operation().Type).To(Equal(talosv1alpha1.OperationTalosUpgrade))
+	})
+
+	// Secure Boot (docs/scope.md §7.3): a machine whose firmware enforces it boots only what that
+	// firmware trusts, and an upgrade is about to give it something else to boot.
+	Context("with Secure Boot on", func() {
+		var (
+			signer   *x509.Certificate
+			stranger *x509.Certificate
+			factory  *catalog.Fake
+		)
+
+		// trusting is a firmware that trusts whoever signs the installer's boot image; pinned is
+		// the one that trusts another certificate and the hashes of the images it has, as a
+		// machine does whose images were enrolled one by one.
+		trusting := func() talos.SecureBootDB { return talos.SecureBootDB{Certificates: [][]byte{signer.Raw}} }
+		pinned := func() talos.SecureBootDB { return talos.SecureBootDB{Certificates: [][]byte{stranger.Raw}, Hashes: 6} }
+
+		firmware := func(machine string, db talos.SecureBootDB) {
+			h.scenario.UpdateNode(h.node(machine).addr, func(n *fake.Node) { n.SecureBoot, n.SecureBootDB = true, db })
+		}
+
+		// upgradeSigned asks for another Talos version from the installer whose boot image is signed.
+		upgradeSigned := func(version string) {
+			GinkgoHelper()
+
+			h.updateCluster(func(tc *talosv1alpha1.TalosCluster) {
+				tc.Spec.Versions.Talos = version
+				tc.Spec.ConfigGeneration.Installer.SecureBoot = true
+				tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled
+			})
+		}
+
+		untouched := func() {
+			GinkgoHelper()
+
+			Expect(h.operation()).To(BeNil())
+			Expect(h.scenario.CallsFor(fake.MethodImagePull)).To(BeEmpty())
+			Expect(h.scenario.CallsFor(fake.MethodInstall)).To(BeEmpty())
+			Expect(h.scenario.CallsFor(fake.MethodReboot)).To(BeEmpty())
+		}
+
+		pulling := func() bool { return len(h.scenario.CallsFor(fake.MethodImagePull)) > 0 }
+
+		BeforeEach(func() {
+			signer = talostest.SigningCertificate(GinkgoT(), "Image signing", nil).Certificate
+			stranger = talostest.SigningCertificate(GinkgoT(), "A boot stick's authority", nil).Certificate
+			factory = &catalog.Fake{Signer: signer}
+			h.reconciler.Signers = &catalog.Cached{Source: factory, Now: func() time.Time { return h.clock }}
+
+			for _, n := range rolloutNodes {
+				firmware(n.name, trusting())
+			}
+		})
+
+		It("refuses to touch any node while one would not boot the new system, and upgrades them all once it would", func() {
+			firmware(worker2, pinned())
+
+			upgradeSigned(newerTalosVersion)
+			h.advance(time.Hour)
+
+			By("refusing the upgrade of every node, the ones that would boot it included")
+			untouched()
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(And(
+				ContainSubstring(worker2+": its firmware has Secure Boot on and does not trust"),
+				ContainSubstring(talos.CertificateFingerprint(signer)),
+				ContainSubstring("A boot stick's authority"), ContainSubstring("6 single image(s)"),
+				ContainSubstring("factory.talos.dev/secureboot/signing-cert.pem"),
+			))
+			Expect(upToDate().Message).NotTo(ContainSubstring(worker1 + ":"))
+			Expect(h.blocked().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+
+			By("asking the Image Factory once, however long the refusal stands")
+			Expect(factory.Asked).To(Equal(1))
+
+			By("upgrading every node once the certificate is in the firmware")
+			firmware(worker2, trusting())
+			h.runUntil("a node is asked to pull", pulling)
+			Expect(h.operation().Type).To(Equal(talosv1alpha1.OperationTalosUpgrade))
+			Expect(h.operation().Plan).To(Equal([]string{worker1, worker2, cp1Machine}))
+			Expect(h.operation().Targets[worker2]).To(ContainSubstring("/metal-installer-secureboot/"))
+			Expect(factory.Asked).To(Equal(1))
+		})
+
+		It("upgrades the other nodes around a machine that is on hold", func() {
+			firmware(worker2, pinned())
+
+			tm := h.machine(worker2)
+			tm.Spec.Hold = true
+			Expect(k8sClient.Update(ctx, tm)).To(Succeed())
+
+			upgradeSigned(newerTalosVersion)
+			h.runUntil("a node is asked to pull", pulling)
+			Expect(h.operation().Plan).To(Equal([]string{worker1, cp1Machine}))
+			Expect(h.scenario.CallsFor(fake.MethodSecureBootDB)).NotTo(ContainElement(HaveField("Node", worker2Addr)),
+				"a machine that is not upgraded is not asked about")
+		})
+
+		It("does not start while it cannot be told whether every node would boot the new system", func() {
+			By("an Image Factory that does not answer")
+			factory.Err = errors.New("no route to host")
+
+			upgradeSigned(newerTalosVersion)
+			h.advance(time.Hour)
+
+			untouched()
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonUnverified))
+			Expect(upToDate().Message).To(And(ContainSubstring("could not be asked which certificate"), ContainSubstring("no route to host")))
+			Expect(h.blocked().Reason).To(Equal(talosv1alpha1.ReasonUnverified))
+
+			By("a node whose firmware cannot be read")
+			factory.Err = nil
+			h.scenario.FailNext(fake.MethodSecureBootDB, cpAddr, status.Error(codes.NotFound, "no such file"))
+			h.advance(time.Hour)
+
+			untouched()
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonUnverified))
+			Expect(upToDate().Message).To(ContainSubstring(cp1Machine + ": what its firmware trusts to boot could not be read"))
+
+			By("starting once both answer")
+			h.scenario.FailNext(fake.MethodSecureBootDB, cpAddr, nil)
+			h.runUntil("a node is asked to pull", pulling)
+			Expect(h.operation().Type).To(Equal(talosv1alpha1.OperationTalosUpgrade))
+		})
+
+		It("refuses the installer whose boot image nobody signed, without asking anyone", func() {
+			upgradeTo(newerTalosVersion)
+			h.advance(time.Hour)
+
+			untouched()
+			Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(upToDate().Message).To(And(ContainSubstring("the boot image of "+newerImage+" is not signed"),
+				ContainSubstring(worker1+":"), ContainSubstring(cp1Machine+":")))
+			Expect(factory.Asked).To(BeZero())
+			Expect(h.scenario.CallsFor(fake.MethodSecureBootDB)).To(BeEmpty())
+
+			// A pool says so for its own machines; the others stay refused, and with them the upgrade.
+			for _, pool := range []string{poolFor(talosv1alpha1.MachineRoleWorker), poolFor(talosv1alpha1.MachineRoleControlPlane)} {
+				h.advance(time.Minute)
+				untouched()
+
+				p := &talosv1alpha1.TalosMachinePool{}
+				Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: h.ns, Name: pool}, p)).To(Succeed())
+				p.Spec.Installer = &talosv1alpha1.PoolInstaller{SecureBoot: new(true)}
+				Expect(k8sClient.Update(ctx, p)).To(Succeed())
+			}
+
+			h.runUntil("a node is asked to pull", pulling)
+			Expect(h.operation().Targets[worker1]).To(ContainSubstring("/metal-installer-secureboot/"))
+		})
+	})
+
+	It("asks nobody outside the cluster to upgrade machines without Secure Boot", func() {
+		factory := &catalog.Fake{}
+		h.reconciler.Signers = factory
+
+		upgradeTo(newerTalosVersion)
+		h.runUntil("a node is asked to pull", func() bool { return len(h.scenario.CallsFor(fake.MethodImagePull)) > 0 })
+
+		Expect(factory.Asked).To(BeZero())
+		Expect(h.scenario.CallsFor(fake.MethodSecureBootDB)).To(BeEmpty())
 	})
 
 	It("leaves the node the operator runs on for last", func() {

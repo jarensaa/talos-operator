@@ -297,7 +297,7 @@ func (r *TalosClusterReconciler) installerProblem(ctx context.Context, tc *talos
 	ctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
 	defer cancel()
 
-	err := r.Catalog.Installer(ctx, installer.FactoryURL, installer.Platform, install.SchematicID, install.Version)
+	err := r.Catalog.Installer(ctx, install.FactoryURL, installer.Platform, install.SchematicID, install.Version, install.SecureBoot)
 	if errors.Is(err, catalog.ErrNotFound) {
 		return err.Error()
 	}

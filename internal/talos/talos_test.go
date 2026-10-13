@@ -47,6 +47,9 @@ var readerMethods = []string{
 	"UnattendedInstallStatus", "Version",
 	// What Talos and etcd say about themselves, and the end of a node's logs: all read.
 	"Diagnostics", "Dmesg", "Links", "Logs", "TimeSynced", "Volumes",
+	// What a node's firmware says about Secure Boot: a resource, and the one file the allowlist
+	// lets MachineService.Read through for.
+	"SecureBoot", "SecureBootDB",
 }
 
 func TestReaderMethodSetIsReviewed(t *testing.T) {
@@ -85,6 +88,15 @@ func TestCheckReadOnly(t *testing.T) {
 		{"apply", machineapi.MachineService_ApplyConfiguration_FullMethodName, &machineapi.ApplyConfigurationRequest{}, false},
 		{"apply without typed request", machineapi.MachineService_ApplyConfiguration_FullMethodName, nil, false},
 		{"bootstrap", machineapi.MachineService_Bootstrap_FullMethodName, &machineapi.BootstrapRequest{}, false},
+		// Read reads any file of a node. The firmware's Secure Boot db is the one it may be asked for.
+		{"read the Secure Boot db", machineapi.MachineService_Read_FullMethodName, &machineapi.ReadRequest{Path: SecureBootDBPath}, true},
+		{"read another firmware variable", machineapi.MachineService_Read_FullMethodName,
+			&machineapi.ReadRequest{Path: "/sys/firmware/efi/efivars/PK-8be4df61-93ca-11d2-aa0d-00e098032b8c"}, false},
+		{"read a file that holds secrets", machineapi.MachineService_Read_FullMethodName,
+			&machineapi.ReadRequest{Path: "/system/state/config.yaml"}, false},
+		{"read a path that only starts like the db", machineapi.MachineService_Read_FullMethodName,
+			&machineapi.ReadRequest{Path: SecureBootDBPath + "/../../../../../system/state/config.yaml"}, false},
+		{"read without typed request", machineapi.MachineService_Read_FullMethodName, nil, false},
 	})
 }
 
@@ -174,6 +186,69 @@ func TestStreamInterceptorRejectsBeforeOpening(t *testing.T) {
 	_, err = accessReadOnly.streamInterceptor()(context.Background(), &grpc.StreamDesc{}, nil, cosiWatchMethod, streamer)
 	if err != nil || !opened {
 		t.Fatalf("allowed stream: err=%v opened=%v", err, opened)
+	}
+}
+
+// sentStream records what was sent on it.
+type sentStream struct {
+	grpc.ClientStream
+
+	sent []any
+}
+
+func (s *sentStream) SendMsg(m any) error {
+	s.sent = append(s.sent, m)
+
+	return nil
+}
+
+// Read is allowed for one path, and what it is asked for is only known when the request is sent:
+// a request for anything else never leaves, and its stream is given up.
+func TestStreamInterceptorChecksTheRequestOfARead(t *testing.T) {
+	var (
+		under    = &sentStream{}
+		streamed context.Context
+	)
+
+	var streamer grpc.Streamer = func(
+		ctx context.Context, _ *grpc.StreamDesc, _ *grpc.ClientConn, _ string, _ ...grpc.CallOption,
+	) (grpc.ClientStream, error) {
+		streamed = ctx
+
+		return under, nil
+	}
+
+	open := func(a access) grpc.ClientStream {
+		t.Helper()
+
+		stream, err := a.streamInterceptor()(context.Background(), &grpc.StreamDesc{}, nil,
+			machineapi.MachineService_Read_FullMethodName, streamer)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return stream
+	}
+
+	stream := open(accessReadOnly)
+
+	if err := stream.SendMsg(&machineapi.ReadRequest{Path: "/system/state/config.yaml"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a read of another file must be refused, got %v", err)
+	}
+
+	if len(under.sent) != 0 || streamed.Err() == nil {
+		t.Fatalf("a refused request must not be sent, and its stream must be given up: sent %v, stream %v", under.sent, streamed.Err())
+	}
+
+	stream = open(accessReadOnly)
+
+	if err := stream.SendMsg(&machineapi.ReadRequest{Path: SecureBootDBPath}); err != nil || len(under.sent) != 1 || streamed.Err() != nil {
+		t.Fatalf("the read of the Secure Boot db must be sent: err %v, sent %v, stream %v", err, under.sent, streamed.Err())
+	}
+
+	// A machine in maintenance mode is read through resources and nothing else.
+	if err := open(accessMaintenance).SendMsg(&machineapi.ReadRequest{Path: SecureBootDBPath}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a maintenance connection reads no file, got %v", err)
 	}
 }
 

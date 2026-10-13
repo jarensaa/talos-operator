@@ -18,6 +18,7 @@ package catalog
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"sync"
@@ -101,12 +102,19 @@ func (c *Cached) TalosVersions(ctx context.Context, factoryURL string) ([]string
 }
 
 // Installer implements Source.
-func (c *Cached) Installer(ctx context.Context, factoryURL, platform, schematic, talosVersion string) error {
-	_, err := remember(c, fmt.Sprintf("installer %s %s %s %s", factoryURL, platform, schematic, talosVersion), func() (struct{}, error) {
-		return struct{}{}, c.Source.Installer(ctx, factoryURL, platform, schematic, talosVersion)
+func (c *Cached) Installer(ctx context.Context, factoryURL, platform, schematic, talosVersion string, secureBoot bool) error {
+	key := fmt.Sprintf("installer %s %s %s %s %t", factoryURL, platform, schematic, talosVersion, secureBoot)
+
+	_, err := remember(c, key, func() (struct{}, error) {
+		return struct{}{}, c.Source.Installer(ctx, factoryURL, platform, schematic, talosVersion, secureBoot)
 	})
 
 	return err
+}
+
+// SecureBootSigner implements Signer.
+func (c *Cached) SecureBootSigner(ctx context.Context, factoryURL string) (*x509.Certificate, error) {
+	return remember(c, "signer "+factoryURL, func() (*x509.Certificate, error) { return c.Source.SecureBootSigner(ctx, factoryURL) })
 }
 
 // KubernetesLatest implements Source.
@@ -136,6 +144,8 @@ type Fake struct {
 	// Tags holds the tags that exist: an image exists if its tag does, whatever its name. The
 	// newest releases in Latest exist as "v<release>".
 	Tags map[string]bool
+	// Signer is the certificate Image Factory signs boot images with; nil means it has none.
+	Signer *x509.Certificate
 	// Err makes every question fail: the source cannot be reached.
 	Err error
 	// Asked counts the questions.
@@ -163,7 +173,7 @@ func (f *Fake) TalosVersions(context.Context, string) ([]string, error) {
 }
 
 // Installer implements Source.
-func (f *Fake) Installer(_ context.Context, _, _, schematic, talosVersion string) error {
+func (f *Fake) Installer(_ context.Context, _, _, schematic, talosVersion string, _ bool) error {
 	if err := f.asked(); err != nil {
 		return err
 	}
@@ -173,6 +183,19 @@ func (f *Fake) Installer(_ context.Context, _, _, schematic, talosVersion string
 	}
 
 	return nil
+}
+
+// SecureBootSigner implements Signer.
+func (f *Fake) SecureBootSigner(context.Context, string) (*x509.Certificate, error) {
+	if err := f.asked(); err != nil {
+		return nil, err
+	}
+
+	if f.Signer == nil {
+		return nil, fmt.Errorf("Image Factory has no Secure Boot signing certificate: %w", ErrNotFound)
+	}
+
+	return f.Signer, nil
 }
 
 // KubernetesLatest implements Source.

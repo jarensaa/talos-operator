@@ -41,6 +41,8 @@ type nodeFacts struct {
 	schematicID  *string
 	// bootID changes with every boot; empty when it was not read.
 	bootID string
+	// secureBoot is whether the node's firmware enforces Secure Boot; nil when it was not read.
+	secureBoot *bool
 	// persistentConfig is the raw persistent config; nil when the node has none, as after
 	// booting from disk. The same care applies as for activeConfig.
 	persistentConfig []byte

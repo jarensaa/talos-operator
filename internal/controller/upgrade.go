@@ -17,7 +17,9 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"maps"
@@ -59,12 +61,84 @@ func (r *TalosClusterReconciler) upgradeMachine(ctx context.Context, tc *talosv1
 	out.HostsOperator = r.NodeName != "" && m.kubernetesNode() == r.NodeName
 
 	if !yes {
-		if out.Problem = talos.UpgradeProblem(m.node.version, m.install.Version, obs.kubernetes); out.Problem == "" {
+		out.Problem = cmp.Or(
+			talos.UpgradeProblem(m.node.version, m.install.Version, obs.kubernetes),
+			talos.SecureBootInstallerProblem(*m.node.secureBoot, m.install.SecureBoot, m.install.Image),
+		)
+		if out.Problem == "" {
 			out.Problem = r.installerProblem(ctx, tc, m.install)
 		}
 	}
 
 	return out
+}
+
+// secureBootPreflight asks, of every machine an upgrade is about to touch whose firmware has
+// Secure Boot on, whether that firmware boots the system the upgrade installs, and writes the
+// answer into the planner's view of the machine (docs/scope.md §7.3). The firmware's db is read
+// from the node, and the certificate the installer's boot image is signed with is asked of the
+// Image Factory the installer comes from: nothing in the cluster knows it. That is why this runs
+// when an upgrade may otherwise start and at no other time, and why not knowing holds the
+// upgrade up: the node that does not boot would be found at its reboot.
+func (r *TalosClusterReconciler) secureBootPreflight(ctx context.Context, obs observation, f *fleet, planned []plan.UpgradeMachine,
+	pending []string,
+) {
+	ctx, cancel := context.WithTimeout(ctx, upstreamTimeout)
+	defer cancel()
+
+	// One Image Factory signs for every pool of a cluster; it is asked once.
+	type answer struct {
+		signer *x509.Certificate
+		err    error
+	}
+
+	signers := map[string]answer{}
+
+	signer := func(factoryURL string) (*x509.Certificate, error) {
+		if r.Signers == nil {
+			return nil, errors.New("this operator has nothing to ask with")
+		}
+
+		if _, asked := signers[factoryURL]; !asked {
+			cert, err := r.Signers.SecureBootSigner(ctx, factoryURL)
+			signers[factoryURL] = answer{signer: cert, err: err}
+		}
+
+		return signers[factoryURL].signer, signers[factoryURL].err
+	}
+
+	for i := range planned {
+		out := &planned[i]
+
+		m := f.of(f.member(out.Name))
+		if !slices.Contains(pending, out.Name) || m.node == nil || m.node.secureBoot == nil || !*m.node.secureBoot {
+			continue
+		}
+
+		var db talos.SecureBootDB
+
+		reads := newNodeReads(ctx, m.node.address)
+		if !reads.read("Secure Boot db", func(ctx context.Context) (err error) {
+			db, err = obs.reader.SecureBootDB(ctx, m.node.address)
+
+			return err
+		}) {
+			out.Unverified = "what its firmware trusts to boot could not be read: " + reads.reason()
+
+			continue
+		}
+
+		cert, err := signer(m.install.FactoryURL)
+		if err != nil {
+			out.Unverified = fmt.Sprintf(
+				"its firmware has Secure Boot on, and %s could not be asked which certificate it signs boot images with: %v",
+				m.install.FactoryURL, err)
+
+			continue
+		}
+
+		out.Problem = talos.SecureBootTrustProblem(db, cert, m.install.FactoryURL)
+	}
 }
 
 // planUpgrade owns TalosUpToDate while no operation is in flight: it asks the planner whether an
@@ -94,9 +168,18 @@ func (r *TalosClusterReconciler) planUpgrade(ctx context.Context, tc *talosv1alp
 	})
 
 	holds := held(tc, talosv1alpha1.OperationTalosUpgrade)
-	result := plan.PlanUpgrade(planned, plan.UpgradeSettings{Skipped: holds.Skipped, Aborted: holds.Aborted, Policy: obs.policy}, passOf(obs))
+	settings := plan.UpgradeSettings{Skipped: holds.Skipped, Aborted: holds.Aborted, Policy: obs.policy}
+	result := plan.PlanUpgrade(planned, settings, passOf(obs))
 
-	// So does an abort.
+	// Nothing else stands in the way: now, and only now, every machine of the plan is asked
+	// whether it would boot what it is about to be given. The planner decides again with the
+	// answers, and one machine that would not refuses the upgrade of all of them.
+	if result.MayStart() {
+		r.secureBootPreflight(ctx, obs, f, planned, result.Pending)
+		result = plan.PlanUpgrade(planned, settings, passOf(obs))
+	}
+
+	// An abort covers one installer too, and is spent the same way.
 	if !result.AbortStands {
 		hold(tc, talosv1alpha1.OperationTalosUpgrade, func(h *talosv1alpha1.Holds) { clear(h.Aborted) })
 	}

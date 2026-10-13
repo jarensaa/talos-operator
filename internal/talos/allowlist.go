@@ -126,9 +126,19 @@ func notAllowed(method string) string {
 // Any other mode is refused even as a dry run, because Talos cancels a pending TRY rollback
 // before it checks DryRun (v1alpha1_server.go:203-205 in Talos v1.14), which would disarm the
 // rollback that protects an in-flight config change (§8.5).
+//
+// MachineService.Read reads any file of a node, its secrets included. It is let through for one
+// path: the firmware's Secure Boot db, which holds certificates and hashes and nothing secret
+// (§7.3).
 func checkReadOnly(method string, req any) string {
 	if readOnlyMethods[method] {
 		return ""
+	}
+
+	if method == machineapi.MachineService_Read_FullMethodName {
+		if read, ok := req.(*machineapi.ReadRequest); ok && read.GetPath() == SecureBootDBPath {
+			return ""
+		}
 	}
 
 	if method == machineapi.MachineService_ApplyConfiguration_FullMethodName {
@@ -199,17 +209,56 @@ func (a access) unaryInterceptor() grpc.UnaryClientInterceptor {
 	}
 }
 
-// streamInterceptor checks the method before the stream opens. No streaming RPC is conditionally
-// allowed, so the request message does not need inspecting.
+// requestDecides are the streaming RPCs that are allowed for some requests only. Their request is
+// checked when it is sent, which is after the stream opened: nothing has reached the node's
+// handler by then, and nothing does when the request is refused.
+var requestDecides = map[string]bool{
+	machineapi.MachineService_Read_FullMethodName: true,
+}
+
+// streamInterceptor checks the method before the stream opens, and for the RPCs in requestDecides
+// the request before it is sent.
 func (a access) streamInterceptor() grpc.StreamClientInterceptor {
 	return func(
 		ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string,
 		streamer grpc.Streamer, opts ...grpc.CallOption,
 	) (grpc.ClientStream, error) {
-		if err := a.check(method, nil); err != nil {
+		if !requestDecides[method] {
+			if err := a.check(method, nil); err != nil {
+				return nil, err
+			}
+
+			return streamer(ctx, desc, cc, method, opts...)
+		}
+
+		// A stream whose request is refused is given up at once, not when its caller's context ends.
+		ctx, cancel := context.WithCancel(ctx)
+
+		stream, err := streamer(ctx, desc, cc, method, opts...)
+		if err != nil {
+			cancel()
+
 			return nil, err
 		}
 
-		return streamer(ctx, desc, cc, method, opts...)
+		return &checkedStream{ClientStream: stream, cancel: cancel, check: func(req any) error { return a.check(method, req) }}, nil
 	}
+}
+
+// checkedStream sends only the requests its check lets through.
+type checkedStream struct {
+	grpc.ClientStream
+
+	cancel context.CancelFunc
+	check  func(req any) error
+}
+
+func (s *checkedStream) SendMsg(m any) error {
+	if err := s.check(m); err != nil {
+		s.cancel()
+
+		return err
+	}
+
+	return s.ClientStream.SendMsg(m)
 }

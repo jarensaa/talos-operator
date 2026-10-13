@@ -15,10 +15,17 @@ limitations under the License.
 */
 
 // Package talostest provides Talos fixtures for tests: a shared throwaway secrets bundle, the
-// talosconfigs signed by it, and the machine configs of a made-up cluster generated from it.
+// talosconfigs signed by it, the machine configs of a made-up cluster generated from it, and
+// certificates of the kind firmware is told to trust.
 package talostest
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"sync"
 	"time"
 
@@ -92,4 +99,48 @@ func AdminTalosconfig(t T, endpoints ...string) []byte {
 	t.Helper()
 
 	return Talosconfig(t, role.MakeSet(role.Admin), time.Hour, endpoints...)
+}
+
+// Authority is a certificate and the key that signs with it.
+type Authority struct {
+	Certificate *x509.Certificate
+	key         *ecdsa.PrivateKey
+}
+
+// SigningCertificate returns a certificate made for the test, of the kind boot images are signed
+// with: self-signed, or issued by issuer if one is given.
+func SigningCertificate(t T, commonName string, issuer *Authority) *Authority {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+
+	parent, signer := template, key
+	if issuer != nil {
+		parent, signer = issuer.Certificate, issuer.key
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, parent, &key.PublicKey, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return &Authority{Certificate: cert, key: key}
 }

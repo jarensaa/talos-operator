@@ -139,6 +139,12 @@ type Installer struct {
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	// +optional
 	SchematicID string `json:"schematicID,omitempty"`
+
+	// SecureBoot asks for the installer whose boot image Image Factory signs
+	// (<platform>-installer-secureboot). A machine whose firmware has Secure Boot on boots nothing
+	// else, and is not upgraded with any other installer.
+	// +optional
+	SecureBoot bool `json:"secureBoot,omitempty"`
 }
 
 // GenerationOptions are the generate.Input options that differ from talosctl defaults.

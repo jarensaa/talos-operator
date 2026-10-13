@@ -154,6 +154,15 @@ var allowedOn = []struct {
 	{"a service's log", machineapi.MachineService_Logs_FullMethodName, &machineapi.LogsRequest{}, credentialed},
 	{"the kernel's log", machineapi.MachineService_Dmesg_FullMethodName, &machineapi.DmesgRequest{}, credentialed},
 	{"the cluster's health check", clusterapi.ClusterService_HealthCheck_FullMethodName, &clusterapi.HealthCheckRequest{}, credentialed},
+	// Read reads any file of a node, its secrets included. The firmware's Secure Boot db, which
+	// holds none, is the one path it is let through for.
+	{"reading the Secure Boot db", machineapi.MachineService_Read_FullMethodName, &machineapi.ReadRequest{Path: SecureBootDBPath},
+		credentialed},
+	{"reading another firmware variable", machineapi.MachineService_Read_FullMethodName,
+		&machineapi.ReadRequest{Path: "/sys/firmware/efi/efivars/PK-8be4df61-93ca-11d2-aa0d-00e098032b8c"}, nil},
+	{"reading a file that holds secrets", machineapi.MachineService_Read_FullMethodName,
+		&machineapi.ReadRequest{Path: "/system/state/config.yaml"}, nil},
+	{"reading without a request", machineapi.MachineService_Read_FullMethodName, nil, nil},
 	// The one apply that changes nothing: a dry run, in the one mode that leaves a pending try alone.
 	{"a dry run in try mode", machineapi.MachineService_ApplyConfiguration_FullMethodName,
 		apply(machineapi.ApplyConfigurationRequest_TRY, true), credentialed},

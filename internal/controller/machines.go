@@ -192,9 +192,10 @@ func (m boundMachine) running() bool {
 }
 
 // installed reports whether the node's version and schematic were read, and whether they are the
-// ones the spec asks for.
+// ones the spec asks for. A node whose firmware was not asked about Secure Boot is not known
+// either: what it would boot decides whether it may be upgraded at all.
 func (m boundMachine) installed() (known, yes bool) {
-	if m.node == nil || m.node.version == "" || m.node.schematicID == nil || m.install.Image == "" {
+	if m.node == nil || m.node.version == "" || m.node.schematicID == nil || m.node.secureBoot == nil || m.install.Image == "" {
 		return false, false
 	}
 

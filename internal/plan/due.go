@@ -74,6 +74,8 @@ const (
 	BlockInvalid = talosv1alpha1.ReasonInvalidRollout
 	// BlockIncompatible: a node cannot be taken to the version or installer its spec asks for.
 	BlockIncompatible = talosv1alpha1.ReasonIncompatible
+	// BlockUnverified: whether a node would boot what its spec asks for could not be told.
+	BlockUnverified = talosv1alpha1.ReasonUnverified
 	// BlockNotAtRest: the cluster does not run what its spec asks for, so a machine that is added
 	// would join on something else than its peers run.
 	BlockNotAtRest = talosv1alpha1.ReasonNotAtRest

@@ -28,6 +28,12 @@ type PoolInstaller struct {
 	// +kubebuilder:validation:Pattern=`^[0-9a-f]{64}$`
 	// +optional
 	SchematicID string `json:"schematicID,omitempty"`
+
+	// SecureBoot overrides whether the pool's machines are installed from the installer whose
+	// boot image is signed, e.g. for a pool of machines whose firmware has Secure Boot on in a
+	// cluster where the others have not.
+	// +optional
+	SecureBoot *bool `json:"secureBoot,omitempty"`
 }
 
 // TalosMachinePoolSpec defines the desired state of TalosMachinePool.
