@@ -50,7 +50,7 @@ const adoptionManager = "talos-operator-adoption"
 // the resources are the user's and the operator never writes a spec again. Nothing takes it back
 // (docs/scope.md §12.14).
 func adopted(tc *talosv1alpha1.TalosCluster) bool {
-	return managing(tc) || (tc.Status.Adoption != nil && tc.Status.Adoption.AdoptedAt != nil)
+	return tc.Spec.Management.ManagesConfig() || (tc.Status.Adoption != nil && tc.Status.Adoption.AdoptedAt != nil)
 }
 
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=create
@@ -432,7 +432,7 @@ func liveNodes(facts *clusterFacts) ([]adopt.LiveNode, []string) {
 		}
 
 		role := talosmachine.TypeWorker
-		if n.machineType == machineTypeControlPlane {
+		if n.machineType == talos.MachineTypeControlPlane {
 			role = talosmachine.TypeControlPlane
 		}
 

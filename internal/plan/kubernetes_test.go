@@ -191,17 +191,17 @@ func TestPlanKubernetesOrder(t *testing.T) {
 		t.Fatalf("got %v (%s: %s)\nwant %v", got.Pending, got.BlockReason, got.BlockMessage, want)
 	}
 
-	if got.Images["kube-apiserver/cp1"] != "registry.k8s.io/kube-apiserver:v1.37.1" ||
-		got.Images["kubelet/w2"] != "ghcr.io/siderolabs/kubelet:v1.37.1" ||
-		len(got.Images) != len(want) {
-		t.Fatalf("images: %v", got.Images)
+	if got.Targets["kube-apiserver/cp1"] != "registry.k8s.io/kube-apiserver:v1.37.1" ||
+		got.Targets["kubelet/w2"] != "ghcr.io/siderolabs/kubelet:v1.37.1" ||
+		len(got.Targets) != len(want) {
+		t.Fatalf("images: %v", got.Targets)
 	}
 
 	if want := []string{kubeCP1, "cp2", "w1", "w2"}; !slices.Equal(got.Behind, want) {
 		t.Fatalf("behind: got %v, want %v", got.Behind, want)
 	}
 
-	for key := range got.Images {
+	for key := range got.Targets {
 		component, machine := SplitTurn(key)
 		if TurnKey(component, machine) != key || component == "" {
 			t.Fatalf("turn key %q does not split into a component and a machine", key)
@@ -233,7 +233,7 @@ func TestPlanKubernetesOrder(t *testing.T) {
 	// image its rendered config names.
 	far := PlanKubernetes([]KubernetesMachine{kubeControlPlane(kubeCP1, "1.35.4", kubeNew), kubeWorker("w1", "1.35.4", kubeNew)},
 		KubernetesSettings{}, healthyPass())
-	if far.Hop.Version != "1.36.0" || far.Images["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.0" || len(far.Pending) != 6 {
+	if far.Hop.Version != "1.36.0" || far.Targets["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.0" || len(far.Pending) != 6 {
 		t.Fatalf("far: %+v", far)
 	}
 
@@ -268,7 +268,7 @@ func TestPlanKubernetesBlocks(t *testing.T) {
 			healthyPass(), BlockIncompatible, "v1.13.0"},
 		{"the checks did not run", cluster(), KubernetesSettings{Unchecked: "cp1 did not answer"}, healthyPass(), BlockNotCurrent,
 			"cp1 did not answer"},
-		{wordPaused, cluster(), KubernetesSettings{Paused: true}, healthyPass(), BlockPaused, wordPaused},
+		{wordPaused, cluster(), KubernetesSettings{Policy: pausedPolicy}, healthyPass(), BlockPaused, wordPaused},
 		{"outside the windows", cluster(), KubernetesSettings{Policy: Policy{OutsideWindow: wordOutside}}, healthyPass(), BlockOutsideWindow,
 			wordOutside},
 		{"a gate of the user's", cluster(), KubernetesSettings{Policy: Policy{GateClosed: "gate ceph"}}, healthyPass(), BlockGateClosed,
@@ -288,7 +288,7 @@ func TestPlanKubernetesBlocks(t *testing.T) {
 			m[2].Images[ComponentKubelet] = KubernetesImage{Live: "ghcr.io/siderolabs/kubelet:latest", Desired: kubeImage(ComponentKubelet, kubeNew)}
 		}), KubernetesSettings{}, healthyPass(), BlockIncompatible, "names no version"},
 		// What cannot work is said before what is merely not yet.
-		{"incompatible and paused", cluster(), KubernetesSettings{Paused: true, Problems: []string{"a removed flag"}}, healthyPass(),
+		{"incompatible and paused", cluster(), KubernetesSettings{Policy: pausedPolicy, Problems: []string{"a removed flag"}}, healthyPass(),
 			BlockIncompatible, "a removed flag"},
 	}
 
@@ -327,7 +327,7 @@ func TestPlanKubernetesBlocks(t *testing.T) {
 }
 
 func TestNextKubernetesStep(t *testing.T) {
-	pulling := Step{Name: StepPulling, Tried: true, PreviousHash: prev, DesiredHash: desired, Since: t0}
+	pulling := Step{Name: StepPulling, PreviousHash: prev, DesiredHash: desired, Since: t0}
 	late := t0.Add(timing.StepTimeout)
 
 	tests := []struct {

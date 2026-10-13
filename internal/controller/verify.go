@@ -55,7 +55,7 @@ const (
 //
 // The planner requires all of it to hold without interruption for the soak. Only API errors of
 // the management cluster are returned.
-func (r *TalosClusterReconciler) verifyNode(ctx context.Context, obs observation, v machineView, since, now time.Time) (plan.Gate, error) {
+func (r *TalosClusterReconciler) verifyNode(ctx context.Context, obs observation, m boundMachine, since, now time.Time) (plan.Gate, error) {
 	closed := func(format string, args ...any) (plan.Gate, error) {
 		return plan.Gate{Reason: fmt.Sprintf(format, args...)}, nil
 	}
@@ -64,10 +64,7 @@ func (r *TalosClusterReconciler) verifyNode(ctx context.Context, obs observation
 		return gate, nil
 	}
 
-	name := v.node.hostname
-	if id := v.tm.Status.Identity; id != nil && id.KubernetesNodeName != "" {
-		name = id.KubernetesNodeName
-	}
+	name := m.kubernetesNode()
 
 	node := &corev1.Node{}
 	if err := r.Get(ctx, client.ObjectKey{Name: name}, node); err != nil {

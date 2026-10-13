@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package talostest provides Talos credential fixtures for tests: a shared throwaway secrets
-// bundle and talosconfigs signed by it, and certificates of the kind firmware is told to trust.
+// Package talostest provides Talos fixtures for tests: a shared throwaway secrets bundle, the
+// talosconfigs signed by it, the machine configs of a made-up cluster generated from it, and
+// certificates of the kind firmware is told to trust.
 package talostest
 
 import (

@@ -75,6 +75,69 @@ func Recover(cfg config.Provider, contract *config.VersionContract) (*secrets.Bu
 	return b, nil
 }
 
+// authority is one of the certificate authorities a bundle holds.
+type authority struct {
+	// name is how status.certificates lists the authority, field how a mismatch names it.
+	name, field string
+	// pem returns its certificate and its key as the bundle has them: nothing of what it lacks.
+	pem func(*secrets.Certs) (crt, key []byte)
+}
+
+// authorities are the authorities of a bundle, in the order a bundle that lacks some names them.
+// Everything that goes through a bundle's authorities goes through this list.
+var authorities = []authority{
+	{"os", fieldOSCA, func(c *secrets.Certs) ([]byte, []byte) {
+		if c.OS == nil {
+			return nil, nil
+		}
+
+		return c.OS.Crt, c.OS.Key
+	}},
+	{"etcd", fieldEtcdCA, func(c *secrets.Certs) ([]byte, []byte) {
+		if c.Etcd == nil {
+			return nil, nil
+		}
+
+		return c.Etcd.Crt, c.Etcd.Key
+	}},
+	{"kubernetes", fieldK8sCA, func(c *secrets.Certs) ([]byte, []byte) {
+		if c.K8s == nil {
+			return nil, nil
+		}
+
+		return c.K8s.Crt, c.K8s.Key
+	}},
+	{"kubernetes-aggregator", fieldAggregatorCA, func(c *secrets.Certs) ([]byte, []byte) {
+		if c.K8sAggregator == nil {
+			return nil, nil
+		}
+
+		return c.K8sAggregator.Crt, c.K8sAggregator.Key
+	}},
+}
+
+// AuthorityCertificates returns the certificate of each certificate authority of the bundle, by
+// the name status.certificates lists it under: os, kubernetes, kubernetes-aggregator and etcd. One
+// the bundle does not have, or that is not a certificate, is left out. Only the certificates are
+// read, never their keys.
+func AuthorityCertificates(b *secrets.Bundle) map[string]*x509.Certificate {
+	out := map[string]*x509.Certificate{}
+	if b == nil || b.Certs == nil {
+		return out
+	}
+
+	for _, ca := range authorities {
+		crt, _ := ca.pem(b.Certs)
+
+		if cert, err := parseCertificate(crt); err == nil {
+			out[ca.name] = cert
+		}
+	}
+
+	return out
+}
+
+// missingParts names what a bundle lacks of what a cluster's configs are generated from.
 func missingParts(b *secrets.Bundle) []string {
 	var missing []string
 
@@ -84,19 +147,35 @@ func missingParts(b *secrets.Bundle) []string {
 		}
 	}
 
-	certs := b.Certs
-	check("Talos API CA key", certs.OS != nil && len(certs.OS.Crt) > 0 && len(certs.OS.Key) > 0)
-	check("etcd CA key", certs.Etcd != nil && len(certs.Etcd.Crt) > 0 && len(certs.Etcd.Key) > 0)
-	check("Kubernetes CA key", certs.K8s != nil && len(certs.K8s.Crt) > 0 && len(certs.K8s.Key) > 0)
-	check("aggregator CA key", certs.K8sAggregator != nil && len(certs.K8sAggregator.Crt) > 0 && len(certs.K8sAggregator.Key) > 0)
+	// A bundle recovered from a config has every section. One that a person wrote into a Secret
+	// may lack any of them, or be nothing at all: a section that is not there lacks all its parts.
+	if b == nil {
+		b = &secrets.Bundle{}
+	}
+
+	certs, cluster, trustd, tokens := orEmpty(b.Certs), orEmpty(b.Cluster), orEmpty(b.TrustdInfo), orEmpty(b.Secrets)
+
+	for _, ca := range authorities {
+		crt, key := ca.pem(certs)
+		check(ca.field+" key", len(crt) > 0 && len(key) > 0)
+	}
+
 	check("service account key", certs.K8sServiceAccount != nil && len(certs.K8sServiceAccount.Key) > 0)
-	check("cluster ID", b.Cluster.ID != "")
-	check("cluster secret", b.Cluster.Secret != "")
-	check("trustd token", b.TrustdInfo.Token != "")
-	check("bootstrap token", b.Secrets.BootstrapToken != "" && b.Secrets.BootstrapToken != ".")
-	check("secretbox encryption secret", b.Secrets.SecretboxEncryptionSecret != "")
+	check("cluster ID", cluster.ID != "")
+	check("cluster secret", cluster.Secret != "")
+	check("trustd token", trustd.Token != "")
+	check("bootstrap token", tokens.BootstrapToken != "" && tokens.BootstrapToken != ".")
+	check("secretbox encryption secret", tokens.SecretboxEncryptionSecret != "")
 
 	return missing
+}
+
+func orEmpty[T any](section *T) *T {
+	if section == nil {
+		return new(T)
+	}
+
+	return section
 }
 
 // Node is one node's live config, named for error messages.
@@ -117,7 +196,14 @@ func (e *MismatchError) Error() string {
 // Verify checks that every node's config carries the bundle's secrets: all of them on control
 // planes, and the CA certificates and tokens on workers. Certificates and keys are compared by
 // public key, so re-encoded PEM still matches.
+//
+// A bundle that lacks a part is refused before anything is compared: it is not the bundle of a
+// cluster, and no config could be rendered from it.
 func Verify(b *secrets.Bundle, nodes []Node) error {
+	if missing := missingParts(b); len(missing) > 0 {
+		return fmt.Errorf("secrets bundle is incomplete: missing %s", strings.Join(missing, ", "))
+	}
+
 	want, err := fingerprints(b)
 	if err != nil {
 		return fmt.Errorf("fingerprint bundle: %w", err)
@@ -209,16 +295,15 @@ func fingerprints(b *secrets.Bundle) (fingerprintSet, error) {
 		fieldSecretbox:      hash(b.Secrets.SecretboxEncryptionSecret),
 	}}
 
-	for name, crt := range map[string][]byte{
-		fieldOSCA: b.Certs.OS.Crt, fieldEtcdCA: b.Certs.Etcd.Crt,
-		fieldK8sCA: b.Certs.K8s.Crt, fieldAggregatorCA: b.Certs.K8sAggregator.Crt,
-	} {
+	for _, ca := range authorities {
+		crt, _ := ca.pem(b.Certs)
+
 		fp, err := certFingerprint(crt)
 		if err != nil {
-			return set, fmt.Errorf("%s: %w", name, err)
+			return set, fmt.Errorf("%s: %w", ca.field, err)
 		}
 
-		set.values[name] = fp
+		set.values[ca.field] = fp
 	}
 
 	fp, err := keyFingerprint(b.Certs.K8sServiceAccount.Key)
@@ -295,16 +380,27 @@ func hash(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// certFingerprint is the SHA-256 of a PEM certificate's public key.
-func certFingerprint(pemBytes []byte) (string, error) {
+// parseCertificate parses a PEM certificate. Its errors say what the input is not, and never
+// quote it.
+func parseCertificate(pemBytes []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
-		return "", errors.New("not PEM")
+		return nil, errors.New("not PEM")
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return "", errors.New("not a certificate")
+		return nil, errors.New("not a certificate")
+	}
+
+	return cert, nil
+}
+
+// certFingerprint is the SHA-256 of a PEM certificate's public key.
+func certFingerprint(pemBytes []byte) (string, error) {
+	cert, err := parseCertificate(pemBytes)
+	if err != nil {
+		return "", err
 	}
 
 	sum := sha256.Sum256(cert.RawSubjectPublicKeyInfo)

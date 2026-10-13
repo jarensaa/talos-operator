@@ -22,22 +22,21 @@ import (
 	"time"
 
 	"github.com/robfig/cron/v3"
+
+	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 )
 
 // The rollout policy a user declares (docs/scope.md §6.4): when nodes may be changed, what else
 // must hold, and which Jobs run around an operation. This file is the part that decides; reading
 // the objects and running the Jobs is the controller's.
 
-// Block reasons of the policy.
-const (
-	// BlockOutsideWindow: no maintenance window is open.
-	BlockOutsideWindow = "OutsideWindow"
-	// BlockInvalid: spec.rollout cannot be understood.
-	BlockInvalid = "InvalidRollout"
-)
-
 // Policy is what the user's rollout policy says in this pass. The zero value allows everything.
 type Policy struct {
+	// Paused is spec.paused.
+	Paused bool
+	// Invalid says why the timings of spec.rollout cannot be used: under them a tried config
+	// could never be confirmed. Empty while they can.
+	Invalid string
 	// OutsideWindow says why no maintenance window is open: none is, or they cannot be understood.
 	// Empty while one is open, or none is declared.
 	OutsideWindow string
@@ -46,6 +45,8 @@ type Policy struct {
 	// GateClosed names the user's gate that is closed, with what it said. Empty while all are open.
 	GateClosed string
 }
+
+const paused = "spec.paused is set"
 
 // Gates is the conjunction of the user's gates. It is asked wherever the cluster's own health is.
 func (p Policy) Gates() Gate {
@@ -58,10 +59,10 @@ func (p Policy) Gates() Gate {
 
 // Hold is open while a new node may begin: nothing is paused and a maintenance window is open. A
 // node that is being changed is finished whatever it says.
-func (p Policy) Hold(paused bool) Gate {
+func (p Policy) Hold() Gate {
 	switch {
-	case paused:
-		return Gate{Reason: "spec.paused is set"}
+	case p.Paused:
+		return Gate{Reason: paused}
 	case p.OutsideWindow != "":
 		return Gate{Reason: p.OutsideWindow}
 	}
@@ -69,37 +70,21 @@ func (p Policy) Hold(paused bool) Gate {
 	return Gate{Open: true}
 }
 
-// block is the reason a due operation may not start because of when it is, or empty.
-func (p Policy) block(paused bool) (string, string) {
+// block is why no operation starts now, whatever is due: it is paused, spec.rollout cannot be
+// understood, or no maintenance window is open.
+func (p Policy) block() block {
 	switch {
-	case paused:
-		return BlockPaused, "spec.paused is set"
+	case p.Paused:
+		return block{BlockPaused, paused}
 	case p.WindowsInvalid:
-		return BlockInvalid, p.OutsideWindow
+		return block{BlockInvalid, p.OutsideWindow}
+	case p.Invalid != "":
+		return block{BlockInvalid, p.Invalid}
 	case p.OutsideWindow != "":
-		return BlockOutsideWindow, p.OutsideWindow
+		return block{BlockOutsideWindow, p.OutsideWindow}
 	}
 
-	return "", ""
-}
-
-// And is the gate that is open when both are. A closed gate keeps its own reason.
-func (g Gate) And(other Gate) Gate {
-	switch {
-	case !g.Open:
-		return g
-	case !other.Open:
-		return other
-	}
-
-	notes := make([]string, 0, 2)
-	for _, n := range []string{g.Note, other.Note} {
-		if n != "" {
-			notes = append(notes, n)
-		}
-	}
-
-	return Gate{Open: true, Note: strings.Join(notes, "; ")}
+	return block{}
 }
 
 // Window is a recurring maintenance window.
@@ -191,14 +176,6 @@ func parseWindow(w Window) (cron.Schedule, *time.Location, error) {
 // FailHook: a hook's Job failed, or did not finish in time.
 const FailHook = "HookFailed"
 
-// Run and EndHook are the actions of a hook, besides Wait and Fail.
-const (
-	// Run: create the hook's Job.
-	Run ActionKind = iota + 100
-	// EndHook: the hook's Job succeeded.
-	EndHook
-)
-
 // HookJob is what was observed of a hook's Job.
 type HookJob struct {
 	// Exists is false until the Job was created.
@@ -226,10 +203,10 @@ func NextHook(job HookJob, since time.Time, timeout time.Duration, now time.Time
 
 // Hook stages (docs/scope.md §6.4).
 const (
-	HookPreRollout  = "preRollout"
-	HookPostRollout = "postRollout"
-	HookPreNode     = "preNode"
-	HookPostNode    = "postNode"
+	HookPreRollout  = talosv1alpha1.HookPreRollout
+	HookPostRollout = talosv1alpha1.HookPostRollout
+	HookPreNode     = talosv1alpha1.HookPreNode
+	HookPostNode    = talosv1alpha1.HookPostNode
 )
 
 // Hooks is how many hooks each stage has.

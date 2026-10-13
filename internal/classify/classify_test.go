@@ -34,28 +34,17 @@ import (
 func rendered(t *testing.T, bundle *secrets.Bundle, patches ...string) *render.Config {
 	t.Helper()
 
-	return renderedAt(t, bundle, machine.TypeControlPlane, "1.37.0", patches...)
+	return renderedAt(t, bundle, machine.TypeControlPlane, talostest.KubernetesVersion, patches...)
 }
 
 // renderedAt renders a machine of the given role at a Kubernetes version.
 func renderedAt(t *testing.T, bundle *secrets.Bundle, role machine.Type, kubernetes string, patches ...string) *render.Config {
 	t.Helper()
 
-	raw := make([][]byte, 0, len(patches))
-	for _, p := range patches {
-		raw = append(raw, []byte(p))
-	}
+	in := talostest.Input(t, patches...)
+	in.Bundle, in.Role, in.KubernetesVersion = bundle, role, kubernetes
 
-	cfg, err := render.Render(render.Input{
-		ClusterName:       "c",
-		Endpoint:          "https://10.5.0.2:6443",
-		KubernetesVersion: kubernetes,
-		Contract:          config.TalosVersion1_14,
-		Bundle:            bundle,
-		Role:              role,
-		InstallImage:      "factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.2",
-		Patches:           raw,
-	})
+	cfg, err := render.Render(in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +63,7 @@ func TestClassify(t *testing.T) {
 
 	const (
 		label    = "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  example.com/zone: a\n"
-		bond     = "apiVersion: v1alpha1\nkind: BondConfig\nname: bond0\nlinks: [eth0, eth1]\nbondMode: 802.3ad\n"
+		bond     = talostest.BondPatch
 		firewall = "apiVersion: v1alpha1\nkind: NetworkDefaultActionConfig\ningress: block\n"
 		volume   = "apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: data\nprovisioning:\n" +
 			"  diskSelector:\n    match: disk.transport == \"nvme\"\n  minSize: 10GiB\n"
@@ -144,7 +133,7 @@ func TestClassify(t *testing.T) {
 // The reverse direction is the same class: removing a bond can cut a node off as adding one can.
 func TestClassifyIsSymmetric(t *testing.T) {
 	bundle := talostest.Bundle(t)
-	with := rendered(t, bundle, "apiVersion: v1alpha1\nkind: BondConfig\nname: bond0\nlinks: [eth0, eth1]\nbondMode: 802.3ad\n")
+	with := rendered(t, bundle, talostest.BondPatch)
 
 	got, err := classify.Classify(with, rendered(t, bundle))
 	if err != nil || got.Class != classify.Connectivity {
@@ -190,7 +179,7 @@ func TestClassifyInstallerImage(t *testing.T) {
 
 	installDoc := func(version, disk string) string {
 		return "apiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n" +
-			"  image: factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:" + version + "\n" +
+			"  image: " + talostest.InstallerOf(version) + "\n" +
 			"provisioning:\n  diskSelector:\n    match: disk.transport == \"" + disk + "\"\n"
 	}
 
@@ -257,11 +246,11 @@ func TestClassifyKubernetesVersion(t *testing.T) {
 		volume   = "apiVersion: v1alpha1\nkind: UserVolumeConfig\nname: data\nprovisioning:\n" +
 			"  diskSelector:\n    match: disk.transport == \"nvme\"\n  minSize: 10GiB\n"
 		installer = "apiVersion: v1alpha1\nkind: UnattendedInstallConfig\ninstaller:\n" +
-			"  image: factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:%s\n" +
+			"  image: %s\n" +
 			"provisioning:\n  diskSelector:\n    match: disk.transport == \"sata\"\n"
 	)
 
-	install := func(version string) string { return fmt.Sprintf(installer, version) }
+	install := func(version string) string { return fmt.Sprintf(installer, talostest.InstallerOf(version)) }
 
 	const kubeletImage = "v1alpha1/KubeletConfig: image"
 
@@ -311,5 +300,67 @@ func TestClassifyKubernetesVersion(t *testing.T) {
 
 	if classify.Kubernetes.NeedsApproval() {
 		t.Fatal("no approval makes a config rollout apply a Kubernetes version")
+	}
+}
+
+// A document whose fields do not say how it changed is classified as a whole: by its kind, and as
+// Unknown where it is the legacy root document, which has no class but that of its fields.
+func TestClassifyADocumentAsAWhole(t *testing.T) {
+	const (
+		kubelet = render.DocKey("v1alpha1/KubeletConfig")
+		install = render.DocKey("v1alpha1/UnattendedInstallConfig")
+	)
+
+	doc := func(key render.DocKey, body string) *render.Config {
+		cfg := &render.Config{Docs: map[render.DocKey][]byte{}}
+		if body != "" {
+			cfg.Docs[key] = []byte(body)
+		}
+
+		return cfg
+	}
+
+	tests := []struct {
+		name          string
+		key           render.DocKey
+		live, desired string
+		want          classify.Class
+	}{
+		// The same fields in another order: the bytes differ, and no field does.
+		{"the root document, no field differing", render.RootKey,
+			"machine:\n  type: worker\ncluster:\n  id: a\n", "cluster:\n  id: a\nmachine:\n  type: worker\n", classify.Unknown},
+		{"a Kubernetes component, no field differing", kubelet,
+			"image: a\nextraArgs: {b: c}\n", "extraArgs: {b: c}\nimage: a\n", classify.LiveSafe},
+		{"the installer's document, no field differing", install,
+			"installer:\n  image: a\n  disk: b\n", "installer:\n  disk: b\n  image: a\n", classify.BootTime},
+		// The image is the installer's only while nothing else in the document moves with it.
+		{"the installer's image and its disk", install,
+			"installer:\n  image: a\n  disk: b\n", "installer:\n  image: c\n  disk: d\n", classify.BootTime},
+		// A document only one of the configs has.
+		{"the root document gone", render.RootKey, "machine:\n  type: worker\n", "", classify.Protected},
+		{"a Kubernetes component appearing", kubelet, "", "image: a\n", classify.LiveSafe},
+		{"the installer's document appearing", install, "", "installer:\n  image: a\n", classify.BootTime},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := classify.Classify(doc(tt.key, tt.live), doc(tt.key, tt.desired))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The reason is the document, with no field named.
+			if got.Class != tt.want || !slices.Equal(got.Reasons, []string{string(tt.key)}) {
+				t.Fatalf("got %s (%v), want %s (%s)", got.Class, got.Reasons, tt.want, tt.key)
+			}
+		})
+	}
+
+	// A document that cannot be compared field by field is an error, and never a class.
+	for _, key := range []render.DocKey{render.RootKey, kubelet, install} {
+		_, err := classify.Classify(doc(key, "image: a\n"), doc(key, "image: [unclosed\n"))
+		if err == nil || !strings.HasPrefix(err.Error(), "compare "+string(key)+": ") {
+			t.Errorf("%s: got %v", key, err)
+		}
 	}
 }

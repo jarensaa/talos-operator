@@ -119,6 +119,14 @@ func halted(op *talosv1alpha1.Operation, what string) {
 	}
 }
 
+// expectSucceeded fails the spec unless the operation that ended succeeded, with what the
+// operation said of itself.
+func expectSucceeded(record talosv1alpha1.OperationRecord) {
+	GinkgoHelper()
+
+	Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+}
+
 func labelDocument(value string) string {
 	return "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  " + rolloutLabel + ": " + value + "\n"
 }
@@ -221,15 +229,6 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}).WithContext(ctx).WithTimeout(30 * time.Second).Should(Succeed())
 	}
 
-	// rollouts returns how many operations have ended so far.
-	rollouts := func(ctx context.Context) int {
-		GinkgoHelper()
-
-		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(tc), tc)).To(Succeed())
-
-		return len(tc.Status.History)
-	}
-
 	// lastEnded is the operation that ended last, or nothing. The history keeps only the most
 	// recent ones, so its length does not say whether another has ended.
 	lastEnded := func(ctx context.Context) string {
@@ -244,20 +243,41 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		return tc.Status.History[0].ID
 	}
 
-	// endedSince waits for an operation to end after the one named, and returns its record. One
-	// that halts instead ends the wait.
-	endedSince := func(ctx context.Context, previous, what string, timeout time.Duration) talosv1alpha1.OperationRecord {
+	// awaitEnd waits for an operation to end after the one named, and returns its record. An
+	// operation that halts stays halted until a human acts, so a halt ends the wait: unless told
+	// says that the spec is that human, and has just said how the operation is to end.
+	awaitEnd := func(ctx context.Context, previous, what string, timeout time.Duration, told bool) talosv1alpha1.OperationRecord {
 		GinkgoHelper()
 
 		Eventually(func(g Gomega) {
 			refresh(ctx, g)
-			halted(tc.Status.Operation, what)
+
+			if !told {
+				halted(tc.Status.Operation, what)
+			}
+
 			g.Expect(tc.Status.Operation).To(BeNil(), "still in flight: %+v", tc.Status.Operation)
 			g.Expect(tc.Status.History).NotTo(BeEmpty())
 			g.Expect(tc.Status.History[0].ID).NotTo(Equal(previous), "the %s has not run", what)
 		}).WithContext(ctx).WithTimeout(timeout).WithPolling(5 * time.Second).Should(Succeed())
 
 		return tc.Status.History[0]
+	}
+
+	// endedSince waits for an operation to end after the one named, and returns its record. One
+	// that halts instead ends the wait.
+	endedSince := func(ctx context.Context, previous, what string, timeout time.Duration) talosv1alpha1.OperationRecord {
+		GinkgoHelper()
+
+		return awaitEnd(ctx, previous, what, timeout, false)
+	}
+
+	// endedAsTold is endedSince for an operation that has halted, and that the spec has just told
+	// by annotation how to end: that it is halted is what was to be expected, and ends no wait.
+	endedAsTold := func(ctx context.Context, previous, what string, timeout time.Duration) talosv1alpha1.OperationRecord {
+		GinkgoHelper()
+
+		return awaitEnd(ctx, previous, what, timeout, true)
 	}
 
 	isControlPlane := func(tm *talosv1alpha1.TalosMachine) bool {
@@ -279,15 +299,41 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}).WithContext(ctx).WithTimeout(timeout).Should(Succeed())
 	}
 
-	addrsOf := func(env string) []netip.Addr {
-		fields := strings.Fields(os.Getenv(env))
-		out := make([]netip.Addr, 0, len(fields))
-
-		for _, a := range fields {
-			out = append(out, netip.MustParseAddr(a))
+	// workersOrSkip returns the harness cluster's workers, and skips the spec on a cluster that has none.
+	workersOrSkip := func() []netip.Addr {
+		workers := addrsOf("E2E_WORKERS")
+		if len(workers) == 0 {
+			Skip("the harness cluster has no worker")
 		}
 
-		return out
+		return workers
+	}
+
+	// labelled lists the Kubernetes Nodes that carry a label with that value.
+	labelled := func(ctx context.Context, g Gomega, label, value string) []corev1.Node {
+		var list corev1.NodeList
+		g.Expect(k8sClient.List(ctx, &list, client.MatchingLabels{label: value})).To(Succeed())
+
+		return list.Items
+	}
+
+	// expectLabelled waits until that many Nodes carry the rollout's label with that value: the
+	// label reached Kubernetes, so the config that sets it really took effect.
+	expectLabelled := func(ctx context.Context, value string, count int) {
+		GinkgoHelper()
+
+		Eventually(func(g Gomega) {
+			g.Expect(labelled(ctx, g, rolloutLabel, value)).To(HaveLen(count))
+		}).WithContext(ctx).WithTimeout(time.Minute).Should(Succeed())
+	}
+
+	// expectNoReboot compares two snapshots of the nodes: none may have booted in between.
+	expectNoReboot := func(before, after map[netip.Addr]nodeState) {
+		GinkgoHelper()
+
+		for _, n := range nodes {
+			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
+		}
 	}
 
 	BeforeAll(func(ctx context.Context) {
@@ -804,7 +850,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}).WithContext(ctx).WithTimeout(time.Duration(len(nodes)) * 15 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 
 		record := upgraded()
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		expectSucceeded(*record)
 		Expect(record.Completed).To(HaveLen(len(nodes)))
 		Expect(lowest).To(BeNumerically(">=", int32(len(nodes))-1), "the budget lets one replica go at a time, never more")
 
@@ -849,42 +895,28 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 	// A change of the spec reaches the nodes: applied in try mode, verified from outside, and
 	// confirmed only after the node stayed healthy (docs/scope.md §8.5.1).
 	It("rolls a label out to the workers without a reboot", func(ctx context.Context) {
-		workers := addrsOf("E2E_WORKERS")
-		if len(workers) == 0 {
-			Skip("the harness cluster has no worker")
-		}
+		workers := workersOrSkip()
 
 		before := snapshot(ctx, harness, nodes)
-		ended := rollouts(ctx)
+		previous := lastEnded(ctx)
 
 		workerConfig := poolConfig(ctx, talosv1alpha1.MachineRoleWorker)
 		setPoolConfig(ctx, talosv1alpha1.MachineRoleWorker, with(workerConfig, labelDocument("one")))
 
 		By("waiting for the rollout to finish")
-		Eventually(func(g Gomega) {
-			refresh(ctx, g)
-			g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
-			g.Expect(tc.Status.History).To(HaveLen(ended + 1))
-		}).WithContext(ctx).WithTimeout(time.Duration(len(workers)) * 5 * time.Minute).Should(Succeed())
-
-		record := tc.Status.History[0]
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		record := endedSince(ctx, previous, "rollout", time.Duration(len(workers))*5*time.Minute)
+		expectSucceeded(record)
 		Expect(record.Completed).To(HaveLen(len(workers)))
 		inSync(ctx, time.Minute)
 
 		By("checking that the label reached Kubernetes, so the config really took effect")
-		Eventually(func(g Gomega) {
-			var labelled corev1.NodeList
-			g.Expect(k8sClient.List(ctx, &labelled, client.MatchingLabels{rolloutLabel: "one"})).To(Succeed())
-			g.Expect(labelled.Items).To(HaveLen(len(workers)))
-		}).WithContext(ctx).WithTimeout(time.Minute).Should(Succeed())
+		expectLabelled(ctx, "one", len(workers))
 
 		By("checking that only the workers changed, persistently, and nothing rebooted")
 		after := snapshot(ctx, harness, nodes)
+		expectNoReboot(before, after)
 
 		for _, n := range nodes {
-			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
-
 			if slices.Contains(workers, n) {
 				Expect(after[n].ConfigHash).NotTo(Equal(before[n].ConfigHash), "%s must run the new config", n)
 
@@ -904,13 +936,10 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 	// middle of a node's try, the other replica takes the rollout over from what is in status and
 	// on the node, and finishes it (docs/scope.md §4.2, §8.5.1).
 	It("finishes a rollout when the operator's leader is killed in the middle of it", func(ctx context.Context) {
-		workers := addrsOf("E2E_WORKERS")
-		if len(workers) == 0 {
-			Skip("the harness cluster has no worker")
-		}
+		workers := workersOrSkip()
 
 		before := snapshot(ctx, harness, nodes)
-		ended := rollouts(ctx)
+		previous := lastEnded(ctx)
 
 		setPoolConfig(ctx, talosv1alpha1.MachineRoleWorker,
 			with(poolConfig(ctx, talosv1alpha1.MachineRoleWorker), labelDocument("two")))
@@ -936,29 +965,16 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}).WithContext(ctx).WithTimeout(3 * time.Minute).Should(Succeed())
 
 		By("waiting for the rollout to finish under the new leader")
-		Eventually(func(g Gomega) {
-			refresh(ctx, g)
-			g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
-			g.Expect(tc.Status.History).To(HaveLen(ended + 1))
-		}).WithContext(ctx).WithTimeout(time.Duration(len(workers)) * 6 * time.Minute).Should(Succeed())
-
-		record := tc.Status.History[0]
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		record := endedSince(ctx, previous, "rollout", time.Duration(len(workers))*6*time.Minute)
+		expectSucceeded(record)
 		Expect(record.Completed).To(HaveLen(len(workers)))
 		inSync(ctx, time.Minute)
 
 		By("checking that the change arrived everywhere, confirmed, and nothing rebooted")
-		Eventually(func(g Gomega) {
-			var labelled corev1.NodeList
-			g.Expect(k8sClient.List(ctx, &labelled, client.MatchingLabels{rolloutLabel: "two"})).To(Succeed())
-			g.Expect(labelled.Items).To(HaveLen(len(workers)))
-		}).WithContext(ctx).WithTimeout(time.Minute).Should(Succeed())
-
-		after := snapshot(ctx, harness, nodes)
+		expectLabelled(ctx, "two", len(workers))
+		expectNoReboot(before, snapshot(ctx, harness, nodes))
 
 		for _, n := range nodes {
-			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
-
 			if slices.Contains(workers, n) {
 				cfgs, err := harness.MachineConfig(ctx, n)
 				Expect(err).NotTo(HaveOccurred())
@@ -973,14 +989,11 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 	// config that broke a node is taken back (docs/scope.md §6.3, §8.3). Here the admin breaks a
 	// worker's kubelet behind the operator's back, and enforcing the spec repairs the node.
 	It("repairs a worker whose kubelet a config broke, while the rest of the cluster is healthy", func(ctx context.Context) {
-		workers := addrsOf("E2E_WORKERS")
-		if len(workers) == 0 {
-			Skip("the harness cluster has no worker")
-		}
+		workers := workersOrSkip()
 
 		victim := workers[0]
 		before := snapshot(ctx, harness, nodes)
-		ended := rollouts(ctx)
+		previous := lastEnded(ctx)
 
 		// ready reports what Kubernetes says about the victim's Node.
 		ready := func(g Gomega) corev1.ConditionStatus {
@@ -1046,15 +1059,8 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			tc.Spec.Rollout.DriftPolicy = talosv1alpha1.DriftPolicyEnforce
 		})
 
-		Eventually(func(g Gomega) {
-			refresh(ctx, g)
-			g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
-			g.Expect(tc.Status.History).To(HaveLen(ended+1), "no rollout ended: %+v",
-				meta.FindStatusCondition(tc.Status.Conditions, talosv1alpha1.ConditionConfigInSync))
-		}).WithContext(ctx).WithTimeout(e2eTryTimeout + 5*time.Minute).WithPolling(5 * time.Second).Should(Succeed())
-
-		record := tc.Status.History[0]
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		record := endedSince(ctx, previous, "rollout that repairs the node", e2eTryTimeout+5*time.Minute)
+		expectSucceeded(record)
 		Expect(record.Completed).To(HaveLen(1), "only the broken node needed a change")
 		inSync(ctx, 2*time.Minute)
 
@@ -1070,10 +1076,9 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(repaired.PendingConfigChange()).To(BeFalse(), "the repair is confirmed, not left tried")
 
 		after := snapshot(ctx, harness, nodes)
+		expectNoReboot(before, after)
 
 		for _, n := range nodes {
-			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
-
 			if n != victim {
 				Expect(after[n].ConfigHash).To(Equal(before[n].ConfigHash), "%s was healthy and must not change", n)
 			}
@@ -1118,13 +1123,11 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 	// The M3 acceptance: a network change that cuts a node off is reverted by Talos without the
 	// operator confirming it, the rollout halts, and no second node is touched.
 	It("lets Talos revert a config that cuts a node off, and halts before the next node", func(ctx context.Context) {
-		workers, controlPlanes := addrsOf("E2E_WORKERS"), addrsOf("E2E_CONTROLPLANES")
-		if len(workers) == 0 {
-			Skip("the harness cluster has no worker")
-		}
+		workersOrSkip()
 
+		controlPlanes := addrsOf("E2E_CONTROLPLANES")
 		before := snapshot(ctx, harness, nodes)
-		ended := rollouts(ctx)
+		previous := lastEnded(ctx)
 
 		// One rollout, two changes: the workers lose their way to every control plane, and the
 		// control planes get a harmless label. Workers go first, so the label must never arrive.
@@ -1182,9 +1185,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		By("checking that every node runs what it ran before: the worker reverted, the rest untouched")
 		Expect(snapshot(ctx, harness, nodes)).To(Equal(before))
 
-		var labelled corev1.NodeList
-		Expect(k8sClient.List(ctx, &labelled, client.MatchingLabels{rolloutLabel: "never"})).To(Succeed())
-		Expect(labelled.Items).To(BeEmpty(), "no control plane was touched")
+		Expect(labelled(ctx, Default, rolloutLabel, "never")).To(BeEmpty(), "no control plane was touched")
 
 		// The worker answers again once Talos took the config back, and is asked what it has to
 		// say about the time it was cut off (docs/scope.md §14.6).
@@ -1216,12 +1217,9 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			tc.Annotations[talosv1alpha1.AnnotationAbort] = op.Failure.Token
 		})
 
-		Eventually(func(g Gomega) {
-			refresh(ctx, g)
-			g.Expect(tc.Status.Operation).To(BeNil())
-			g.Expect(tc.Status.History).To(HaveLen(ended + 1))
-			g.Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationAborted))
-		}).WithContext(ctx).WithTimeout(2 * time.Minute).Should(Succeed())
+		// The operation is halted until the operator reads the annotation: that ends no wait here.
+		record := endedAsTold(ctx, previous, "rollout", 2*time.Minute)
+		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationAborted))
 
 		setPoolConfig(ctx, talosv1alpha1.MachineRoleWorker, workerConfig)
 		setPoolConfig(ctx, talosv1alpha1.MachineRoleControlPlane, controlPlaneConfig)
@@ -1249,17 +1247,14 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 	// maintenance window by the cluster's own clock, a gate read from the API with the permission
 	// the chart was given for it, and hooks as Jobs that really run.
 	It("holds a rollout back outside its windows and behind a gate, and runs its hooks around it", func(ctx context.Context) {
-		workers := addrsOf("E2E_WORKERS")
-		if len(workers) == 0 {
-			Skip("the harness cluster has no worker")
-		}
+		workers := workersOrSkip()
 
 		const (
 			policyLabel = "e2e.talos-operator/policy"
 			gateObject  = "storage"
 		)
 
-		ended := rollouts(ctx)
+		previous := lastEnded(ctx)
 
 		// The one image every node is known to have: the operator's own. Its --help exits with 0.
 		deployment := &appsv1.Deployment{}
@@ -1361,17 +1356,8 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		storage.Data["health"] = "HEALTH_OK"
 		Expect(k8sClient.Update(ctx, storage)).To(Succeed())
 
-		Eventually(func(g Gomega) {
-			refresh(ctx, g)
-			if op := tc.Status.Operation; op != nil {
-				halted(op, "rollout")
-			}
-			g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
-			g.Expect(tc.Status.History).To(HaveLen(ended + 1))
-		}).WithContext(ctx).WithTimeout(time.Duration(len(workers))*6*time.Minute + 5*time.Minute).Should(Succeed())
-
-		record := tc.Status.History[0]
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		record := endedSince(ctx, previous, "rollout", time.Duration(len(workers))*6*time.Minute+5*time.Minute)
+		expectSucceeded(record)
 		Expect(record.Completed).To(HaveLen(len(workers)))
 
 		By("checking that every hook ran, as a Job that succeeded, for the node it was for")
@@ -1381,12 +1367,11 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		Expect(jobs[talosv1alpha1.HookPreNode]).To(HaveLen(len(workers)))
 		Expect(jobs[talosv1alpha1.HookPostNode]).To(HaveLen(len(workers)))
 
-		var labelled corev1.NodeList
-		Expect(k8sClient.List(ctx, &labelled, client.MatchingLabels{policyLabel: "held"})).To(Succeed())
-		Expect(labelled.Items).To(HaveLen(len(workers)), "the label reached Kubernetes, so the config really took effect")
+		changed := labelled(ctx, Default, policyLabel, "held")
+		Expect(changed).To(HaveLen(len(workers)), "the label reached Kubernetes, so the config really took effect")
 
-		workerNodes := make([]string, 0, len(labelled.Items))
-		for _, n := range labelled.Items {
+		workerNodes := make([]string, 0, len(changed))
+		for _, n := range changed {
 			workerNodes = append(workerNodes, n.Name)
 		}
 
@@ -1455,18 +1440,10 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		if strands {
 			By("starting kubelets with a flag the new version removed")
-			ended := rollouts(ctx)
+			previous := lastEnded(ctx)
 			setPoolConfig(ctx, role, with(original, removedKubeletPatch))
 
-			Eventually(func(g Gomega) {
-				refresh(ctx, g)
-				if op := tc.Status.Operation; op != nil {
-					halted(op, "rollout")
-				}
-				g.Expect(tc.Status.Operation).To(BeNil(), "still rolling out: %+v", tc.Status.Operation)
-				g.Expect(tc.Status.History).To(HaveLen(ended + 1))
-			}).WithContext(ctx).WithTimeout(time.Duration(len(flagged)) * 6 * time.Minute).Should(Succeed())
-			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded), tc.Status.History[0].Message)
+			expectSucceeded(endedSince(ctx, previous, "rollout", time.Duration(len(flagged))*6*time.Minute))
 		}
 
 		By("asking for the next Kubernetes minor")
@@ -1526,7 +1503,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		}).WithContext(ctx).WithTimeout(time.Duration(turns) * 6 * time.Minute).WithPolling(5 * time.Second).Should(Succeed())
 
 		record := upgraded()[0]
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		expectSucceeded(record)
 		Expect(record.Completed).To(HaveLen(turns))
 		Expect(record.Completed[0]).To(HavePrefix(plan.ComponentAPIServer+"/"), "the API servers go first")
 
@@ -1610,7 +1587,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		record := endedSince(ctx, previous, "rollout of the metrics switch", time.Duration(len(controlPlanes))*10*time.Minute)
 		Expect(record.Type).To(Equal(talosv1alpha1.OperationConfigRollout))
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		expectSucceeded(record)
 		Expect(record.Completed).To(HaveLen(len(controlPlanes)), "the control planes, and nobody else")
 		inSync(ctx, 2*time.Minute)
 
@@ -1627,10 +1604,9 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		By("checking that nothing rebooted and no worker changed")
 		after := snapshot(ctx, harness, nodes)
+		expectNoReboot(before, after)
 
 		for _, n := range nodes {
-			Expect(after[n].BootID).To(Equal(before[n].BootID), "%s must not reboot", n)
-
 			if slices.Contains(workers, n) {
 				Expect(after[n].ConfigHash).To(Equal(before[n].ConfigHash), "%s is a worker and must not change", n)
 			} else {
@@ -1683,7 +1659,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 		record := endedSince(ctx, previous, "defragmentation", time.Duration(len(members))*8*time.Minute)
 		Expect(record.Type).To(Equal(talosv1alpha1.OperationEtcdDefragment))
-		Expect(record.Outcome).To(Equal(talosv1alpha1.OperationSucceeded), record.Message)
+		expectSucceeded(record)
 		Expect(record.Completed).To(ConsistOf(members))
 		Expect(record.Completed[len(record.Completed)-1]).To(Equal(leader), "the member that led etcd goes last")
 
@@ -1895,7 +1871,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 
 			// The history keeps the last ten operations, so its length says nothing by now.
 			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationAddMachine))
-			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+			expectSucceeded(tc.Status.History[0])
 			Expect(tc.Status.History[0].Completed).To(Equal([]string{added.Name}))
 
 			inSync(ctx, 5*time.Minute)
@@ -1944,7 +1920,7 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 			settled(ctx, "removal", 30*time.Minute, gone(ctx, added, spareUUID))
 
 			Expect(tc.Status.History[0].Type).To(Equal(talosv1alpha1.OperationRemoveMachine))
-			Expect(tc.Status.History[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
+			expectSucceeded(tc.Status.History[0])
 
 			By("deleting the TalosMachine of the machine that has left")
 			Expect(k8sClient.Delete(ctx, added)).To(Succeed())

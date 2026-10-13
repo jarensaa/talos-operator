@@ -59,19 +59,22 @@ type Layers struct {
 	Machines     map[string][]string
 }
 
-// For returns the patches for one node in apply order: all, role, machine.
-func (l Layers) For(name string, role machine.Type) [][]byte {
-	layers := [][]string{l.All, l.Worker, l.Machines[name]}
+// Role returns the layer the machines of a role share.
+func (l Layers) Role(role machine.Type) []string {
 	if role == machine.TypeControlPlane {
-		layers[1] = l.ControlPlane
+		return l.ControlPlane
 	}
 
-	var out [][]byte
+	return l.Worker
+}
 
-	for _, layer := range layers {
-		for _, p := range layer {
-			out = append(out, []byte(p))
-		}
+// patches returns the patches of one node in the order they apply.
+func (l Layers) patches(name string, role machine.Type) [][]byte {
+	layered := render.Layered(l.All, l.Role(role), l.Machines[name])
+
+	out := make([][]byte, 0, len(layered))
+	for _, p := range layered {
+		out = append(out, []byte(p))
 	}
 
 	return out
@@ -80,6 +83,21 @@ func (l Layers) For(name string, role machine.Type) [][]byte {
 // unit is everything one node's patches do to one document, per pass. Keeping a document's
 // passes together means wherever the unit lands, its operations keep their order.
 type unit [2]string
+
+// target is what one patch document addresses: a document, to merge into or to delete.
+type target struct {
+	key    render.DocKey
+	delete bool
+}
+
+// String names the target in errors, and is what targets are ordered by.
+func (t target) String() string {
+	if t.delete {
+		return string(t.key) + "#delete"
+	}
+
+	return string(t.key)
+}
 
 // Patches derives the layers that turn the regenerated base into every node's live config, then
 // proves it: rendering base + layers must reproduce each live config exactly, and the secrets
@@ -96,8 +114,8 @@ func Patches(in Inputs, b *secrets.Bundle, nodes []Node) (Layers, error) {
 		bases[role] = base
 	}
 
-	// units[node][docKey] is what the node's patches do to that document.
-	units := map[string]map[string]unit{}
+	// units[node][target] is what the node's patches do to that document.
+	units := map[string]map[target]unit{}
 
 	for _, n := range nodes {
 		u, err := nodeUnits(bases[n.Role], n.Live)
@@ -105,9 +123,9 @@ func Patches(in Inputs, b *secrets.Bundle, nodes []Node) (Layers, error) {
 			return Layers{}, fmt.Errorf("%s: %w", n.Name, err)
 		}
 
-		for key := range u {
-			if slices.ContainsFunc(identityKinds, func(k string) bool { return strings.Contains(key, "/"+k) }) {
-				return Layers{}, fmt.Errorf("%w: %s differs on %s", ErrIdentityPatch, key, n.Name)
+		for to := range u {
+			if slices.Contains(identityKinds, to.key.Kind()) {
+				return Layers{}, fmt.Errorf("%w: %s differs on %s", ErrIdentityPatch, to, n.Name)
 			}
 		}
 
@@ -123,14 +141,14 @@ func Patches(in Inputs, b *secrets.Bundle, nodes []Node) (Layers, error) {
 	return layers, nil
 }
 
-// nodeUnits diffs base against live and groups the resulting patch documents by document key.
-func nodeUnits(base, live config.Provider) (map[string]unit, error) {
+// nodeUnits diffs base against live and groups the resulting patch documents by what they address.
+func nodeUnits(base, live config.Provider) (map[target]unit, error) {
 	patches, err := configdiff.Patch(base, live)
 	if err != nil {
 		return nil, fmt.Errorf("diff: %w", err)
 	}
 
-	units := map[string]unit{}
+	units := map[target]unit{}
 
 	for pass, p := range patches {
 		smp, ok := p.(configpatcher.StrategicMergePatch)
@@ -148,20 +166,21 @@ func nodeUnits(base, live config.Provider) (map[string]unit, error) {
 			return nil, err
 		}
 
-		for key, doc := range docs {
-			u := units[key]
+		for to, doc := range docs {
+			u := units[to]
 			u[pass] = doc
-			units[key] = u
+			units[to] = u
 		}
 	}
 
 	return units, nil
 }
 
-// splitDocs splits a multi-document patch into documents keyed like render.DocKey, with
-// "$patch: delete" selectors keyed separately from merges.
-func splitDocs(raw []byte) (map[string]string, error) {
-	out := map[string]string{}
+// splitDocs splits a multi-document patch into its documents by what each addresses, with
+// "$patch: delete" selectors apart from merges. The documents are kept as text, which is what a
+// layer is made of.
+func splitDocs(raw []byte) (map[target]string, error) {
+	out := map[target]string{}
 
 	for _, part := range strings.Split("\n"+string(raw), "\n---\n") {
 		part = strings.TrimSpace(part)
@@ -181,55 +200,38 @@ func splitDocs(raw []byte) (map[string]string, error) {
 			return nil, errors.New("patch document does not parse")
 		}
 
-		key := head.APIVersion + "/" + head.Kind
-		if head.Kind == "" {
-			key = "v1alpha1"
-		}
-
-		if head.Name != "" {
-			key += "/" + head.Name
-		}
-
-		if head.Patch == "delete" {
-			key += "#delete"
-		}
-
-		out[key] = part + "\n"
+		to := target{key: render.KeyOf(head.APIVersion, head.Kind, head.Name), delete: head.Patch == "delete"}
+		out[to] = part + "\n"
 	}
 
 	return out, nil
 }
 
 // factor places each unit in the widest layer where it is identical on every node of that scope.
-func factor(nodes []Node, units map[string]map[string]unit) Layers {
-	type placed struct {
-		key string
-		u   unit
-	}
+func factor(nodes []Node, units map[string]map[target]unit) Layers {
+	var all, cp, worker []unit
 
-	var all, cp, worker []placed
+	machines := map[string][]unit{}
 
-	machines := map[string][]placed{}
-
-	keys := map[string]bool{}
+	targets := map[target]bool{}
 	for _, u := range units {
-		for k := range u {
-			keys[k] = true
+		for to := range u {
+			targets[to] = true
 		}
 	}
 
-	sorted := make([]string, 0, len(keys))
-	for k := range keys {
-		sorted = append(sorted, k)
+	sorted := make([]target, 0, len(targets))
+	for to := range targets {
+		sorted = append(sorted, to)
 	}
 
-	slices.Sort(sorted)
+	slices.SortFunc(sorted, func(a, b target) int { return strings.Compare(a.String(), b.String()) })
 
-	sameOn := func(scope []Node, key string) (unit, bool) {
+	sameOn := func(scope []Node, to target) (unit, bool) {
 		var first *unit
 
 		for _, n := range scope {
-			u, ok := units[n.Name][key]
+			u, ok := units[n.Name][to]
 			if !ok {
 				return unit{}, false
 			}
@@ -263,26 +265,26 @@ func factor(nodes []Node, units map[string]map[string]unit) Layers {
 
 	cps, workers := byRole(machine.TypeControlPlane), byRole(machine.TypeWorker)
 
-	for _, key := range sorted {
-		if u, ok := sameOn(nodes, key); ok {
-			all = append(all, placed{key, u})
+	for _, to := range sorted {
+		if u, ok := sameOn(nodes, to); ok {
+			all = append(all, u)
 
 			continue
 		}
 
-		cpU, cpSame := sameOn(cps, key)
-		wU, wSame := sameOn(workers, key)
+		cpU, cpSame := sameOn(cps, to)
+		wU, wSame := sameOn(workers, to)
 
 		if cpSame {
-			cp = append(cp, placed{key, cpU})
+			cp = append(cp, cpU)
 		}
 
 		if wSame {
-			worker = append(worker, placed{key, wU})
+			worker = append(worker, wU)
 		}
 
 		for _, n := range nodes {
-			u, ok := units[n.Name][key]
+			u, ok := units[n.Name][to]
 			if !ok {
 				continue
 			}
@@ -291,19 +293,19 @@ func factor(nodes []Node, units map[string]map[string]unit) Layers {
 				continue
 			}
 
-			machines[n.Name] = append(machines[n.Name], placed{key, u})
+			machines[n.Name] = append(machines[n.Name], u)
 		}
 	}
 
-	assemble := func(ps []placed) []string {
+	assemble := func(placed []unit) []string {
 		var out []string
 
 		for pass := range 2 {
 			var docs []string
 
-			for _, p := range ps {
-				if p.u[pass] != "" {
-					docs = append(docs, p.u[pass])
+			for _, u := range placed {
+				if u[pass] != "" {
+					docs = append(docs, u[pass])
 				}
 			}
 
@@ -317,8 +319,8 @@ func factor(nodes []Node, units map[string]map[string]unit) Layers {
 
 	layers := Layers{All: assemble(all), ControlPlane: assemble(cp), Worker: assemble(worker), Machines: map[string][]string{}}
 
-	for name, ps := range machines {
-		if p := assemble(ps); len(p) > 0 {
+	for name, placed := range machines {
+		if p := assemble(placed); len(p) > 0 {
 			layers.Machines[name] = p
 		}
 	}
@@ -332,7 +334,7 @@ func prove(in Inputs, b *secrets.Bundle, nodes []Node, layers Layers) error {
 	var verify []bundle.Node
 
 	for _, n := range nodes {
-		rendered, err := render.Generate(in.RenderInput(render.Input{Bundle: b, Role: n.Role, Patches: layers.For(n.Name, n.Role)}))
+		rendered, err := render.Generate(in.RenderInput(render.Input{Bundle: b, Role: n.Role, Patches: layers.patches(n.Name, n.Role)}))
 		if err != nil {
 			return fmt.Errorf("%s: render with derived patches: %w", n.Name, err)
 		}
@@ -342,23 +344,8 @@ func prove(in Inputs, b *secrets.Bundle, nodes []Node, layers Layers) error {
 			return fmt.Errorf("%s: %w", n.Name, err)
 		}
 
-		want, err := render.Normalize(n.Live)
-		if err != nil {
-			return fmt.Errorf("%s: normalize live config: %w", n.Name, err)
-		}
-
-		diffs, err := render.Diff(got, want)
-		if err != nil {
+		if err := render.Reproduces("derived patches", got, n.Live); err != nil {
 			return fmt.Errorf("%s: %w", n.Name, err)
-		}
-
-		if len(diffs) > 0 {
-			var text strings.Builder
-			for _, d := range diffs {
-				text.WriteString(d.Text)
-			}
-
-			return fmt.Errorf("%s: derived patches do not reproduce the live config:\n%s", n.Name, text.String())
 		}
 
 		verify = append(verify, bundle.Node{Name: n.Name, Config: rendered})

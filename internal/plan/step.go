@@ -17,8 +17,6 @@ limitations under the License.
 package plan
 
 import (
-	"errors"
-	"fmt"
 	"time"
 )
 
@@ -40,13 +38,11 @@ const (
 	StepRollingBack = "RollingBack"
 )
 
-// Failure reasons of a node step.
+// Failure reasons of a config change, besides FailTimeout.
 const (
 	// FailConfigChanged: the node's config is neither the one the step started from nor the one
 	// it applies, so something else changed it.
 	FailConfigChanged = "ConfigChangedUnderneath"
-	// FailTimeout: a bounded wait ran out. A timeout is a failure, never a skip.
-	FailTimeout = "Timeout"
 	// FailRolledBack: the try was not confirmed and the node is back on its previous config.
 	FailRolledBack = "RolledBack"
 	// FailNodeUnreachableAfterRollback: the try was not confirmed and the node did not come back on
@@ -66,83 +62,6 @@ const (
 	RollbackGrace = 30 * time.Second
 )
 
-// Default timings (docs/scope.md §8.5.1).
-const (
-	DefaultTryTimeout  = 5 * time.Minute
-	DefaultSoak        = 2 * time.Minute
-	DefaultStepTimeout = 10 * time.Minute
-	// minVerifyWindow is the least time a try must leave for verification besides the soak.
-	minVerifyWindow = 2 * time.Minute
-)
-
-// Timing bounds the waits of a node step.
-type Timing struct {
-	// TryTimeout is the window Talos gives a tried config before reverting it.
-	TryTimeout time.Duration
-	// Soak is how long a node must stay healthy under a config before it is confirmed.
-	Soak time.Duration
-	// StepTimeout bounds every other wait: for a gate to open, for a node that needs no change
-	// to verify, for a node to come back after a try ended or after a reboot.
-	StepTimeout time.Duration
-	// DrainTimeout bounds the eviction of a node's pods before an upgrade reboots it.
-	DrainTimeout time.Duration
-}
-
-// WithDefaults fills unset timings.
-func (t Timing) WithDefaults() Timing {
-	if t.TryTimeout == 0 {
-		t.TryTimeout = DefaultTryTimeout
-	}
-
-	if t.Soak == 0 {
-		t.Soak = DefaultSoak
-	}
-
-	if t.StepTimeout == 0 {
-		t.StepTimeout = DefaultStepTimeout
-	}
-
-	if t.DrainTimeout == 0 {
-		t.DrainTimeout = DefaultDrainTimeout
-	}
-
-	return t
-}
-
-// Validate refuses timings under which a try could never be confirmed.
-func (t Timing) Validate() error {
-	if t.Soak < 0 || t.StepTimeout <= 0 || t.DrainTimeout <= 0 {
-		return errors.New("soak must not be negative, and stepTimeout and drainTimeout must be positive")
-	}
-
-	if t.TryTimeout < t.Soak+minVerifyWindow {
-		return fmt.Errorf("tryTimeout %s must exceed soak %s by at least %s, or a tried config could never be confirmed",
-			t.TryTimeout, t.Soak, minVerifyWindow)
-	}
-
-	if t.StepTimeout <= t.Soak {
-		return fmt.Errorf("stepTimeout %s must exceed soak %s", t.StepTimeout, t.Soak)
-	}
-
-	return nil
-}
-
-// Step is the persisted state of the node step in flight.
-type Step struct {
-	Name string
-	// Tried is false only for a node that already ran the desired config when its turn came:
-	// nothing is applied to it, it is only verified.
-	Tried bool
-	// PreviousHash is the node's config when the step began; DesiredHash the one being applied.
-	PreviousHash, DesiredHash string
-	// Since is when this step began.
-	Since time.Time
-	// Deadline is the end of the try window. It is persisted before the try is applied.
-	Deadline time.Time
-	// HealthySince is when verification first passed without interruption; zero if it does not.
-	HealthySince time.Time
-}
-
 // Node is what was just observed on the step's node, through a different node where possible.
 type Node struct {
 	Reachable bool
@@ -150,67 +69,6 @@ type Node struct {
 	// empty when the node has no persistent config resource, as after booting from disk.
 	ActiveHash, PersistentHash string
 }
-
-// ActionKind is what the executor does next.
-type ActionKind int
-
-const (
-	// Wait: nothing to do yet.
-	Wait ActionKind = iota
-	// Advance: persist the next step. No side effect happens in the same reconcile.
-	Advance
-	// MarkHealthy and MarkUnhealthy start and reset the soak.
-	MarkHealthy
-	MarkUnhealthy
-	// Try: validate with a dry run, then apply in try mode with a timeout that ends at the
-	// persisted deadline or later.
-	Try
-	// Rearm: persist a fresh try deadline. Only chosen while the node is still on its previous
-	// config before the current deadline, when no try can be pending.
-	Rearm
-	// Confirm: re-apply the node's active config without a reboot, which makes it persistent.
-	Confirm
-	// Complete: the node runs the desired config, persistently, and is healthy.
-	Complete
-	// Fail: halt the operation.
-	Fail
-)
-
-func (k ActionKind) String() string {
-	names := map[ActionKind]string{
-		Wait: "Wait", Advance: "Advance", MarkHealthy: "MarkHealthy", MarkUnhealthy: "MarkUnhealthy", Try: "Try", Rearm: "Rearm",
-		Confirm: "Confirm", Complete: "Complete", Fail: "Fail",
-		Pull: "Pull", Install: "Install", MarkCordoned: "MarkCordoned", Cordon: "Cordon", Evict: "Evict", Reboot: "Reboot",
-		Uncordon:  "Uncordon",
-		Provision: "Provision", Reset: "Reset", RemoveMember: "RemoveMember", DeleteNode: "DeleteNode", Defrag: "Defrag",
-	}
-
-	return names[k]
-}
-
-// Action is the planner's answer for the step in flight.
-type Action struct {
-	Kind ActionKind
-	// Step is the step to persist, for Advance.
-	Step string
-	// Reason is the failure reason, for Fail.
-	Reason string
-	// Message explains a Wait or a Fail.
-	Message string
-}
-
-// notReachable is what a step waits for while its node does not answer.
-const notReachable = "the node is not reachable"
-
-func wait(format string, args ...any) Action {
-	return Action{Kind: Wait, Message: fmt.Sprintf(format, args...)}
-}
-
-func fail(reason, format string, args ...any) Action {
-	return Action{Kind: Fail, Reason: reason, Message: fmt.Sprintf(format, args...)}
-}
-
-func advance(step string) Action { return Action{Kind: Advance, Step: step} }
 
 // NextStep decides what to do for the node step in flight.
 //
@@ -228,7 +86,7 @@ func NextStep(step Step, node Node, pre, checks Gate, t Timing, now time.Time) A
 	case StepTrying:
 		return nextTrying(step, node, pre, t, now)
 	case StepVerifying:
-		if step.Tried {
+		if step.tried() {
 			return nextVerifyingTry(step, node, checks, t, now)
 		}
 
@@ -238,12 +96,8 @@ func NextStep(step Step, node Node, pre, checks Gate, t Timing, now time.Time) A
 	case StepRollingBack:
 		return nextRollingBack(step, node, t, now)
 	default:
-		return fail(FailConfigChanged, "unknown step %q", step.Name)
+		return unknownStep(step.Name)
 	}
-}
-
-func timedOut(step Step, t Timing, now time.Time) bool {
-	return !now.Before(step.Since.Add(t.StepTimeout))
 }
 
 func nextTrying(step Step, node Node, pre Gate, t Timing, now time.Time) Action {
@@ -256,7 +110,7 @@ func nextTrying(step Step, node Node, pre Gate, t Timing, now time.Time) Action 
 		return advance(StepVerifying)
 	case node.ActiveHash != step.PreviousHash:
 		return fail(FailConfigChanged, "the node's config changed while the operation was in flight")
-	case timedOut(step, t, now):
+	case step.timedOut(t, now):
 		return fail(FailTimeout, "not applied within %s: %s", t.StepTimeout, pre.Reason)
 	case step.Deadline.Sub(now) < t.Soak+ConfirmMargin+minVerifyWindow/2:
 		// Too little of the persisted window is left to verify, soak and confirm. The node is
@@ -282,22 +136,11 @@ func nextVerifying(step Step, node Node, checks Gate, t Timing, now time.Time) A
 	settled := node.PersistentHash == "" || node.PersistentHash == step.DesiredHash
 	healthy := node.Reachable && settled && checks.Open
 
-	switch {
-	case node.Reachable && node.ActiveHash != step.DesiredHash:
+	if node.Reachable && node.ActiveHash != step.DesiredHash {
 		return fail(FailConfigChanged, "the node's config changed while the operation was in flight")
-	case healthy && !step.HealthySince.IsZero() && now.Sub(step.HealthySince) >= t.Soak:
-		return Action{Kind: Complete}
-	case timedOut(step, t, now):
-		return fail(FailTimeout, "not verified within %s: %s", t.StepTimeout, unverified(node, settled, checks))
-	case !healthy && !step.HealthySince.IsZero():
-		return Action{Kind: MarkUnhealthy, Message: unverified(node, settled, checks)}
-	case !healthy:
-		return wait("%s", unverified(node, settled, checks))
-	case step.HealthySince.IsZero():
-		return Action{Kind: MarkHealthy}
-	default:
-		return soaking(step, t)
 	}
+
+	return step.settle(healthy, unverified(node, settled, checks), t, now)
 }
 
 func unverified(node Node, settled bool, checks Gate) string {
@@ -309,11 +152,6 @@ func unverified(node Node, settled bool, checks Gate) string {
 	default:
 		return checks.Reason
 	}
-}
-
-// soaking is the wait of a healthy node. Its message does not change while the soak runs.
-func soaking(step Step, t Timing) Action {
-	return wait("healthy since %s; soaking for %s", step.HealthySince.UTC().Format(time.RFC3339), t.Soak)
 }
 
 func nextVerifyingTry(step Step, node Node, checks Gate, t Timing, now time.Time) Action {
@@ -335,7 +173,7 @@ func nextVerifyingTry(step Step, node Node, checks Gate, t Timing, now time.Time
 	case now.Sub(step.HealthySince) >= t.Soak:
 		return advance(StepConfirming)
 	default:
-		return soaking(step, t)
+		return step.soaking(t)
 	}
 }
 

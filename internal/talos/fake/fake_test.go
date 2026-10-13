@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -574,3 +575,100 @@ type recorder struct{ failed bool }
 func (r *recorder) Helper() {}
 
 func (r *recorder) Fatalf(string, ...any) { r.failed = true }
+
+// Whichever client forfeits, the lead goes to a member of etcd and to nobody else: a machine that
+// waits for its config is none, whatever it will be once it has joined.
+func TestTheLeadOfEtcdOnlyGoesToAMember(t *testing.T) {
+	first, waiting, second := netip.MustParseAddr("10.5.0.2"), netip.MustParseAddr("10.5.0.3"), netip.MustParseAddr("10.5.0.4")
+	s := fake.NewScenario(
+		fake.Node{Addr: first, MachineType: fake.TypeControlPlane, Nodename: "first", EtcdMemberID: 0xa1},
+		fake.Node{Addr: waiting, MachineType: fake.TypeControlPlane, Nodename: "waiting", EtcdMemberID: 0xa2, Maintenance: true},
+	)
+	ctx := context.Background()
+
+	// leader is the member that leads, as the node at one address sees it.
+	leader := func(asked netip.Addr) uint64 {
+		st, err := s.Reader().EtcdStatus(ctx, asked)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return st.Leader
+	}
+
+	forfeiters := []struct {
+		name   string
+		client interface {
+			ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error
+		}
+	}{{"the upgrader", s.Upgrader()}, {"the remover", s.Remover()}, {"the keeper", s.Keeper()}}
+
+	// A member that leads alone has nobody to hand the lead to, and keeps it.
+	for _, f := range forfeiters {
+		if err := f.client.ForfeitEtcdLeadership(ctx, first); err != nil || leader(first) != 0xa1 {
+			t.Fatalf("%s: a member that leads alone keeps the lead: %v", f.name, err)
+		}
+	}
+
+	s.Add(fake.Node{Addr: second, MachineType: fake.TypeControlPlane, Nodename: "second", EtcdMemberID: 0xa3})
+
+	// With another member, the lead goes back and forth between the two, past the machine whose
+	// address lies between theirs and which is no member.
+	leading, other := first, second
+
+	for _, f := range forfeiters {
+		if err := f.client.ForfeitEtcdLeadership(ctx, leading); err != nil || leader(other) != s.Node(other).EtcdMemberID {
+			t.Fatalf("%s: the lead goes to the other member: %v, led by %x", f.name, err, leader(other))
+		}
+
+		leading, other = other, leading
+	}
+
+	// A leader that is reset leaves etcd, and the lead to the member that stays.
+	if err := s.Remover().Reset(ctx, leading); err != nil || leader(other) != s.Node(other).EtcdMemberID {
+		t.Fatalf("the member that stays leads after the leader left: %v", err)
+	}
+
+	if got := s.CallsFor(fake.MethodEtcdForfeitLeadership); len(got) != 6 {
+		t.Fatalf("every forfeit is recorded, whichever client sent it: %+v", got)
+	}
+}
+
+// A Scenario is used from several goroutines. What is recorded of a call is recorded with the
+// call, so no other call that arrives at the same moment can be given its mode or its image.
+func TestACallIsRecordedWholeWhateverElseIsCalled(t *testing.T) {
+	s, w := applyScenario()
+	u := s.Upgrader()
+	ctx := context.Background()
+
+	const image = "factory.example.com/metal-installer/bbb:v1.14.9"
+
+	var wg sync.WaitGroup
+
+	for range 50 {
+		wg.Go(func() { _ = w.ApplyConfig(ctx, cp1, changed, talos.ApplyNoReboot, 0) })
+		wg.Go(func() { _, _ = s.Reader().Version(ctx, cp1) })
+		wg.Go(func() { _ = u.PullImage(ctx, cp1, image) })
+	}
+
+	wg.Wait()
+
+	for _, call := range s.Calls() {
+		want := fake.Call{Method: call.Method, Node: cp1}
+
+		switch call.Method {
+		case fake.MethodApplyConfiguration:
+			want.Mode = talos.ApplyNoReboot
+		case fake.MethodImagePull:
+			want.Image = image
+		}
+
+		if call != want {
+			t.Fatalf("recorded %+v, want %+v", call, want)
+		}
+	}
+
+	if got := len(s.Calls()); got != 150 {
+		t.Fatalf("every call is recorded once: %d", got)
+	}
+}

@@ -26,11 +26,12 @@ import (
 	"time"
 
 	"github.com/jarensaa/talos-operator/internal/catalog"
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 	"github.com/jarensaa/talos-operator/internal/validate"
 )
 
 const (
-	schematic = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
+	schematic = talostest.SchematicID
 	other     = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 )
 

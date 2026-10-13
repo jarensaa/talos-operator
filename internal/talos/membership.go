@@ -27,7 +27,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cosi-project/runtime/pkg/safe"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	configconfig "github.com/siderolabs/talos/pkg/machinery/config/config"
@@ -36,13 +35,9 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
-
-// StageMaintenance is the stage of a machine that has no config and waits for one.
-const StageMaintenance = "maintenance"
 
 // Remover is the Talos access of membership: Enabled for a machine that leaves the cluster:
 // everything a Reader can do, plus the three calls a removal is made of (docs/scope.md §7.7). It
@@ -103,17 +98,17 @@ var membershipMethods = map[string]bool{
 // one shape a removal uses: graceful, with a reboot, wiping exactly STATE and EPHEMERAL of the
 // system disk. A reset of the whole system disk, of a user disk, or one that leaves etcd without
 // saying so, is refused here, whatever the caller meant.
-func checkMembership(method string, req any) error {
+func checkMembership(method string, req any) string {
 	if membershipMethods[method] {
-		return nil
+		return ""
 	}
 
 	if method == machineapi.MachineService_Reset_FullMethodName {
 		if reset, ok := req.(*machineapi.ResetRequest); ok && removalReset(reset) {
-			return nil
+			return ""
 		}
 
-		return status.Errorf(codes.PermissionDenied, "talos-operator: this reset is not the one a removal is allowed")
+		return "this reset is not the one a removal is allowed"
 	}
 
 	return checkReadOnly(method, req)
@@ -144,36 +139,24 @@ func removalReset(req *machineapi.ResetRequest) bool {
 // checkMaintenance is the allowlist of a Maintenance connection: reading resources, and applying
 // a config without a reboot, which is the only mode that makes a machine in maintenance mode take
 // one. The machine itself allows an unauthenticated caller little more.
-func checkMaintenance(method string, req any) error {
+func checkMaintenance(method string, req any) string {
 	switch method {
 	case cosiGetMethod, cosiListMethod:
-		return nil
+		return ""
 	case machineapi.MachineService_ApplyConfiguration_FullMethodName:
 		if apply, ok := req.(*machineapi.ApplyConfigurationRequest); ok && !apply.GetDryRun() &&
 			apply.GetMode() == machineapi.ApplyConfigurationRequest_NO_REBOOT {
-			return nil
+			return ""
 		}
 	}
 
-	return status.Errorf(codes.PermissionDenied, "talos-operator: %s is not allowed on a maintenance connection", method)
+	return method + " is not allowed on a maintenance connection"
 }
 
-// machineryRemover implements Remover with the machinery client.
-type machineryRemover struct{ machineryReader }
+// machineryRemover implements Remover on a connection opened with accessMembership.
+type machineryRemover struct{ forfeiter }
 
 var _ Remover = (*machineryRemover)(nil)
-
-// ForfeitEtcdLeadership implements Remover.
-func (m *machineryRemover) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
-	ctx, cancel := m.callContext(ctx, node)
-	defer cancel()
-
-	if _, err := m.client.EtcdForfeitLeadership(ctx, &machineapi.EtcdForfeitLeadershipRequest{}); err != nil {
-		return fmt.Errorf("forfeit etcd leadership on %s: %w", node, err)
-	}
-
-	return nil
-}
 
 // Reset implements Remover. The request is the one talosctl sends for
 // `reset --graceful --reboot --wipe-mode system-disk --system-labels-to-wipe STATE,EPHEMERAL`
@@ -260,7 +243,7 @@ var _ Maintenance = (*machineryMaintenance)(nil)
 // (client.WithMaintenanceMode, pkg/machinery/client/options.go:178): TLS without a client
 // certificate and without verifying the server's, to that one address. Nothing is sent until the
 // first call.
-func newMaintenance(ctx context.Context, addr netip.Addr, f *Factory) (*machineryMaintenance, error) {
+func newMaintenance(ctx context.Context, addr netip.Addr) (*machineryMaintenance, error) {
 	pin := &keyPin{}
 
 	c, err := client.New(ctx,
@@ -269,16 +252,13 @@ func newMaintenance(ctx context.Context, addr netip.Addr, f *Factory) (*machiner
 			VerifyConnection:   pin.verify,
 		}),
 		client.WithEndpoints(addr.String()),
-		client.WithGRPCDialOptions(
-			grpc.WithChainUnaryInterceptor(accessMaintenance.unaryInterceptor()),
-			grpc.WithChainStreamInterceptor(accessMaintenance.streamInterceptor()),
-		),
+		client.WithGRPCDialOptions(accessMaintenance.dialOptions()...),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create a maintenance client for %s: %w", addr, err)
 	}
 
-	return &machineryMaintenance{machineryReader: machineryReader{client: c, timeout: f.callTimeout()}, addr: addr}, nil
+	return &machineryMaintenance{machineryReader: machineryReader{client: c, timeout: DefaultCallTimeout}, addr: addr}, nil
 }
 
 // Probe implements Maintenance.
@@ -345,9 +325,9 @@ func (m *machineryMaintenance) Fits(ctx context.Context, machineConfig []byte) (
 		return problems, nil
 	}
 
-	links, err := safe.StateListAll[*network.LinkStatus](ctx, m.client.COSI)
+	links, err := cosiList[*network.LinkStatus](&m.machineryReader, ctx, m.addr, "list the links of")
 	if err != nil {
-		return nil, fmt.Errorf("list the links of %s: %w", m.addr, err)
+		return nil, err
 	}
 
 	have := map[string]bool{}
@@ -365,9 +345,9 @@ func (m *machineryMaintenance) Fits(ctx context.Context, machineConfig []byte) (
 }
 
 func (m *machineryMaintenance) disks(ctx context.Context) ([]string, error) {
-	disks, err := safe.StateListAll[*block.Disk](ctx, m.client.COSI)
+	disks, err := cosiList[*block.Disk](&m.machineryReader, ctx, m.addr, "list the disks of")
 	if err != nil {
-		return nil, fmt.Errorf("list the disks of %s: %w", m.addr, err)
+		return nil, err
 	}
 
 	var out []string

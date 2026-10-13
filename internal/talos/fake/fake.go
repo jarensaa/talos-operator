@@ -15,8 +15,9 @@ limitations under the License.
 */
 
 // Package fake is an in-memory Talos cluster for controller tests. It implements the talos
-// Reader over a scriptable Scenario and records every call, so tests can assert both what the
-// operator observed and that observe mode never attempted a mutation.
+// clients, the Reader and every one that can change a node, over a scriptable Scenario and
+// records every call, so tests can assert both what the operator observed and that observe mode
+// never attempted a mutation.
 package fake
 
 import (
@@ -35,7 +36,8 @@ import (
 	"github.com/jarensaa/talos-operator/internal/talos"
 )
 
-// Method names recorded in Calls. Mutating methods are added here as the Writer grows.
+// Method names recorded in Calls. A method that is added here is also said to read or to change
+// a node, in methodReads.
 const (
 	MethodVersion                 = "Version"
 	MethodMachineStatus           = "MachineStatus"
@@ -73,18 +75,60 @@ const (
 	MethodSecureBootDB = "SecureBootDB"
 )
 
-// Machine types as Talos reports them.
-const (
-	TypeControlPlane = "controlplane"
-	TypeWorker       = "worker"
+// Machine types as Talos reports them: talos.MachineTypeControlPlane and talos.MachineTypeWorker,
+// under the names the tests have for them.
+var (
+	TypeControlPlane = talos.MachineTypeControlPlane
+	TypeWorker       = talos.MachineTypeWorker
 )
 
-// mutatingMethods lists recorded methods that change node state. A dry-run apply is recorded
-// under ApplyConfiguration with DryRun set, which AssertNoMutations allows.
-var mutatingMethods = map[string]bool{
-	MethodApplyConfiguration: true, MethodImagePull: true, MethodInstall: true, MethodEtcdForfeitLeadership: true, MethodReboot: true,
-	MethodKubernetesImagePull: true, MethodReset: true, MethodEtcdRemoveMember: true, MethodMaintenanceApply: true,
-	MethodEtcdDefragment: true,
+// methodReads says of every recorded method whether it leaves the node as it is. Every Method
+// constant has an entry, which a test checks. A method that is recorded without one counts as one
+// that changes a node: AssertNoMutations must not pass because somebody forgot a line here.
+var methodReads = map[string]bool{
+	MethodVersion:                 true,
+	MethodMachineStatus:           true,
+	MethodBootID:                  true,
+	MethodSystemInformation:       true,
+	MethodImageFactorySchematic:   true,
+	MethodNodename:                true,
+	MethodUnattendedInstallStatus: true,
+	MethodServices:                true,
+	MethodMachineType:             true,
+	MethodMachineConfig:           true,
+	MethodMembers:                 true,
+	MethodEtcdMembers:             true,
+	MethodEtcdStatus:              true,
+	MethodSecureBoot:              true,
+	MethodSecureBootDB:            true,
+	MethodHealthCheck:             true,
+	MethodKubernetesUpgradeChecks: true,
+	MethodMaintenanceProbe:        true,
+	MethodMaintenanceFits:         true,
+	MethodNodeHealth:              true,
+	MethodLogs:                    true,
+
+	// What changes a node.
+	MethodApplyConfiguration:    false,
+	MethodImagePull:             false,
+	MethodInstall:               false,
+	MethodEtcdForfeitLeadership: false,
+	MethodReboot:                false,
+	MethodKubernetesImagePull:   false,
+	MethodReset:                 false,
+	MethodEtcdRemoveMember:      false,
+	MethodMaintenanceApply:      false,
+	MethodEtcdDefragment:        false,
+}
+
+// mutates reports whether a recorded call could have changed a node. A dry-run apply is recorded
+// under ApplyConfiguration with DryRun set, and changes nothing.
+func (c Call) mutates() bool {
+	if c.Method == MethodApplyConfiguration && c.DryRun {
+		return false
+	}
+
+	return !methodReads[c.Method]
 }
 
 func (n *Node) unhealthy() bool { return n.UnhealthyWhen != nil && n.UnhealthyWhen(n.Config.Active) }
@@ -158,7 +202,7 @@ type Node struct {
 	joining bool
 }
 
-// Call is one recorded Reader call.
+// Call is one recorded call, of any of the clients.
 type Call struct {
 	Method string
 	Node   netip.Addr
@@ -177,11 +221,8 @@ type Scenario struct {
 	errors map[errorKey]error
 	calls  []Call
 
-	// members and etcdMembers override the views derived from nodes when non-nil.
-	members     []talos.Member
-	etcdMembers []talos.EtcdMember
-	etcdLeader  uint64
-	health      talos.HealthResult
+	etcdLeader uint64
+	health     talos.HealthResult
 	// removed is what the Kubernetes upgrade checks find, by the version checked.
 	removed map[string][]string
 }
@@ -231,22 +272,6 @@ func (s *Scenario) UpdateNode(addr netip.Addr, update func(*Node)) {
 	if n, ok := s.nodes[addr]; ok {
 		update(n)
 	}
-}
-
-// SetMembers overrides the discovery member list (default: derived from nodes).
-func (s *Scenario) SetMembers(members []talos.Member) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.members = members
-}
-
-// SetEtcdMembers overrides the etcd member list (default: derived from control-plane nodes).
-func (s *Scenario) SetEtcdMembers(members []talos.EtcdMember) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.etcdMembers = members
 }
 
 // SetHealth sets the result of HealthCheck.
@@ -317,7 +342,7 @@ func (s *Scenario) AssertNoMutations(t TestingT) {
 	t.Helper()
 
 	for _, c := range s.Calls() {
-		if mutatingMethods[c.Method] && !c.DryRun {
+		if c.mutates() {
 			t.Fatalf("observe mode issued a mutating call: %s on %s", c.Method, c.Node)
 		}
 	}
@@ -403,7 +428,7 @@ func ParseInstaller(image string) (schematic, version string, ok bool) {
 }
 
 // Remover returns a talos.Remover backed by the scenario.
-func (s *Scenario) Remover() talos.Remover { return &remover{reader{s: s}} }
+func (s *Scenario) Remover() talos.Remover { return &remover{forfeiter{reader{s: s}}} }
 
 // Maintenance returns the maintenance connection to the machine at addr.
 func (s *Scenario) Maintenance(addr netip.Addr) talos.Maintenance {
@@ -418,15 +443,6 @@ func (s *Scenario) Add(n Node) {
 	s.nodes[n.Addr] = &n
 }
 
-// Forget takes a node out of the scenario altogether, as when its machine is switched off for
-// good and the cluster's discovery has dropped it.
-func (s *Scenario) Forget(addr netip.Addr) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	delete(s.nodes, addr)
-}
-
 // Kill makes a node answer nothing from now on, with no reboot to come back from. It stays a
 // member of whatever it was a member of, as a machine that died does.
 func (s *Scenario) Kill(addr netip.Addr) {
@@ -439,34 +455,22 @@ func (s *Scenario) Kill(addr netip.Addr) {
 }
 
 // remover is the Remover of a scenario.
-type remover struct{ reader }
-
-// ForfeitEtcdLeadership implements talos.Remover.
-func (r *remover) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
-	return (&upgrader{r.reader}).ForfeitEtcdLeadership(ctx, node)
-}
+type remover struct{ forfeiter }
 
 // Reset implements talos.Remover: the node leaves etcd, forgets its config and reboots. It comes
 // back from Boot as a machine in maintenance mode.
 func (r *remover) Reset(ctx context.Context, node netip.Addr) error {
-	if _, err := r.s.record(ctx, MethodReset, node); err != nil {
+	if _, err := r.s.record(ctx, Call{Method: MethodReset, Node: node}); err != nil {
 		return err
 	}
 
 	r.s.mu.Lock()
 	defer r.s.mu.Unlock()
 
+	// A leader that leaves etcd leaves the lead to another member. With none left, nobody leads.
 	n := r.s.nodes[node]
-	if n.EtcdMemberID != 0 && r.s.etcdLeader == n.EtcdMemberID {
+	if n.EtcdMemberID != 0 && r.s.etcdLeader == n.EtcdMemberID && !r.s.handOffLeaderLocked(n) {
 		r.s.etcdLeader = 0
-
-		for _, other := range r.s.sortedNodesLocked() {
-			if other.EtcdMemberID != 0 && other.EtcdMemberID != n.EtcdMemberID && !other.Maintenance {
-				r.s.etcdLeader = other.EtcdMemberID
-
-				break
-			}
-		}
 	}
 
 	n.down, n.Maintenance, n.EtcdMemberID, n.EtcdLearner = true, true, 0, false
@@ -478,7 +482,7 @@ func (r *remover) Reset(ctx context.Context, node netip.Addr) error {
 
 // RemoveEtcdMember implements talos.Remover: whichever node has the member loses it, dead or not.
 func (r *remover) RemoveEtcdMember(ctx context.Context, peer netip.Addr, id uint64) error {
-	asked, err := r.s.record(ctx, MethodEtcdRemoveMember, peer)
+	asked, err := r.s.record(ctx, Call{Method: MethodEtcdRemoveMember, Node: peer})
 	if err != nil {
 		return err
 	}
@@ -507,32 +511,21 @@ type maintenance struct {
 
 // candidate logs a call and returns a copy of the machine, if it waits in maintenance mode.
 func (m *maintenance) candidate(ctx context.Context, method string) (*Node, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+	return m.s.called(ctx, Call{Method: method, Node: m.addr}, silentWithoutCredentials)
+}
 
-	m.s.mu.Lock()
-	defer m.s.mu.Unlock()
-
-	m.s.calls = append(m.s.calls, Call{Method: method, Node: m.addr})
-
-	if err := m.s.errors[errorKey{method: method, node: m.addr}]; err != nil {
-		return nil, fmt.Errorf("%s on %s: %w", method, m.addr, err)
-	}
-
-	n, ok := m.s.nodes[m.addr]
-
+// silentWithoutCredentials says why a machine does not answer a maintenance connection, which
+// presents no certificate; nothing if it does. n is nil when no machine has the address.
+func silentWithoutCredentials(n *Node) string {
 	switch {
-	case !ok, n.down:
-		return nil, fmt.Errorf("%s on %s: %w", method, m.addr, status.Error(codes.Unavailable, "fake: nothing answers"))
+	case n == nil, n.down:
+		return "nothing answers"
 	case !n.Maintenance:
 		// A configured node asks for a client certificate, and a maintenance connection has none.
-		return nil, fmt.Errorf("%s on %s: %w", method, m.addr, status.Error(codes.Unavailable, "fake: the node wants a client certificate"))
+		return "the node wants a client certificate"
 	}
 
-	copied := *n
-
-	return &copied, nil
+	return ""
 }
 
 // Probe implements talos.Maintenance.
@@ -577,7 +570,7 @@ func (m *maintenance) Close() error { return nil }
 
 // Upgrader returns a talos.Upgrader backed by the scenario.
 func (s *Scenario) Upgrader() talos.Upgrader {
-	return &upgrader{reader{s: s}}
+	return &upgrader{forfeiter{reader{s: s}}}
 }
 
 // Writer returns a talos.ConfigWriter backed by the scenario.
@@ -590,8 +583,35 @@ func (s *Scenario) Reader() talos.Reader {
 	return &reader{s: s}
 }
 
-// record logs a call and returns a copy of the node, or the injected / unavailable error.
-func (s *Scenario) record(ctx context.Context, method string, node netip.Addr) (*Node, error) {
+// record logs a call made with the cluster's credentials and returns a copy of the node, or the
+// injected / unavailable error.
+func (s *Scenario) record(ctx context.Context, call Call) (*Node, error) {
+	return s.called(ctx, call, silentWithCredentials)
+}
+
+// silentWithCredentials says why a node does not answer a client that comes with the cluster's
+// credentials; nothing if it does. n is nil when no node has the address.
+func silentWithCredentials(n *Node) string {
+	switch {
+	case n == nil:
+		return "no such node"
+	case n.down:
+		return "node is rebooting"
+	case n.Maintenance:
+		// It asks for no client certificate and has no CA to check one against.
+		return "the machine is in maintenance mode"
+	case n.UnreachableWhen != nil && n.UnreachableWhen(n.Config.Active):
+		return "node is cut off"
+	}
+
+	return ""
+}
+
+// called is every call to a node. It logs the call, whole and in the one step that takes the
+// lock, so that what is recorded of a call is never completed afterwards. It returns a copy of
+// the node the call reached, or the error the caller sees: the context's, an injected one, or
+// Unavailable when silent says why the node does not answer this kind of connection.
+func (s *Scenario) called(ctx context.Context, call Call, silent func(*Node) string) (*Node, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -599,28 +619,15 @@ func (s *Scenario) record(ctx context.Context, method string, node netip.Addr) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.calls = append(s.calls, Call{Method: method, Node: node, DryRun: method == MethodApplyConfiguration && dryRun(ctx)})
+	s.calls = append(s.calls, call)
 
-	if err := s.errors[errorKey{method: method, node: node}]; err != nil {
-		return nil, fmt.Errorf("%s on %s: %w", method, node, err)
+	if err := s.errors[errorKey{method: call.Method, node: call.Node}]; err != nil {
+		return nil, fmt.Errorf("%s on %s: %w", call.Method, call.Node, err)
 	}
 
-	n, ok := s.nodes[node]
-	if !ok {
-		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: no such node"))
-	}
-
-	if n.down {
-		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: node is rebooting"))
-	}
-
-	if n.Maintenance {
-		// It asks for no client certificate and has no CA to check one against.
-		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: the machine is in maintenance mode"))
-	}
-
-	if n.UnreachableWhen != nil && n.UnreachableWhen(n.Config.Active) {
-		return nil, fmt.Errorf("%s on %s: %w", method, node, status.Error(codes.Unavailable, "fake: node is cut off"))
+	n := s.nodes[call.Node]
+	if why := silent(n); why != "" {
+		return nil, fmt.Errorf("%s on %s: %w", call.Method, call.Node, status.Error(codes.Unavailable, "fake: "+why))
 	}
 
 	copied := *n
@@ -628,11 +635,29 @@ func (s *Scenario) record(ctx context.Context, method string, node netip.Addr) (
 	return &copied, nil
 }
 
-func (s *Scenario) membersLocked() []talos.Member {
-	if s.members != nil {
-		return slices.Clone(s.members)
+// isEtcdMember reports whether a node is a member of etcd now. A machine that waits for its
+// config, or is installing itself, is not one yet, whatever it will be once it has joined.
+func isEtcdMember(n *Node) bool {
+	return n.EtcdMemberID != 0 && !n.Maintenance && !n.joining
+}
+
+// handOffLeaderLocked gives the lead of etcd to the next member that is not from, and reports
+// whether there was one. The lead is not touched when there was not: what becomes of it then is
+// the caller's to say, and differs between a member that stays and one that leaves.
+func (s *Scenario) handOffLeaderLocked(from *Node) bool {
+	for _, other := range s.sortedNodesLocked() {
+		if isEtcdMember(other) && other.EtcdMemberID != from.EtcdMemberID {
+			s.etcdLeader = other.EtcdMemberID
+
+			return true
+		}
 	}
 
+	return false
+}
+
+// membersLocked is what discovery lists: every node that has joined.
+func (s *Scenario) membersLocked() []talos.Member {
 	out := make([]talos.Member, 0, len(s.nodes))
 	for _, n := range s.sortedNodesLocked() {
 		if n.Maintenance || n.joining {
@@ -650,15 +675,12 @@ func (s *Scenario) membersLocked() []talos.Member {
 	return out
 }
 
+// etcdMembersLocked is etcd's member list: every node that is a member now.
 func (s *Scenario) etcdMembersLocked() []talos.EtcdMember {
-	if s.etcdMembers != nil {
-		return slices.Clone(s.etcdMembers)
-	}
-
 	var out []talos.EtcdMember
 
 	for _, n := range s.sortedNodesLocked() {
-		if n.EtcdMemberID != 0 && !n.Maintenance && !n.joining {
+		if isEtcdMember(n) {
 			out = append(out, talos.EtcdMember{ID: n.EtcdMemberID, Hostname: n.Nodename, IsLearner: n.EtcdLearner})
 		}
 	}
@@ -683,8 +705,30 @@ type reader struct {
 
 var _ talos.Reader = (*reader)(nil)
 
+// forfeiter is the one call the Upgrader, the Remover and the Keeper share.
+type forfeiter struct{ reader }
+
+// ForfeitEtcdLeadership implements talos.Upgrader, talos.Remover and talos.Keeper: the next member
+// takes over from a leader. A member that does not lead has nothing to give up, and one that
+// leads alone keeps the lead.
+func (f *forfeiter) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
+	n, err := f.s.record(ctx, Call{Method: MethodEtcdForfeitLeadership, Node: node})
+	if err != nil {
+		return err
+	}
+
+	f.s.mu.Lock()
+	defer f.s.mu.Unlock()
+
+	if n.EtcdMemberID != 0 && f.s.etcdLeader == n.EtcdMemberID {
+		f.s.handOffLeaderLocked(n)
+	}
+
+	return nil
+}
+
 func (r *reader) Version(ctx context.Context, node netip.Addr) (talos.VersionInfo, error) {
-	n, err := r.s.record(ctx, MethodVersion, node)
+	n, err := r.s.record(ctx, Call{Method: MethodVersion, Node: node})
 	if err != nil {
 		return talos.VersionInfo{}, err
 	}
@@ -693,7 +737,7 @@ func (r *reader) Version(ctx context.Context, node netip.Addr) (talos.VersionInf
 }
 
 func (r *reader) MachineStatus(ctx context.Context, node netip.Addr) (talos.MachineStatus, error) {
-	n, err := r.s.record(ctx, MethodMachineStatus, node)
+	n, err := r.s.record(ctx, Call{Method: MethodMachineStatus, Node: node})
 	if err != nil {
 		return talos.MachineStatus{}, err
 	}
@@ -707,7 +751,7 @@ func (r *reader) MachineStatus(ctx context.Context, node netip.Addr) (talos.Mach
 }
 
 func (r *reader) BootID(ctx context.Context, node netip.Addr) (string, error) {
-	n, err := r.s.record(ctx, MethodBootID, node)
+	n, err := r.s.record(ctx, Call{Method: MethodBootID, Node: node})
 	if err != nil {
 		return "", err
 	}
@@ -716,7 +760,7 @@ func (r *reader) BootID(ctx context.Context, node netip.Addr) (string, error) {
 }
 
 func (r *reader) SystemInformation(ctx context.Context, node netip.Addr) (talos.SystemInformation, error) {
-	n, err := r.s.record(ctx, MethodSystemInformation, node)
+	n, err := r.s.record(ctx, Call{Method: MethodSystemInformation, Node: node})
 	if err != nil {
 		return talos.SystemInformation{}, err
 	}
@@ -725,7 +769,7 @@ func (r *reader) SystemInformation(ctx context.Context, node netip.Addr) (talos.
 }
 
 func (r *reader) ImageFactorySchematic(ctx context.Context, node netip.Addr) (talos.Schematic, error) {
-	n, err := r.s.record(ctx, MethodImageFactorySchematic, node)
+	n, err := r.s.record(ctx, Call{Method: MethodImageFactorySchematic, Node: node})
 	if err != nil {
 		return talos.Schematic{}, err
 	}
@@ -738,7 +782,7 @@ func (r *reader) ImageFactorySchematic(ctx context.Context, node netip.Addr) (ta
 }
 
 func (r *reader) Nodename(ctx context.Context, node netip.Addr) (string, error) {
-	n, err := r.s.record(ctx, MethodNodename, node)
+	n, err := r.s.record(ctx, Call{Method: MethodNodename, Node: node})
 	if err != nil {
 		return "", err
 	}
@@ -747,7 +791,7 @@ func (r *reader) Nodename(ctx context.Context, node netip.Addr) (string, error) 
 }
 
 func (r *reader) UnattendedInstallStatus(ctx context.Context, node netip.Addr) (talos.InstallStatus, error) {
-	n, err := r.s.record(ctx, MethodUnattendedInstallStatus, node)
+	n, err := r.s.record(ctx, Call{Method: MethodUnattendedInstallStatus, Node: node})
 	if err != nil {
 		return talos.InstallStatus{}, err
 	}
@@ -760,7 +804,7 @@ func (r *reader) UnattendedInstallStatus(ctx context.Context, node netip.Addr) (
 }
 
 func (r *reader) Services(ctx context.Context, node netip.Addr) ([]talos.ServiceStatus, error) {
-	n, err := r.s.record(ctx, MethodServices, node)
+	n, err := r.s.record(ctx, Call{Method: MethodServices, Node: node})
 	if err != nil {
 		return nil, err
 	}
@@ -769,7 +813,7 @@ func (r *reader) Services(ctx context.Context, node netip.Addr) ([]talos.Service
 }
 
 func (r *reader) MachineType(ctx context.Context, node netip.Addr) (string, error) {
-	n, err := r.s.record(ctx, MethodMachineType, node)
+	n, err := r.s.record(ctx, Call{Method: MethodMachineType, Node: node})
 	if err != nil {
 		return "", err
 	}
@@ -778,7 +822,7 @@ func (r *reader) MachineType(ctx context.Context, node netip.Addr) (string, erro
 }
 
 func (r *reader) MachineConfig(ctx context.Context, node netip.Addr) (talos.MachineConfigs, error) {
-	n, err := r.s.record(ctx, MethodMachineConfig, node)
+	n, err := r.s.record(ctx, Call{Method: MethodMachineConfig, Node: node})
 	if err != nil {
 		return talos.MachineConfigs{}, err
 	}
@@ -790,7 +834,7 @@ func (r *reader) MachineConfig(ctx context.Context, node netip.Addr) (talos.Mach
 }
 
 func (r *reader) Members(ctx context.Context, node netip.Addr) ([]talos.Member, error) {
-	if _, err := r.s.record(ctx, MethodMembers, node); err != nil {
+	if _, err := r.s.record(ctx, Call{Method: MethodMembers, Node: node}); err != nil {
 		return nil, err
 	}
 
@@ -801,7 +845,7 @@ func (r *reader) Members(ctx context.Context, node netip.Addr) ([]talos.Member, 
 }
 
 func (r *reader) EtcdMembers(ctx context.Context, node netip.Addr) ([]talos.EtcdMember, error) {
-	n, err := r.s.record(ctx, MethodEtcdMembers, node)
+	n, err := r.s.record(ctx, Call{Method: MethodEtcdMembers, Node: node})
 	if err != nil {
 		return nil, err
 	}
@@ -817,7 +861,7 @@ func (r *reader) EtcdMembers(ctx context.Context, node netip.Addr) ([]talos.Etcd
 }
 
 func (r *reader) EtcdStatus(ctx context.Context, node netip.Addr) (talos.EtcdStatus, error) {
-	n, err := r.s.record(ctx, MethodEtcdStatus, node)
+	n, err := r.s.record(ctx, Call{Method: MethodEtcdStatus, Node: node})
 	if err != nil {
 		return talos.EtcdStatus{}, err
 	}
@@ -836,7 +880,7 @@ func (r *reader) EtcdStatus(ctx context.Context, node netip.Addr) (talos.EtcdSta
 
 // Diagnostics implements talos.Reader.
 func (r *reader) Diagnostics(ctx context.Context, node netip.Addr) ([]talos.Diagnostic, error) {
-	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	n, err := r.s.record(ctx, Call{Method: MethodNodeHealth, Node: node})
 	if err != nil {
 		return nil, err
 	}
@@ -846,7 +890,7 @@ func (r *reader) Diagnostics(ctx context.Context, node netip.Addr) ([]talos.Diag
 
 // TimeSynced implements talos.Reader.
 func (r *reader) TimeSynced(ctx context.Context, node netip.Addr) (bool, error) {
-	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	n, err := r.s.record(ctx, Call{Method: MethodNodeHealth, Node: node})
 	if err != nil {
 		return false, err
 	}
@@ -856,7 +900,7 @@ func (r *reader) TimeSynced(ctx context.Context, node netip.Addr) (bool, error) 
 
 // Links implements talos.Reader.
 func (r *reader) Links(ctx context.Context, node netip.Addr) ([]talos.Link, error) {
-	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	n, err := r.s.record(ctx, Call{Method: MethodNodeHealth, Node: node})
 	if err != nil {
 		return nil, err
 	}
@@ -866,7 +910,7 @@ func (r *reader) Links(ctx context.Context, node netip.Addr) ([]talos.Link, erro
 
 // Volumes implements talos.Reader.
 func (r *reader) Volumes(ctx context.Context, node netip.Addr) ([]talos.Volume, error) {
-	n, err := r.s.record(ctx, MethodNodeHealth, node)
+	n, err := r.s.record(ctx, Call{Method: MethodNodeHealth, Node: node})
 	if err != nil {
 		return nil, err
 	}
@@ -874,9 +918,9 @@ func (r *reader) Volumes(ctx context.Context, node netip.Addr) ([]talos.Volume, 
 	return slices.Clone(n.Volumes), nil
 }
 
-// Logs implements talos.Reader.
+// SecureBoot implements talos.Reader.
 func (r *reader) SecureBoot(ctx context.Context, node netip.Addr) (bool, error) {
-	n, err := r.s.record(ctx, MethodSecureBoot, node)
+	n, err := r.s.record(ctx, Call{Method: MethodSecureBoot, Node: node})
 	if err != nil {
 		return false, err
 	}
@@ -884,8 +928,9 @@ func (r *reader) SecureBoot(ctx context.Context, node netip.Addr) (bool, error) 
 	return n.SecureBoot, nil
 }
 
+// SecureBootDB implements talos.Reader.
 func (r *reader) SecureBootDB(ctx context.Context, node netip.Addr) (talos.SecureBootDB, error) {
-	n, err := r.s.record(ctx, MethodSecureBootDB, node)
+	n, err := r.s.record(ctx, Call{Method: MethodSecureBootDB, Node: node})
 	if err != nil {
 		return talos.SecureBootDB{}, err
 	}
@@ -893,8 +938,9 @@ func (r *reader) SecureBootDB(ctx context.Context, node netip.Addr) (talos.Secur
 	return n.SecureBootDB, nil
 }
 
+// Logs implements talos.Reader.
 func (r *reader) Logs(ctx context.Context, node netip.Addr, service string, _ int32) ([]byte, error) {
-	n, err := r.s.record(ctx, MethodLogs, node)
+	n, err := r.s.record(ctx, Call{Method: MethodLogs, Node: node})
 	if err != nil {
 		return nil, err
 	}
@@ -908,19 +954,14 @@ func (r *reader) Dmesg(ctx context.Context, node netip.Addr) ([]byte, error) {
 }
 
 // Keeper returns a talos.Keeper backed by the scenario.
-func (s *Scenario) Keeper() talos.Keeper { return &keeper{reader{s: s}} }
+func (s *Scenario) Keeper() talos.Keeper { return &keeper{forfeiter{reader{s: s}}} }
 
 // keeper is the Keeper of a scenario.
-type keeper struct{ reader }
-
-// ForfeitEtcdLeadership implements talos.Keeper.
-func (k *keeper) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
-	return (&upgrader{k.reader}).ForfeitEtcdLeadership(ctx, node)
-}
+type keeper struct{ forfeiter }
 
 // DefragmentEtcd implements talos.Keeper: the member's file shrinks to what it holds.
 func (k *keeper) DefragmentEtcd(ctx context.Context, node netip.Addr) error {
-	n, err := k.s.record(ctx, MethodEtcdDefragment, node)
+	n, err := k.s.record(ctx, Call{Method: MethodEtcdDefragment, Node: node})
 	if err != nil {
 		return err
 	}
@@ -938,7 +979,7 @@ func (k *keeper) DefragmentEtcd(ctx context.Context, node netip.Addr) error {
 }
 
 func (r *reader) HealthCheck(ctx context.Context, node netip.Addr, _ talos.ClusterInfo, _ time.Duration) (talos.HealthResult, error) {
-	if _, err := r.s.record(ctx, MethodHealthCheck, node); err != nil {
+	if _, err := r.s.record(ctx, Call{Method: MethodHealthCheck, Node: node}); err != nil {
 		return talos.HealthResult{}, err
 	}
 
@@ -959,7 +1000,7 @@ func (r *reader) HealthCheck(ctx context.Context, node netip.Addr, _ talos.Clust
 // answer fails the checks.
 func (r *reader) KubernetesUpgradeChecks(ctx context.Context, _, to string, nodes talos.ClusterInfo) ([]string, error) {
 	for _, node := range slices.Concat(nodes.ControlPlanes, nodes.Workers) {
-		if _, err := r.s.record(ctx, MethodKubernetesUpgradeChecks, node); err != nil {
+		if _, err := r.s.record(ctx, Call{Method: MethodKubernetesUpgradeChecks, Node: node}); err != nil {
 			return nil, err
 		}
 	}
@@ -970,127 +1011,107 @@ func (r *reader) KubernetesUpgradeChecks(ctx context.Context, _, to string, node
 	return slices.Clone(r.s.removed[to]), nil
 }
 
-// Factory is a fake target.ClientFactory that serves the scenario's Reader and ConfigWriter and
-// records every target it was asked for, so tests can assert credentials and endpoint selection.
+// Factory is a fake target.ClientFactory that serves the scenario's clients and records every
+// target each kind of client was asked for, so tests can assert credentials and endpoint
+// selection, and that a client of one kind was not built for another.
 type Factory struct {
 	Scenario *Scenario
 
-	mu              sync.Mutex
-	targets         []talos.Target
-	writerTargets   []talos.Target
-	upgraderTargets []talos.Target
-	removerTargets  []talos.Target
-	keeperTargets   []talos.Target
+	mu    sync.Mutex
+	asked map[clientKind][]talos.Target
 }
 
-// Keeper implements target.ClientFactory.
-func (f *Factory) Keeper(_ context.Context, t talos.Target) (talos.Keeper, error) {
+// clientKind is a kind of client a Factory builds for a target. The maintenance connection is
+// not one: it is made to an address.
+type clientKind int
+
+const (
+	readerClient clientKind = iota
+	writerClient
+	upgraderClient
+	removerClient
+	keeperClient
+)
+
+// ask records that a client of a kind was asked for.
+func (f *Factory) ask(kind clientKind, t talos.Target) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.keeperTargets = append(f.keeperTargets, t)
+	if f.asked == nil {
+		f.asked = map[clientKind][]talos.Target{}
+	}
 
-	return f.Scenario.Keeper(), nil
+	f.asked[kind] = append(f.asked[kind], t)
 }
 
-// KeeperTargets returns the targets a Keeper was requested for.
-func (f *Factory) KeeperTargets() []talos.Target {
+// askedFor returns the targets a client of a kind was asked for.
+func (f *Factory) askedFor(kind clientKind) []talos.Target {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	return slices.Clone(f.keeperTargets)
+	return slices.Clone(f.asked[kind])
 }
+
+// Reader implements target.ReaderFactory.
+func (f *Factory) Reader(_ context.Context, t talos.Target) (talos.Reader, error) {
+	f.ask(readerClient, t)
+
+	return f.Scenario.Reader(), nil
+}
+
+// Targets returns the targets a Reader was requested for.
+func (f *Factory) Targets() []talos.Target { return f.askedFor(readerClient) }
+
+// ConfigWriter implements target.ClientFactory.
+func (f *Factory) ConfigWriter(_ context.Context, t talos.Target) (talos.ConfigWriter, error) {
+	f.ask(writerClient, t)
+
+	return f.Scenario.Writer(), nil
+}
+
+// WriterTargets returns the targets a ConfigWriter was requested for.
+func (f *Factory) WriterTargets() []talos.Target { return f.askedFor(writerClient) }
+
+// Upgrader implements target.ClientFactory.
+func (f *Factory) Upgrader(_ context.Context, t talos.Target) (talos.Upgrader, error) {
+	f.ask(upgraderClient, t)
+
+	return f.Scenario.Upgrader(), nil
+}
+
+// UpgraderTargets returns the targets an Upgrader was requested for.
+func (f *Factory) UpgraderTargets() []talos.Target { return f.askedFor(upgraderClient) }
 
 // Remover implements target.ClientFactory.
 func (f *Factory) Remover(_ context.Context, t talos.Target) (talos.Remover, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.removerTargets = append(f.removerTargets, t)
+	f.ask(removerClient, t)
 
 	return f.Scenario.Remover(), nil
 }
 
 // RemoverTargets returns the targets a Remover was requested for.
-func (f *Factory) RemoverTargets() []talos.Target {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (f *Factory) RemoverTargets() []talos.Target { return f.askedFor(removerClient) }
 
-	return slices.Clone(f.removerTargets)
+// Keeper implements target.ClientFactory.
+func (f *Factory) Keeper(_ context.Context, t talos.Target) (talos.Keeper, error) {
+	f.ask(keeperClient, t)
+
+	return f.Scenario.Keeper(), nil
 }
+
+// KeeperTargets returns the targets a Keeper was requested for.
+func (f *Factory) KeeperTargets() []talos.Target { return f.askedFor(keeperClient) }
 
 // Maintenance implements target.ClientFactory.
 func (f *Factory) Maintenance(_ context.Context, addr netip.Addr) (talos.Maintenance, error) {
 	return f.Scenario.Maintenance(addr), nil
 }
 
-// Upgrader implements target.ClientFactory.
-func (f *Factory) Upgrader(_ context.Context, t talos.Target) (talos.Upgrader, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.upgraderTargets = append(f.upgraderTargets, t)
-
-	return f.Scenario.Upgrader(), nil
-}
-
-// UpgraderTargets returns the targets an Upgrader was requested for.
-func (f *Factory) UpgraderTargets() []talos.Target {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return slices.Clone(f.upgraderTargets)
-}
-
-// ConfigWriter implements target.ClientFactory.
-func (f *Factory) ConfigWriter(_ context.Context, t talos.Target) (talos.ConfigWriter, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.writerTargets = append(f.writerTargets, t)
-
-	return f.Scenario.Writer(), nil
-}
-
-// WriterTargets returns the targets a ConfigWriter was requested for.
-func (f *Factory) WriterTargets() []talos.Target {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return slices.Clone(f.writerTargets)
-}
-
-// Reader implements target.ReaderFactory.
-func (f *Factory) Reader(_ context.Context, t talos.Target) (talos.Reader, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.targets = append(f.targets, t)
-
-	return f.Scenario.Reader(), nil
-}
-
-// Targets returns the targets requested so far.
-func (f *Factory) Targets() []talos.Target {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	return slices.Clone(f.targets)
-}
-
-type dryRunKey struct{}
-
-// dryRun reports whether ctx belongs to a dry-run apply, so record can mark the call.
-func dryRun(ctx context.Context) bool {
-	v, _ := ctx.Value(dryRunKey{}).(bool)
-
-	return v
-}
-
 // DryRunApply answers like Talos: it diffs the request against the node's active config with
 // machinery's configdiff, which is what the server does (generateDiff in Talos v1.14).
 func (r *reader) DryRunApply(ctx context.Context, node netip.Addr, machineConfig []byte) (talos.DryRunResult, error) {
-	n, err := r.s.record(context.WithValue(ctx, dryRunKey{}, true), MethodApplyConfiguration, node)
+	n, err := r.s.record(ctx, Call{Method: MethodApplyConfiguration, Node: node, DryRun: true})
 	if err != nil {
 		return talos.DryRunResult{}, err
 	}
@@ -1127,7 +1148,7 @@ type writer struct {
 func (w *writer) ApplyConfig(ctx context.Context, node netip.Addr, machineConfig []byte, mode talos.ApplyMode,
 	tryTimeout time.Duration,
 ) error {
-	if _, err := w.s.record(ctx, MethodApplyConfiguration, node); err != nil {
+	if _, err := w.s.record(ctx, Call{Method: MethodApplyConfiguration, Node: node, Mode: mode}); err != nil {
 		return err
 	}
 
@@ -1137,8 +1158,6 @@ func (w *writer) ApplyConfig(ctx context.Context, node netip.Addr, machineConfig
 
 	w.s.mu.Lock()
 	defer w.s.mu.Unlock()
-
-	w.s.calls[len(w.s.calls)-1].Mode = mode
 
 	n := w.s.nodes[node]
 
@@ -1166,35 +1185,20 @@ func (w *writer) ApplyConfig(ctx context.Context, node netip.Addr, machineConfig
 
 // upgrader implements talos.Upgrader the way a node behaves: an install only fills the inactive
 // boot slot, and nothing about the node changes until it reboots and is booted again (Boot).
-type upgrader struct {
-	reader
-}
+type upgrader struct{ forfeiter }
 
 var _ talos.Upgrader = (*upgrader)(nil)
 
-func (u *upgrader) image(ctx context.Context, method string, node netip.Addr, image string) (*Node, error) {
-	if _, err := u.s.record(ctx, method, node); err != nil {
-		return nil, err
-	}
-
-	u.s.mu.Lock()
-	defer u.s.mu.Unlock()
-
-	u.s.calls[len(u.s.calls)-1].Image = image
-
-	return u.s.nodes[node], nil
-}
-
 // PullImage implements talos.Upgrader.
 func (u *upgrader) PullImage(ctx context.Context, node netip.Addr, image string) error {
-	n, err := u.image(ctx, MethodImagePull, node, image)
-	if err != nil {
+	if _, err := u.s.record(ctx, Call{Method: MethodImagePull, Node: node, Image: image}); err != nil {
 		return err
 	}
 
 	u.s.mu.Lock()
 	defer u.s.mu.Unlock()
 
+	n := u.s.nodes[node]
 	if n.pulled == nil {
 		n.pulled = map[string]bool{}
 	}
@@ -1206,26 +1210,26 @@ func (u *upgrader) PullImage(ctx context.Context, node netip.Addr, image string)
 
 // PullKubernetesImage implements talos.Upgrader.
 func (u *upgrader) PullKubernetesImage(ctx context.Context, node netip.Addr, component, image string) error {
-	// Talos runs these from a node's config. kube-proxy is not among them: nothing pulls it here.
-	runs := []string{talos.ComponentAPIServer, talos.ComponentControllerManager, talos.ComponentScheduler, talos.ComponentKubelet}
-	if !slices.Contains(runs, component) {
-		return fmt.Errorf("%q is not a Kubernetes component Talos runs", component)
+	// Only what Talos runs from a node's config. kube-proxy is not among it: nothing pulls it here.
+	if err := talos.RunsKubernetesComponent(component); err != nil {
+		return err
 	}
 
-	_, err := u.image(ctx, MethodKubernetesImagePull, node, image)
+	_, err := u.s.record(ctx, Call{Method: MethodKubernetesImagePull, Node: node, Image: image})
 
 	return err
 }
 
 // Install implements talos.Upgrader.
 func (u *upgrader) Install(ctx context.Context, node netip.Addr, image string) error {
-	n, err := u.image(ctx, MethodInstall, node, image)
-	if err != nil {
+	if _, err := u.s.record(ctx, Call{Method: MethodInstall, Node: node, Image: image}); err != nil {
 		return err
 	}
 
 	u.s.mu.Lock()
 	defer u.s.mu.Unlock()
+
+	n := u.s.nodes[node]
 
 	switch {
 	case !n.pulled[image]:
@@ -1239,34 +1243,9 @@ func (u *upgrader) Install(ctx context.Context, node netip.Addr, image string) e
 	return nil
 }
 
-// ForfeitEtcdLeadership implements talos.Upgrader: the next control plane takes over.
-func (u *upgrader) ForfeitEtcdLeadership(ctx context.Context, node netip.Addr) error {
-	n, err := u.s.record(ctx, MethodEtcdForfeitLeadership, node)
-	if err != nil {
-		return err
-	}
-
-	u.s.mu.Lock()
-	defer u.s.mu.Unlock()
-
-	if n.EtcdMemberID == 0 || u.s.etcdLeader != n.EtcdMemberID {
-		return nil
-	}
-
-	for _, other := range u.s.sortedNodesLocked() {
-		if other.EtcdMemberID != 0 && other.EtcdMemberID != n.EtcdMemberID {
-			u.s.etcdLeader = other.EtcdMemberID
-
-			break
-		}
-	}
-
-	return nil
-}
-
 // Reboot implements talos.Upgrader. The node is down until Boot.
 func (u *upgrader) Reboot(ctx context.Context, node netip.Addr) error {
-	if _, err := u.s.record(ctx, MethodReboot, node); err != nil {
+	if _, err := u.s.record(ctx, Call{Method: MethodReboot, Node: node}); err != nil {
 		return err
 	}
 

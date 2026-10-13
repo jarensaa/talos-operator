@@ -19,7 +19,9 @@ package render
 import (
 	"fmt"
 	"slices"
+	"strings"
 
+	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/textdiff"
 )
 
@@ -98,4 +100,29 @@ func Diff(from, to *Config) ([]DocDiff, error) {
 	}
 
 	return diffs, nil
+}
+
+// Reproduces requires a rendered config to be the config a node runs. what names, in the plural,
+// what it was rendered from. The error shows the difference as Diff does: redacted.
+func Reproduces(what string, rendered *Config, live config.Provider) error {
+	want, err := Normalize(live)
+	if err != nil {
+		return fmt.Errorf("normalize live config: %w", err)
+	}
+
+	diffs, err := Diff(rendered, want)
+	if err != nil {
+		return err
+	}
+
+	if len(diffs) == 0 {
+		return nil
+	}
+
+	var text strings.Builder
+	for _, d := range diffs {
+		text.WriteString(d.Text)
+	}
+
+	return fmt.Errorf("%s do not reproduce the live config:\n%s", what, text.String())
 }

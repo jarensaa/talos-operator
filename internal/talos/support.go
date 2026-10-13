@@ -72,12 +72,12 @@ func UpgradeProblem(from, target, kubernetesVersion string) string {
 		return fmt.Sprintf("%s is older than %s, and downgrades are not supported", target, from)
 	}
 
-	to, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: target})
+	to, err := talosRelease(target)
 	if err != nil {
 		return fmt.Sprintf("unparsable version %q", target)
 	}
 
-	host, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: from})
+	host, err := talosRelease(from)
 	if err != nil {
 		return fmt.Sprintf("unparsable version %q", from)
 	}
@@ -90,13 +90,11 @@ func UpgradeProblem(from, target, kubernetesVersion string) string {
 		return ""
 	}
 
-	k8s, err := compatibility.ParseKubernetesVersion(kubernetesVersion)
-	if err != nil {
-		return fmt.Sprintf("unparsable Kubernetes version %q", kubernetesVersion)
-	}
-
-	if err := k8s.SupportedWith(to); err != nil {
-		return fmt.Sprintf("Talos %s does not support Kubernetes %s, which the cluster runs: %v", target, kubernetesVersion, err)
+	switch why, problem := runsKubernetes(target, kubernetesVersion); {
+	case problem != "":
+		return problem
+	case why != "":
+		return fmt.Sprintf("Talos %s does not support Kubernetes %s, which the cluster runs: %s", target, kubernetesVersion, why)
 	}
 
 	return ""
@@ -104,19 +102,50 @@ func UpgradeProblem(from, target, kubernetesVersion string) string {
 
 // RunsKubernetes says why a Talos release does not run a Kubernetes version, or returns "".
 func RunsKubernetes(talosVersion, kubernetesVersion string) string {
-	host, err := compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: talosVersion})
-	if err != nil {
-		return fmt.Sprintf("unparsable Talos version %q", talosVersion)
-	}
-
-	k8s, err := compatibility.ParseKubernetesVersion(strings.TrimPrefix(kubernetesVersion, "v"))
-	if err != nil {
-		return fmt.Sprintf("unparsable Kubernetes version %q", kubernetesVersion)
-	}
-
-	if err := k8s.SupportedWith(host); err != nil {
-		return fmt.Sprintf("Talos %s does not run Kubernetes %s: %v", talosVersion, strings.TrimPrefix(kubernetesVersion, "v"), err)
+	switch why, problem := runsKubernetes(talosVersion, kubernetesVersion); {
+	case problem != "":
+		return problem
+	case why != "":
+		return fmt.Sprintf("Talos %s does not run Kubernetes %s: %s", talosVersion, strings.TrimPrefix(kubernetesVersion, "v"), why)
 	}
 
 	return ""
+}
+
+// talosRelease reads the tag of a Talos release for machinery's compatibility rules.
+func talosRelease(tag string) (*compatibility.TalosVersion, error) {
+	return compatibility.ParseTalosVersion(&machineapi.VersionInfo{Tag: tag})
+}
+
+// kubernetesRelease reads a Kubernetes version, with or without its v, for machinery's
+// compatibility rules. The problem is that of a version that is none.
+func kubernetesRelease(kubernetesVersion string) (*compatibility.KubernetesVersion, string) {
+	parsed, err := compatibility.ParseKubernetesVersion(strings.TrimPrefix(kubernetesVersion, "v"))
+	if err != nil {
+		return nil, fmt.Sprintf("unparsable Kubernetes version %q", kubernetesVersion)
+	}
+
+	return parsed, ""
+}
+
+// runsKubernetes is the one place that asks machinery's compatibility rules whether a Talos
+// release runs a Kubernetes version. why is their reason when it does not, and empty when it
+// does. A version that is none is a problem instead, which says which of the two it is: the Talos
+// release is read first.
+func runsKubernetes(talosTag, kubernetesVersion string) (why, problem string) {
+	host, err := talosRelease(talosTag)
+	if err != nil {
+		return "", fmt.Sprintf("unparsable Talos version %q", talosTag)
+	}
+
+	kubernetes, problem := kubernetesRelease(kubernetesVersion)
+	if problem != "" {
+		return "", problem
+	}
+
+	if err := kubernetes.SupportedWith(host); err != nil {
+		return err.Error(), ""
+	}
+
+	return "", ""
 }

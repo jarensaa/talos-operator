@@ -52,63 +52,11 @@ var readOnlyMethods = map[string]bool{
 
 var rejectedRPCs = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "talos_operator_rejected_rpcs_total",
-	Help: "Talos API calls blocked by the read-only allowlist. Must stay 0 in production.",
+	Help: "Talos API calls the allowlist of the operator's own connection refused. Must stay 0 in production.",
 }, []string{"method"})
 
 func init() {
 	metrics.Registry.MustRegister(rejectedRPCs)
-}
-
-// checkReadOnly allows allowlisted methods, and ApplyConfiguration only as a dry run in mode TRY:
-// the adoption proof asks Talos itself to diff a config without applying it (docs/scope.md §7.1).
-// Any other mode is refused even as a dry run, because Talos cancels a pending TRY rollback
-// before it checks DryRun (v1alpha1_server.go:203-205 in Talos v1.14), which would disarm the
-// rollback that protects an in-flight config change (§8.5).
-//
-// MachineService.Read reads any file of a node, its secrets included. It is let through for one
-// path: the firmware's Secure Boot db, which holds certificates and hashes and nothing secret
-// (§7.3).
-func checkReadOnly(method string, req any) error {
-	if readOnlyMethods[method] {
-		return nil
-	}
-
-	if method == machineapi.MachineService_Read_FullMethodName {
-		if read, ok := req.(*machineapi.ReadRequest); ok && read.GetPath() == SecureBootDBPath {
-			return nil
-		}
-	}
-
-	if method == machineapi.MachineService_ApplyConfiguration_FullMethodName {
-		if apply, ok := req.(*machineapi.ApplyConfigurationRequest); ok && apply.GetDryRun() &&
-			apply.GetMode() == machineapi.ApplyConfigurationRequest_TRY {
-			return nil
-		}
-	}
-
-	rejectedRPCs.WithLabelValues(method).Inc()
-
-	return status.Errorf(codes.PermissionDenied, "talos-operator: %s is not allowed on this connection", method)
-}
-
-// upgradeMethods are the RPCs an Upgrader connection may issue besides the read-only ones: pulling
-// an image, installing it to the inactive boot slot, handing off etcd leadership, and rebooting.
-// The deprecated MachineService.Upgrade is not among them, and neither is anything that resets a
-// node, changes etcd membership or applies config.
-var upgradeMethods = map[string]bool{
-	machineapi.ImageService_Pull_FullMethodName:                    true,
-	machineapi.LifecycleService_Upgrade_FullMethodName:             true,
-	machineapi.MachineService_EtcdForfeitLeadership_FullMethodName: true,
-	machineapi.MachineService_Reboot_FullMethodName:                true,
-}
-
-// checkUpgrade is the allowlist of an Upgrader connection.
-func checkUpgrade(method string, req any) error {
-	if upgradeMethods[method] {
-		return nil
-	}
-
-	return checkReadOnly(method, req)
 }
 
 // access is what a connection may do. Each level has its own connection, so the allowlist is fixed
@@ -129,41 +77,123 @@ const (
 	// accessMaintenance is the connection to a machine in maintenance mode: it allows reading
 	// resources and handing the machine its config, and nothing a Reader may do besides.
 	accessMaintenance
+	// accessCount is how many kinds of access there are, and not one of them. A new kind goes
+	// above it, and into allowlists.
+	accessCount
 )
 
+// An allowlist says of one call whether its connection lets it through: nothing if it does, and
+// otherwise why not. It only answers. Counting and refusing are access.check's, so that no way of
+// refusing a call can go uncounted.
+type allowlist func(method string, req any) string
+
+// allowlists is the allowlist of every kind of access.
+var allowlists = [accessCount]allowlist{
+	accessReadOnly:    checkReadOnly,
+	accessConfig:      checkConfig,
+	accessUpgrade:     checkUpgrade,
+	accessMembership:  checkMembership,
+	accessUpkeep:      checkUpkeep,
+	accessMaintenance: checkMaintenance,
+}
+
+// check is what the interceptors of a connection ask before a call leaves. A refused call is
+// counted in talos_operator_rejected_rpcs_total and answered with PermissionDenied, whichever
+// allowlist refused it and for whatever reason. An access without an allowlist allows nothing.
 func (a access) check(method string, req any) error {
-	switch a {
-	case accessConfig:
-		return checkConfig(method, req)
-	case accessUpgrade:
-		return checkUpgrade(method, req)
-	case accessMembership:
-		return checkMembership(method, req)
-	case accessUpkeep:
-		return checkUpkeep(method, req)
-	case accessMaintenance:
-		return checkMaintenance(method, req)
-	case accessReadOnly:
+	why := "this connection has no allowlist, and so allows nothing"
+
+	if a >= 0 && a < accessCount && allowlists[a] != nil {
+		why = allowlists[a](method, req)
 	}
 
-	return checkReadOnly(method, req)
+	if why == "" {
+		return nil
+	}
+
+	rejectedRPCs.WithLabelValues(method).Inc()
+
+	return status.Error(codes.PermissionDenied, "talos-operator: "+why)
+}
+
+// notAllowed is the answer of an allowlist that has nothing more to say about a call.
+func notAllowed(method string) string {
+	return method + " is not allowed on this connection"
+}
+
+// checkReadOnly allows allowlisted methods, and ApplyConfiguration only as a dry run in mode TRY:
+// the adoption proof asks Talos itself to diff a config without applying it (docs/scope.md §7.1).
+// Any other mode is refused even as a dry run, because Talos cancels a pending TRY rollback
+// before it checks DryRun (v1alpha1_server.go:203-205 in Talos v1.14), which would disarm the
+// rollback that protects an in-flight config change (§8.5).
+//
+// MachineService.Read reads any file of a node, its secrets included. It is let through for one
+// path: the firmware's Secure Boot db, which holds certificates and hashes and nothing secret
+// (§7.3).
+func checkReadOnly(method string, req any) string {
+	if readOnlyMethods[method] {
+		return ""
+	}
+
+	if method == machineapi.MachineService_Read_FullMethodName {
+		if read, ok := req.(*machineapi.ReadRequest); ok && read.GetPath() == SecureBootDBPath {
+			return ""
+		}
+	}
+
+	if method == machineapi.MachineService_ApplyConfiguration_FullMethodName {
+		if apply, ok := req.(*machineapi.ApplyConfigurationRequest); ok && apply.GetDryRun() &&
+			apply.GetMode() == machineapi.ApplyConfigurationRequest_TRY {
+			return ""
+		}
+	}
+
+	return notAllowed(method)
 }
 
 // checkConfig is the allowlist of a ConfigWriter connection: everything a Reader may do, plus
 // ApplyConfiguration in mode NO_REBOOT or TRY. AUTO, REBOOT and STAGED are refused: the operator
 // never lets Talos decide to reboot, and never leaves a staged config behind. Nothing else that
 // mutates a node (reboot, upgrade, reset, etcd membership) is reachable through it.
-func checkConfig(method string, req any) error {
+func checkConfig(method string, req any) string {
 	if method == machineapi.MachineService_ApplyConfiguration_FullMethodName {
 		if apply, ok := req.(*machineapi.ApplyConfigurationRequest); ok && !apply.GetDryRun() {
 			switch apply.GetMode() { //nolint:exhaustive // every other mode is refused below
 			case machineapi.ApplyConfigurationRequest_NO_REBOOT, machineapi.ApplyConfigurationRequest_TRY:
-				return nil
+				return ""
 			}
 		}
 	}
 
 	return checkReadOnly(method, req)
+}
+
+// upgradeMethods are the RPCs an Upgrader connection may issue besides the read-only ones: pulling
+// an image, installing it to the inactive boot slot, handing off etcd leadership, and rebooting.
+// The deprecated MachineService.Upgrade is not among them, and neither is anything that resets a
+// node, changes etcd membership or applies config.
+var upgradeMethods = map[string]bool{
+	machineapi.ImageService_Pull_FullMethodName:                    true,
+	machineapi.LifecycleService_Upgrade_FullMethodName:             true,
+	machineapi.MachineService_EtcdForfeitLeadership_FullMethodName: true,
+	machineapi.MachineService_Reboot_FullMethodName:                true,
+}
+
+// checkUpgrade is the allowlist of an Upgrader connection.
+func checkUpgrade(method string, req any) string {
+	if upgradeMethods[method] {
+		return ""
+	}
+
+	return checkReadOnly(method, req)
+}
+
+// dialOptions puts the allowlist on a connection: what the access does not allow never leaves.
+func (a access) dialOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithChainUnaryInterceptor(a.unaryInterceptor()),
+		grpc.WithChainStreamInterceptor(a.streamInterceptor()),
+	}
 }
 
 func (a access) unaryInterceptor() grpc.UnaryClientInterceptor {

@@ -57,12 +57,6 @@ const (
 	DefaultObserveInterval = time.Minute
 	// DefaultHealthTimeout bounds the server-side health check per reconcile.
 	DefaultHealthTimeout = 30 * time.Second
-
-	machineTypeControlPlane = "controlplane"
-	machineTypeWorker       = "worker"
-
-	// stageRunning is the Talos machine stage of a booted, configured node.
-	stageRunning = plan.StageRunning
 )
 
 // TalosClusterReconciler observes Talos clusters and reports their state. In observe mode it
@@ -158,7 +152,7 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		adoptErr = r.prove(ctx, tc, obs)
 	}
 
-	if adoptErr == nil && managing(tc) {
+	if adoptErr == nil && tc.Spec.Management.ManagesConfig() {
 		obs.policy, obs.policyChanges = r.policy(ctx, tc)
 		adoptErr = r.manage(ctx, tc, obs)
 
@@ -166,6 +160,8 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			r.collectBundle(ctx, tc, obs)
 		}
 	}
+
+	keepTransitions(original.Status.Conditions, tc.Status.Conditions)
 
 	if !equality.Semantic.DeepEqual(original.Status, tc.Status) {
 		// The status holds the operation lock and the step in flight, so it is only ever written
@@ -220,18 +216,14 @@ func (r *TalosClusterReconciler) untilWindow(obs observation, wait time.Duration
 // proving reports whether the adoption proof is evaluated: the cluster is observed only and was
 // reached. The proof's own gate decides whether it can succeed (docs/scope.md §7.1 stage 3).
 func proving(tc *talosv1alpha1.TalosCluster, obs observation) bool {
-	observeOnly := tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == ""
-
-	return observeOnly && obs.facts != nil && obs.reader != nil
+	return !tc.Spec.Management.ManagesConfig() && obs.facts != nil && obs.reader != nil
 }
 
 // adopting reports whether the adoption step runs: the cluster is observed only and every
 // adoption precondition holds (docs/scope.md §7.1 stage 1). The step itself only writes resources
 // until the cluster is adopted; after that it keeps checking the secrets bundle against the nodes.
 func adopting(tc *talosv1alpha1.TalosCluster, obs observation) bool {
-	observeOnly := tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == ""
-
-	return observeOnly && obs.facts != nil &&
+	return !tc.Spec.Management.ManagesConfig() && obs.facts != nil &&
 		meta.IsStatusConditionTrue(tc.Status.Conditions, talosv1alpha1.ConditionAdoptionPreconditionsMet)
 }
 
@@ -269,6 +261,8 @@ type observation struct {
 	// maintenance windows say something else next; zero if they never do (docs/scope.md §6.4).
 	policy        plan.Policy
 	policyChanges time.Time
+	// pass is the pass as the gates see it, once it was worked out; see passOf.
+	pass *plan.Pass
 }
 
 func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions) observation {
@@ -334,9 +328,9 @@ func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.
 		}
 
 		switch m.MachineType {
-		case machineTypeControlPlane:
+		case talos.MachineTypeControlPlane:
 			obs.controlPlanes = append(obs.controlPlanes, addr)
-		case machineTypeWorker:
+		case talos.MachineTypeWorker:
 			obs.workers = append(obs.workers, addr)
 		}
 
@@ -350,7 +344,7 @@ func (r *TalosClusterReconciler) observe(ctx context.Context, tc *talosv1alpha1.
 
 		obs.talosVersions[facts.version]++
 
-		if m.MachineType == machineTypeControlPlane && facts.read && !etcdVia.IsValid() {
+		if m.MachineType == talos.MachineTypeControlPlane && facts.read && !etcdVia.IsValid() {
 			etcdVia = addr
 		}
 	}
@@ -464,13 +458,9 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 	})
 
 	reads.read("schematic", func(ctx context.Context) error {
-		sc, err := r.ImageFactorySchematic(ctx, addr)
-
-		// A node that was not installed from Image Factory has none: that is an answer.
-		if err == nil || errors.Is(err, talos.ErrNotFound) {
-			facts.schematicID = &sc.ID
-
-			return nil
+		id, err := schematicOf(ctx, r, addr)
+		if err == nil {
+			facts.schematicID = &id
 		}
 
 		return err
@@ -488,13 +478,13 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 		return err
 	})
 
-	if m.MachineType == machineTypeControlPlane {
+	if m.MachineType == talos.MachineTypeControlPlane {
 		reads.read("etcd status", func(ctx context.Context) error {
 			es, err := r.EtcdStatus(ctx, addr)
 			if err == nil {
 				facts.etcdErrors = es.Errors
 				facts.etcdStatusRead = true
-				facts.etcdLeader = es.MemberID != 0 && es.MemberID == es.Leader
+				facts.etcdLeader = leads(es)
 				facts.etcdSize, facts.etcdInUse = es.DBSize, es.DBSizeInUse
 			}
 
@@ -507,6 +497,20 @@ func observeNodeFacts(ctx context.Context, r talos.Reader, m talos.Member, addr 
 
 	return facts
 }
+
+// schematicOf is the Image Factory schematic a node was installed from. A node that was not
+// installed from Image Factory has none: that is an answer, and the empty one.
+func schematicOf(ctx context.Context, r talos.Reader, node netip.Addr) (string, error) {
+	schematic, err := r.ImageFactorySchematic(ctx, node)
+	if err != nil && !errors.Is(err, talos.ErrNotFound) {
+		return "", err
+	}
+
+	return schematic.ID, nil
+}
+
+// leads reports whether the etcd member that answered is the one that leads.
+func leads(es talos.EtcdStatus) bool { return es.MemberID != 0 && es.MemberID == es.Leader }
 
 // left lists the addresses of the machines the operator took out of the cluster, or is past the
 // point of taking out: removed, reset and on its way out, or confirmed dead.
@@ -598,7 +602,7 @@ func (r *TalosClusterReconciler) applyObservation(tc *talosv1alpha1.TalosCluster
 
 	st.ObservedGeneration = gen
 
-	if tc.Spec.Management.Config == talosv1alpha1.ConfigManagementObserve || tc.Spec.Management.Config == "" {
+	if !tc.Spec.Management.ManagesConfig() {
 		st.Phase = talosv1alpha1.ClusterPhaseAdopting
 		if adopted(tc) {
 			st.Phase = talosv1alpha1.ClusterPhaseAdopted
@@ -767,26 +771,23 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 		was = nil
 	}
 
-	// The same events tell the story of every kind of operation, under their own names.
-	kind, done, does := "Rollout", "MachineConfigured", "runs its rendered config"
-
 	of := is
 	if of == nil {
 		of = was
 	}
 
-	if of != nil {
-		switch of.Type { //nolint:exhaustive // every other kind tells the story of a rollout
-		case talosv1alpha1.OperationTalosUpgrade:
-			kind, done, does = "Upgrade", "MachineUpgraded", "runs the installed system"
-		case talosv1alpha1.OperationKubernetesUpgrade:
-			kind, done, does = "KubernetesUpgrade", "ComponentUpgraded", "runs the new version"
-		case talosv1alpha1.OperationAddMachine:
-			kind, done, does = "Addition", "MachineAdded", "is a member of the cluster"
-		case talosv1alpha1.OperationRemoveMachine:
-			kind, done, does = "Removal", "MachineRemoved", "has left the cluster"
-		}
+	if of == nil {
+		return
 	}
+
+	// The same events tell the story of every kind of operation, under its own names. An
+	// operation of a kind that has none is told as what it is called.
+	k, known := kinds[of.Type]
+	if !known {
+		k = kind{event: string(of.Type), done: "TurnDone", does: "is done"}
+	}
+
+	kind, done, does := k.event, k.done, k.does
 
 	if is != nil {
 		if was == nil {
@@ -841,7 +842,21 @@ func setCondition(st *talosv1alpha1.TalosClusterStatus, gen int64, condType stri
 	setConditionIn(&st.Conditions, gen, condType, status, reason, message)
 }
 
-// setConditionIn sets a condition; LastTransitionTime only moves when the status changes.
+// keepTransitions gives every condition that has the status it had before this pass the
+// transition time it had then. A pass says what holds now, and says some of it by clearing a
+// condition and setting it again, which is no transition: left as it is, the time of every such
+// condition would move with every pass, and a cluster that is blocked, and so at rest, would be
+// written to for as long as it is.
+func keepTransitions(before, after []metav1.Condition) {
+	for i := range after {
+		if was := meta.FindStatusCondition(before, after[i].Type); was != nil && was.Status == after[i].Status {
+			after[i].LastTransitionTime = was.LastTransitionTime
+		}
+	}
+}
+
+// setConditionIn sets a condition. Its LastTransitionTime only moves when its status changes
+// from what it was when the pass began (keepTransitions).
 func setConditionIn(conds *[]metav1.Condition, gen int64, condType string, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(conds, metav1.Condition{
 		Type:               condType,

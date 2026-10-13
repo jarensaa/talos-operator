@@ -81,7 +81,7 @@ func (f clusterFacts) judged() plan.Cluster {
 	for _, n := range f.nodes {
 		m := plan.Member{
 			Hostname:       n.hostname,
-			ControlPlane:   n.machineType == machineTypeControlPlane,
+			ControlPlane:   n.machineType == talos.MachineTypeControlPlane,
 			ReadErr:        n.readErr,
 			Version:        n.version,
 			Schematic:      n.schematicID,
@@ -143,8 +143,13 @@ func hasAddress(node corev1.Node, addr netip.Addr) bool {
 	})
 }
 
-// passOf is this pass over the cluster as the rollout's gates see it.
+// passOf is this pass over the cluster as the gates see it. It is worked out once in a pass
+// (manage), and whoever changes what they were handed changes a copy.
 func passOf(obs observation) plan.Pass {
+	if obs.pass != nil {
+		return *obs.pass
+	}
+
 	p := plan.Pass{Reached: obs.facts != nil, Matched: obs.unmatched != nil, Unmatched: obs.unmatched}
 
 	if obs.facts != nil {

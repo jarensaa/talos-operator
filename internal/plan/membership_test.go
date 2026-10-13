@@ -23,8 +23,6 @@ import (
 	"time"
 )
 
-var membershipTiming = Timing{}.WithDefaults()
-
 // passOf is a healthy pass over a cluster of the given control planes and one worker.
 func passOf(controlPlanes ...string) Pass {
 	p := healthyPass()
@@ -119,7 +117,7 @@ func TestPlanRemoval(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 
-	got = PlanRemoval(machines, RemovalSettings{Paused: true}, passOf("a", "b", "c", "d"))
+	got = PlanRemoval(machines, RemovalSettings{Policy: pausedPolicy}, passOf("a", "b", "c", "d"))
 	if got.MayStart() || got.BlockReason != BlockPaused {
 		t.Fatalf("got %+v", got)
 	}
@@ -138,7 +136,7 @@ func TestPlanRemoval(t *testing.T) {
 	}
 
 	// What a human left out stays out, and what is left goes on.
-	got = PlanRemoval(machines, RemovalSettings{Held: []string{"w-1"}}, passOf("a", "b", "c", "d"))
+	got = PlanRemoval(machines, RemovalSettings{Skipped: map[string]string{"w-1": ""}}, passOf("a", "b", "c", "d"))
 	if !slices.Equal(got.Pending, []string{"w-2", "cp-d"}) || !slices.Equal(got.Held, []string{"w-1"}) {
 		t.Fatalf("got %+v", got)
 	}
@@ -153,7 +151,7 @@ func TestPlanRemoval(t *testing.T) {
 		t.Fatalf("got %+v", got)
 	}
 
-	if got := PlanRemoval(silent, RemovalSettings{Paused: true}, incomplete); got.MayStart() {
+	if got := PlanRemoval(silent, RemovalSettings{Policy: pausedPolicy}, incomplete); got.MayStart() {
 		t.Fatalf("a pause holds it like any other: %+v", got)
 	}
 
@@ -172,7 +170,7 @@ func TestPlanJoin(t *testing.T) {
 	healthy := passOf("a", "b", "c")
 
 	got := PlanJoin(machines, JoinSettings{Hostnames: names}, passOf("a", "b", "c"))
-	if !slices.Equal(got.Pending, []string{"w-2", "w-3", "cp-d"}) || !got.MayStart() || got.Configs["cp-d"] != "config-of-cp-d" {
+	if !slices.Equal(got.Pending, []string{"w-2", "w-3", "cp-d"}) || !got.MayStart() || got.Targets["cp-d"] != "config-of-cp-d" {
 		t.Fatalf("workers first, then control planes: %+v", got)
 	}
 
@@ -192,7 +190,7 @@ func TestPlanJoin(t *testing.T) {
 		machines []JoinMachine
 		reason   string
 	}{
-		"paused":                {JoinSettings{Paused: true, Hostnames: names}, passOf("a", "b", "c"), machines, BlockPaused},
+		"paused":                {JoinSettings{Policy: pausedPolicy, Hostnames: names}, passOf("a", "b", "c"), machines, BlockPaused},
 		"outside its window":    {JoinSettings{Policy: Policy{OutsideWindow: "opens at 02:00"}}, healthy, machines, BlockOutsideWindow},
 		"a rollout is due":      {JoinSettings{NotAtRest: "node-a does not run its rendered config"}, healthy, machines, BlockNotAtRest},
 		"a user's gate":         {JoinSettings{Policy: Policy{GateClosed: "storage is rebuilding"}}, healthy, machines, BlockGateClosed},
@@ -215,7 +213,9 @@ func TestPlanJoin(t *testing.T) {
 	}
 
 	// What a human left out with this config stays out; with another config it is to be added again.
-	got = PlanJoin(machines, JoinSettings{Hostnames: names, Held: map[string]string{"w-2": "config-of-w-2", "w-3": "an older config"}},
+	got = PlanJoin(machines, JoinSettings{
+		Hostnames: names, Skipped: map[string]string{"w-2": "config-of-w-2"}, Aborted: map[string]string{"w-3": "an older config"},
+	},
 		passOf("a", "b", "c"))
 	if !slices.Equal(got.Pending, []string{"w-3", "cp-d"}) || !slices.Equal(got.Held, []string{"w-2"}) {
 		t.Fatalf("got %+v", got)
@@ -244,8 +244,8 @@ func TestNextJoinStep(t *testing.T) {
 		return n
 	}
 
-	long := membershipTiming.StepTimeout
-	soaked := began.Add(membershipTiming.Soak)
+	long := timing.StepTimeout
+	soaked := began.Add(timing.Soak)
 
 	for _, tt := range []struct {
 		name         string
@@ -293,7 +293,7 @@ func TestNextJoinStep(t *testing.T) {
 		{name: "healthy for the first time", step: StepVerifying, node: member, checks: open, want: MarkHealthy},
 		{name: "soaking", step: StepVerifying, node: member, checks: open, healthySince: began, after: time.Second, want: Wait,
 			detail: "soaking"},
-		{name: "soaked", step: StepVerifying, node: member, checks: open, healthySince: began, after: membershipTiming.Soak, want: Complete},
+		{name: "soaked", step: StepVerifying, node: member, checks: open, healthySince: began, after: timing.Soak, want: Complete},
 		{name: "the cluster is not healthy", step: StepVerifying, node: member, checks: closed, want: Wait, detail: "learner"},
 		{name: "it stopped being healthy", step: StepVerifying, node: member, checks: closed, healthySince: began, after: time.Second,
 			want: MarkUnhealthy},
@@ -302,9 +302,9 @@ func TestNextJoinStep(t *testing.T) {
 		{name: "never verified", step: StepVerifying, node: member, checks: closed, after: long, want: Fail, detail: FailTimeout},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			step := JoinStep{Name: tt.step, Since: began, HealthySince: tt.healthySince}
+			step := Step{Name: tt.step, Since: began, HealthySince: tt.healthySince}
 
-			got := NextJoinStep(step, tt.node, tt.pre, tt.checks, membershipTiming, began.Add(tt.after))
+			got := NextJoinStep(step, tt.node, tt.pre, tt.checks, timing, began.Add(tt.after))
 			if got.Kind != tt.want || !strings.Contains(got.Step+" "+got.Reason+" "+got.Message, tt.detail) {
 				t.Fatalf("got %s %+v", got.Kind, got)
 			}
@@ -328,7 +328,7 @@ func TestJoinNeverProvisionsWhatItShouldNot(t *testing.T) {
 								node.FitProblems = []string{"no such disk"}
 							}
 
-							got := NextJoinStep(JoinStep{Name: StepProvisioning, Since: began}, node, pre, Gate{}, membershipTiming, began)
+							got := NextJoinStep(Step{Name: StepProvisioning, Since: began}, node, pre, Gate{}, timing, began)
 							allowed := probed && maintenance && identity && fits && !member && pre.Open
 
 							if (got.Kind == Provision) != allowed {
@@ -343,7 +343,7 @@ func TestJoinNeverProvisionsWhatItShouldNot(t *testing.T) {
 
 	for _, step := range []string{StepJoining, StepVerifying} {
 		node := JoinNode{Probed: true, InMaintenance: true, IdentityMatches: true}
-		if got := NextJoinStep(JoinStep{Name: step, Since: began}, node, open, open, membershipTiming, began); got.Kind == Provision {
+		if got := NextJoinStep(Step{Name: step, Since: began}, node, open, open, timing, began); got.Kind == Provision {
 			t.Fatalf("%s: a config is handed over in the first step and in no other", step)
 		}
 	}
@@ -370,11 +370,11 @@ func TestNextRemovalStep(t *testing.T) {
 	etcdUnread := with(controlPlane(wiped, false), func(n *RemovalNode) { n.EtcdKnown = false })
 	kubernetesUnread := with(wiped, func(n *RemovalNode) { n.KubernetesKnown = false })
 
-	long := membershipTiming.StepTimeout
+	long := timing.StepTimeout
 
 	for _, tt := range []struct {
 		name         string
-		step         RemovalStep
+		step         Step
 		node         RemovalNode
 		pre, checks  Gate
 		after        time.Duration
@@ -382,75 +382,75 @@ func TestNextRemovalStep(t *testing.T) {
 		want         ActionKind
 		detail       string
 	}{
-		{name: "not cordoned yet", step: RemovalStep{Name: StepDraining}, node: live, pre: open, want: MarkCordoned},
-		{name: "about to cordon", step: RemovalStep{Name: StepDraining, Cordoned: true}, node: live, pre: open, want: Cordon},
-		{name: "the gate is closed", step: RemovalStep{Name: StepDraining}, node: live, pre: closed, want: Wait, detail: "learner"},
-		{name: "pods left", step: RemovalStep{Name: StepDraining, Cordoned: true}, node: cordoned(3), pre: open, want: Evict, detail: "3 pods"},
+		{name: "not cordoned yet", step: Step{Name: StepDraining}, node: live, pre: open, want: MarkCordoned},
+		{name: "about to cordon", step: Step{Name: StepDraining, Cordoned: true}, node: live, pre: open, want: Cordon},
+		{name: "the gate is closed", step: Step{Name: StepDraining}, node: live, pre: closed, want: Wait, detail: "learner"},
+		{name: "pods left", step: Step{Name: StepDraining, Cordoned: true}, node: cordoned(3), pre: open, want: Evict, detail: "3 pods"},
 		// A node that is being drained is finished, whatever the gate says by now.
-		{name: "pods left, gate closed", step: RemovalStep{Name: StepDraining, Cordoned: true}, node: cordoned(1), pre: closed, want: Evict},
-		{name: "drained", step: RemovalStep{Name: StepDraining, Cordoned: true}, node: cordoned(0), pre: open, want: Advance,
+		{name: "pods left, gate closed", step: Step{Name: StepDraining, Cordoned: true}, node: cordoned(1), pre: closed, want: Evict},
+		{name: "drained", step: Step{Name: StepDraining, Cordoned: true}, node: cordoned(0), pre: open, want: Advance,
 			detail: StepResetting},
-		{name: "pods not listed", step: RemovalStep{Name: StepDraining, Cordoned: true}, node: cordoned(-1), pre: open, want: Wait},
-		{name: "never drained", step: RemovalStep{Name: StepDraining, Cordoned: true}, node: cordoned(2), pre: open,
-			after: membershipTiming.DrainTimeout, want: Fail, detail: FailDrainTimeout},
-		{name: "no Node to drain", step: RemovalStep{Name: StepDraining}, node: with(live, func(n *RemovalNode) { n.Registered = false }),
+		{name: "pods not listed", step: Step{Name: StepDraining, Cordoned: true}, node: cordoned(-1), pre: open, want: Wait},
+		{name: "never drained", step: Step{Name: StepDraining, Cordoned: true}, node: cordoned(2), pre: open,
+			after: timing.DrainTimeout, want: Fail, detail: FailDrainTimeout},
+		{name: "no Node to drain", step: Step{Name: StepDraining}, node: with(live, func(n *RemovalNode) { n.Registered = false }),
 			pre: open, want: Advance, detail: StepResetting},
 		// What cannot be reset afterwards is not drained first.
-		{name: "the machine does not answer", step: RemovalStep{Name: StepDraining}, node: silent, pre: open, want: Wait,
+		{name: "the machine does not answer", step: Step{Name: StepDraining}, node: silent, pre: open, want: Wait,
 			detail: "not reachable"},
-		{name: "the machine never answered", step: RemovalStep{Name: StepDraining}, node: silent, pre: open, after: long, want: Fail,
+		{name: "the machine never answered", step: Step{Name: StepDraining}, node: silent, pre: open, after: long, want: Fail,
 			detail: FailNodeGone},
-		{name: "it left before its turn", step: RemovalStep{Name: StepDraining}, node: wiped, pre: closed, want: Advance, detail: StepLeaving},
+		{name: "it left before its turn", step: Step{Name: StepDraining}, node: wiped, pre: closed, want: Advance, detail: StepLeaving},
 
-		{name: "ready to be reset", step: RemovalStep{Name: StepResetting, Cordoned: true}, node: cordoned(0), pre: open, want: Reset},
-		{name: "the gate closed before the reset", step: RemovalStep{Name: StepResetting, Cordoned: true}, node: cordoned(0), pre: closed,
+		{name: "ready to be reset", step: Step{Name: StepResetting, Cordoned: true}, node: cordoned(0), pre: open, want: Reset},
+		{name: "the gate closed before the reset", step: Step{Name: StepResetting, Cordoned: true}, node: cordoned(0), pre: closed,
 			want: Wait, detail: "learner"},
-		{name: "the gate never opened again", step: RemovalStep{Name: StepResetting, Cordoned: true}, node: cordoned(0), pre: closed,
+		{name: "the gate never opened again", step: Step{Name: StepResetting, Cordoned: true}, node: cordoned(0), pre: closed,
 			after: long, want: Fail, detail: FailTimeout},
-		{name: "it went quiet before the reset", step: RemovalStep{Name: StepResetting, Cordoned: true}, node: gone, pre: open, want: Wait},
-		{name: "it stayed quiet", step: RemovalStep{Name: StepResetting, Cordoned: true}, node: gone, pre: open, after: long, want: Fail,
+		{name: "it went quiet before the reset", step: Step{Name: StepResetting, Cordoned: true}, node: gone, pre: open, want: Wait},
+		{name: "it stayed quiet", step: Step{Name: StepResetting, Cordoned: true}, node: gone, pre: open, after: long, want: Fail,
 			detail: FailNodeGone},
 		// It was reset: it is never reset again.
-		{name: "it is back in maintenance mode", step: RemovalStep{Name: StepResetting, Cordoned: true}, node: wiped, pre: open, want: Advance,
+		{name: "it is back in maintenance mode", step: Step{Name: StepResetting, Cordoned: true}, node: wiped, pre: open, want: Advance,
 			detail: StepLeaving},
 
-		{name: "a worker on its way out", step: RemovalStep{Name: StepLeaving}, node: gone, want: Wait, detail: "maintenance mode"},
-		{name: "a worker that forgot the cluster", step: RemovalStep{Name: StepLeaving}, node: wiped, want: Advance, detail: StepDeleting},
-		{name: "a control plane still in etcd", step: RemovalStep{Name: StepLeaving}, node: controlPlane(wiped, true), want: Wait,
+		{name: "a worker on its way out", step: Step{Name: StepLeaving}, node: gone, want: Wait, detail: "maintenance mode"},
+		{name: "a worker that forgot the cluster", step: Step{Name: StepLeaving}, node: wiped, want: Advance, detail: StepDeleting},
+		{name: "a control plane still in etcd", step: Step{Name: StepLeaving}, node: controlPlane(wiped, true), want: Wait,
 			detail: "etcd"},
-		{name: "a control plane that is gone", step: RemovalStep{Name: StepLeaving}, node: controlPlane(wiped, false), want: Advance,
+		{name: "a control plane that is gone", step: Step{Name: StepLeaving}, node: controlPlane(wiped, false), want: Advance,
 			detail: StepDeleting},
-		{name: "etcd not read", step: RemovalStep{Name: StepLeaving}, node: etcdUnread, want: Wait, detail: "could not be read"},
+		{name: "etcd not read", step: Step{Name: StepLeaving}, node: etcdUnread, want: Wait, detail: "could not be read"},
 		// Whether it still holds the cluster's secrets cannot be told.
-		{name: "it never came back", step: RemovalStep{Name: StepLeaving}, node: gone, after: long, want: Fail, detail: FailNotWiped},
-		{name: "its member never left", step: RemovalStep{Name: StepLeaving}, node: controlPlane(wiped, true), after: long, want: Fail,
+		{name: "it never came back", step: Step{Name: StepLeaving}, node: gone, after: long, want: Fail, detail: FailNotWiped},
+		{name: "its member never left", step: Step{Name: StepLeaving}, node: controlPlane(wiped, true), after: long, want: Fail,
 			detail: FailTimeout},
 
-		{name: "a dead worker", step: RemovalStep{Name: StepLeaving, Dead: true}, node: gone, pre: open, want: Advance, detail: StepDeleting},
-		{name: "a dead control plane", step: RemovalStep{Name: StepLeaving, Dead: true}, node: controlPlane(gone, true), pre: open,
+		{name: "a dead worker", step: Step{Name: StepLeaving, Dead: true}, node: gone, pre: open, want: Advance, detail: StepDeleting},
+		{name: "a dead control plane", step: Step{Name: StepLeaving, Dead: true}, node: controlPlane(gone, true), pre: open,
 			want: RemoveMember},
-		{name: "a dead control plane, gate closed", step: RemovalStep{Name: StepLeaving, Dead: true}, node: controlPlane(gone, true),
+		{name: "a dead control plane, gate closed", step: Step{Name: StepLeaving, Dead: true}, node: controlPlane(gone, true),
 			pre: closed, want: Wait, detail: "learner"},
-		{name: "a dead control plane, out of etcd", step: RemovalStep{Name: StepLeaving, Dead: true}, node: controlPlane(gone, false),
+		{name: "a dead control plane, out of etcd", step: Step{Name: StepLeaving, Dead: true}, node: controlPlane(gone, false),
 			pre: open, want: Advance, detail: StepDeleting},
-		{name: "a dead control plane, never out of etcd", step: RemovalStep{Name: StepLeaving, Dead: true}, node: controlPlane(gone, true),
+		{name: "a dead control plane, never out of etcd", step: Step{Name: StepLeaving, Dead: true}, node: controlPlane(gone, true),
 			pre: closed, after: long, want: Fail, detail: FailTimeout},
 
-		{name: "its Node is still there", step: RemovalStep{Name: StepDeleting}, node: wiped, want: DeleteNode},
-		{name: "its Node is gone", step: RemovalStep{Name: StepDeleting}, node: with(wiped, func(n *RemovalNode) { n.Registered = false }),
+		{name: "its Node is still there", step: Step{Name: StepDeleting}, node: wiped, want: DeleteNode},
+		{name: "its Node is gone", step: Step{Name: StepDeleting}, node: with(wiped, func(n *RemovalNode) { n.Registered = false }),
 			want: Advance, detail: StepVerifying},
-		{name: "Kubernetes not read", step: RemovalStep{Name: StepDeleting}, node: kubernetesUnread, want: Wait},
+		{name: "Kubernetes not read", step: Step{Name: StepDeleting}, node: kubernetesUnread, want: Wait},
 
-		{name: "the rest is healthy", step: RemovalStep{Name: StepVerifying}, checks: open, want: MarkHealthy},
-		{name: "the rest soaked", step: RemovalStep{Name: StepVerifying}, checks: open, healthySince: began, after: membershipTiming.Soak,
+		{name: "the rest is healthy", step: Step{Name: StepVerifying}, checks: open, want: MarkHealthy},
+		{name: "the rest soaked", step: Step{Name: StepVerifying}, checks: open, healthySince: began, after: timing.Soak,
 			want: Complete},
-		{name: "the rest is not healthy", step: RemovalStep{Name: StepVerifying}, checks: closed, want: Wait, detail: "learner"},
-		{name: "the rest never was", step: RemovalStep{Name: StepVerifying}, checks: closed, after: long, want: Fail, detail: FailTimeout},
+		{name: "the rest is not healthy", step: Step{Name: StepVerifying}, checks: closed, want: Wait, detail: "learner"},
+		{name: "the rest never was", step: Step{Name: StepVerifying}, checks: closed, after: long, want: Fail, detail: FailTimeout},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			tt.step.Since, tt.step.HealthySince = began, tt.healthySince
 
-			got := NextRemovalStep(tt.step, tt.node, tt.pre, tt.checks, membershipTiming, began.Add(tt.after))
+			got := NextRemovalStep(tt.step, tt.node, tt.pre, tt.checks, timing, began.Add(tt.after))
 			if got.Kind != tt.want || !strings.Contains(got.Step+" "+got.Reason+" "+got.Message, tt.detail) {
 				t.Fatalf("got %s %+v", got.Kind, got)
 			}
@@ -475,8 +475,8 @@ func TestRemovalNeverDoesWhatItShouldNot(t *testing.T) {
 									Reachable: reachable, Wiped: wiped, ControlPlane: true, EtcdKnown: true, EtcdMember: member,
 									KubernetesKnown: true, Registered: true, Unschedulable: cordoned,
 								}
-								got := NextRemovalStep(RemovalStep{Name: step, Since: began, Dead: dead, Cordoned: true}, node, pre, open,
-									membershipTiming, began)
+								got := NextRemovalStep(Step{Name: step, Since: began, Dead: dead, Cordoned: true}, node, pre, open,
+									timing, began)
 								where := func() string { return step + " " + got.Kind.String() }
 
 								switch got.Kind { //nolint:exhaustive // the actions that take something

@@ -23,14 +23,10 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
-	"github.com/siderolabs/talos/pkg/machinery/config"
-	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -75,12 +71,7 @@ func TestReaderMethodSetIsReviewed(t *testing.T) {
 }
 
 func TestCheckReadOnly(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
+	checkAllowlist(t, accessReadOnly, []allowCase{
 		{"version", machineapi.MachineService_Version_FullMethodName, &emptypb.Empty{}, true},
 		{"cosi get", cosiGetMethod, nil, true},
 		{"reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, false},
@@ -106,64 +97,26 @@ func TestCheckReadOnly(t *testing.T) {
 		{"read a path that only starts like the db", machineapi.MachineService_Read_FullMethodName,
 			&machineapi.ReadRequest{Path: SecureBootDBPath + "/../../../../../system/state/config.yaml"}, false},
 		{"read without typed request", machineapi.MachineService_Read_FullMethodName, nil, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			before := testutil.ToFloat64(rejectedRPCs.WithLabelValues(tt.method))
-
-			err := checkReadOnly(tt.method, tt.req)
-
-			after := testutil.ToFloat64(rejectedRPCs.WithLabelValues(tt.method))
-
-			if tt.allow {
-				if err != nil {
-					t.Fatalf("expected allowed, got %v", err)
-				}
-
-				if after != before {
-					t.Fatal("allowed call must not count as rejected")
-				}
-
-				return
-			}
-
-			if status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-
-			if after != before+1 {
-				t.Fatalf("rejected counter: before %v after %v", before, after)
-			}
-		})
-	}
+	})
 }
 
 // A ConfigWriter connection may apply config without rebooting or in try mode, and still nothing
 // else that mutates a node.
 func TestCheckConfig(t *testing.T) {
-	apply := machineapi.MachineService_ApplyConfiguration_FullMethodName
-	mode := func(m machineapi.ApplyConfigurationRequest_Mode, dryRun bool) *machineapi.ApplyConfigurationRequest {
-		return &machineapi.ApplyConfigurationRequest{Mode: m, DryRun: dryRun}
-	}
+	const method = machineapi.MachineService_ApplyConfiguration_FullMethodName
 
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
-		{"apply no-reboot", apply, mode(machineapi.ApplyConfigurationRequest_NO_REBOOT, false), true},
-		{"apply try", apply, mode(machineapi.ApplyConfigurationRequest_TRY, false), true},
-		{"dry run in try mode", apply, mode(machineapi.ApplyConfigurationRequest_TRY, true), true},
+	checkAllowlist(t, accessConfig, []allowCase{
+		{"apply no-reboot", method, apply(machineapi.ApplyConfigurationRequest_NO_REBOOT, false), true},
+		{"apply try", method, apply(machineapi.ApplyConfigurationRequest_TRY, false), true},
+		{"dry run in try mode", method, apply(machineapi.ApplyConfigurationRequest_TRY, true), true},
 		// Talos would decide about a reboot itself, or leave a config staged for the next boot.
-		{"apply auto", apply, mode(machineapi.ApplyConfigurationRequest_AUTO, false), false},
-		{"apply staged", apply, mode(machineapi.ApplyConfigurationRequest_STAGED, false), false},
+		{"apply auto", method, apply(machineapi.ApplyConfigurationRequest_AUTO, false), false},
+		{"apply staged", method, apply(machineapi.ApplyConfigurationRequest_STAGED, false), false},
 		//nolint:staticcheck // the deprecated mode must stay refused
-		{"apply reboot", apply, mode(machineapi.ApplyConfigurationRequest_REBOOT, false), false},
+		{"apply reboot", method, apply(machineapi.ApplyConfigurationRequest_REBOOT, false), false},
 		// A dry run in another mode still cancels a pending try rollback.
-		{"dry run in no-reboot mode", apply, mode(machineapi.ApplyConfigurationRequest_NO_REBOOT, true), false},
-		{"apply without typed request", apply, nil, false},
+		{"dry run in no-reboot mode", method, apply(machineapi.ApplyConfigurationRequest_NO_REBOOT, true), false},
+		{"apply without typed request", method, nil, false},
 		{"version", machineapi.MachineService_Version_FullMethodName, &emptypb.Empty{}, true},
 		{"reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, false},
 		{"reset", machineapi.MachineService_Reset_FullMethodName, &machineapi.ResetRequest{}, false},
@@ -171,20 +124,7 @@ func TestCheckConfig(t *testing.T) {
 		{"upgrade", machineapi.MachineService_Upgrade_FullMethodName, &machineapi.UpgradeRequest{}, false},
 		{"etcd leave", machineapi.MachineService_EtcdLeaveCluster_FullMethodName, &machineapi.EtcdLeaveClusterRequest{}, false},
 		{"bootstrap", machineapi.MachineService_Bootstrap_FullMethodName, &machineapi.BootstrapRequest{}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := accessConfig.check(tt.method, tt.req)
-			if tt.allow && err != nil {
-				t.Fatalf("expected allowed, got %v", err)
-			}
-
-			if !tt.allow && status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-		})
-	}
+	})
 }
 
 func TestReaderAndConfigWriterUseSeparateConnections(t *testing.T) {
@@ -206,12 +146,6 @@ func TestReaderAndConfigWriterUseSeparateConnections(t *testing.T) {
 
 	if ro == rw {
 		t.Fatal("a Reader must never share the ConfigWriter's connection, whose allowlist is wider")
-	}
-
-	f.Invalidate("uid-1")
-
-	if len(f.clients) != 0 {
-		t.Fatalf("Invalidate must drop both connections, left %d", len(f.clients))
 	}
 }
 
@@ -330,15 +264,12 @@ func ep(s string) creds.Endpoint {
 func TestSelectEndpoints(t *testing.T) {
 	cps := []creds.Endpoint{ep("10.0.0.11"), ep("10.0.0.12"), ep("10.0.0.13")}
 
-	got, err := SelectEndpoints(cps, SelectOptions{
-		Exclude: netip.MustParseAddr("10.0.0.11"),
-		Healthy: map[netip.Addr]bool{netip.MustParseAddr("10.0.0.13"): true},
-	})
+	got, err := SelectEndpoints(cps, SelectOptions{Exclude: netip.MustParseAddr("10.0.0.11")})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want := []creds.Endpoint{ep("10.0.0.13"), ep("10.0.0.12")}
+	want := []creds.Endpoint{ep("10.0.0.12"), ep("10.0.0.13")}
 	if !slices.Equal(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -363,11 +294,6 @@ func TestParseEndpointRejectsHostnames(t *testing.T) {
 		}
 	}
 }
-
-// testBundle is shared by the package: generating a bundle's CA keys takes about a second.
-var testBundle = sync.OnceValues(func() (*secrets.Bundle, error) {
-	return secrets.NewBundle(secrets.NewClock(), config.TalosVersion1_14)
-})
 
 func testCredentials(t *testing.T) *creds.Credentials {
 	t.Helper()
@@ -434,10 +360,10 @@ func TestFactoryCachesPerTargetAndEndpoints(t *testing.T) {
 		t.Fatalf("an idle client must be closed and forgotten, %d left", len(f.clients))
 	}
 
-	f.Invalidate("uid-1")
+	f.Close()
 
 	if len(f.clients) != 0 {
-		t.Fatal("Invalidate must drop every cached client of the cluster")
+		t.Fatal("Close must close and forget every cached client")
 	}
 }
 

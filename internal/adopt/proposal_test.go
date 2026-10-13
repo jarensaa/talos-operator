@@ -27,30 +27,19 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	sigsyaml "sigs.k8s.io/yaml"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/adopt"
 	"github.com/jarensaa/talos-operator/internal/adopt/bundle"
-	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 const (
-	clusterName  = "my-cluster"
-	schematic    = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
-	installImage = "factory.talos.dev/metal-installer/" + schematic + ":v1.14.0"
+	clusterName  = talostest.ClusterName
+	schematic    = talostest.SchematicID
+	installImage = talostest.InstallImage
 
-	networkPatch = `apiVersion: v1alpha1
-kind: BondConfig
-name: bond0
-links: [eth0, eth1]
-bondMode: 802.3ad
----
-apiVersion: v1alpha1
-kind: DHCPv4Config
-name: bond0
----
+	networkPatch = talostest.NetworkPatch + `---
 apiVersion: v1alpha1
 kind: KubeProxyConfig
 enabled: false
@@ -71,32 +60,16 @@ func liveCluster(t *testing.T, b *secrets.Bundle, image string) []adopt.LiveNode
 	nodes := make([]adopt.LiveNode, 0, len(wwids))
 
 	for i, wwid := range wwids {
-		cfg, err := render.Generate(render.Input{
-			ClusterName:       clusterName,
-			Endpoint:          "https://cluster.example.com:6443",
-			KubernetesVersion: "1.37.0",
-			Contract:          config.TalosVersion1_14,
-			Bundle:            b,
-			Role:              machine.TypeControlPlane,
-			InstallImage:      image,
-			Patches:           [][]byte{[]byte(fmt.Sprintf(diskPatch, wwid)), []byte(networkPatch)},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		raw, err := cfg.Bytes()
-		if err != nil {
-			t.Fatal(err)
-		}
+		in := talostest.Input(t, fmt.Sprintf(diskPatch, wwid), networkPatch)
+		in.Bundle, in.InstallImage = b, image
 
 		nodes = append(nodes, adopt.LiveNode{
 			Hostname:     fmt.Sprintf("talos-cp-%d", i+1),
 			Address:      fmt.Sprintf("10.0.0.%d", 11+i),
 			Role:         machine.TypeControlPlane,
 			SystemUUID:   fmt.Sprintf("aaaaaaaa-bbbb-4ccc-8ddd-00000000000%d", i),
-			TalosVersion: "v1.14.0",
-			Config:       raw,
+			TalosVersion: talostest.TalosVersion,
+			Config:       talostest.Config(t, in),
 		})
 	}
 
@@ -124,13 +97,14 @@ func TestBuildProposesSpecsThatReproduceTheCluster(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !p.Recovered || !reflect.DeepEqual(p.Bundle.Certs, b.Certs) {
+	if !reflect.DeepEqual(p.Bundle.Certs, b.Certs) {
 		t.Fatal("the bundle must be recovered from the live cluster")
 	}
 
 	spec := p.Cluster.Spec
-	if spec.ClusterName != clusterName || spec.Versions.Talos != "v1.14.0" || spec.Versions.Kubernetes != "1.37.0" ||
-		spec.ConfigGeneration.VersionContract != "v1.14" || spec.ConfigGeneration.Installer.SchematicID != schematic {
+	if spec.ClusterName != clusterName || spec.Versions.Talos != talostest.TalosVersion ||
+		spec.Versions.Kubernetes != talostest.KubernetesVersion ||
+		spec.ConfigGeneration.VersionContract != talostest.VersionContract || spec.ConfigGeneration.Installer.SchematicID != schematic {
 		t.Fatalf("unexpected spec: %+v", spec)
 	}
 
@@ -180,8 +154,8 @@ func TestBuildVerifiesASuppliedBundleInsteadOfTrustingIt(t *testing.T) {
 	nodes := liveCluster(t, b, installImage)
 
 	p, err := adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster(), Bundle: b})
-	if err != nil || p.Recovered {
-		t.Fatalf("matching supplied bundle: recovered=%v err=%v", p != nil && p.Recovered, err)
+	if err != nil || p.Bundle != b {
+		t.Fatalf("a matching supplied bundle must be the proposal's: err=%v", err)
 	}
 
 	other, err := secrets.NewBundle(secrets.NewClock(), config.TalosVersion1_14)
@@ -192,6 +166,19 @@ func TestBuildVerifiesASuppliedBundleInsteadOfTrustingIt(t *testing.T) {
 	var mismatch *bundle.MismatchError
 	if _, err := adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster(), Bundle: other}); !errors.As(err, &mismatch) {
 		t.Fatalf("expected MismatchError for a stale secrets.yaml, got %v", err)
+	}
+
+	// A Secret that decodes and is not a whole bundle is refused too, and is not read through.
+	for _, text := range []string{"{}\n", "cluster:\n  id: a\n  secret: b\n"} {
+		partial, err := adopt.DecodeBundle([]byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster(), Bundle: partial})
+		if err == nil || !strings.Contains(err.Error(), "secrets bundle is incomplete: missing Talos API CA key") {
+			t.Fatalf("expected a bundle without certificates to be refused, got %v", err)
+		}
 	}
 }
 
@@ -302,55 +289,6 @@ func TestInstallTargetTakesAPoolsSecureBootSetting(t *testing.T) {
 	}
 }
 
-func TestProposalYAMLIsCommitReady(t *testing.T) {
-	p, err := adopt.Build(adopt.Request{Nodes: liveCluster(t, talostest.Bundle(t), installImage), Cluster: observedCluster()})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	clusterYAML, err := p.ClusterYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for _, want := range []string{
-		"# renovate: datasource=github-releases depName=siderolabs/talos\n    talos: v1.14.0",
-		"# renovate: datasource=github-releases depName=kubernetes/kubernetes\n    kubernetes: 1.37.0",
-		"kind: TalosCluster",
-	} {
-		if !strings.Contains(string(clusterYAML), want) {
-			t.Errorf("cluster YAML lacks %q:\n%s", want, clusterYAML)
-		}
-	}
-
-	if strings.Contains(string(clusterYAML), "status:") || strings.Contains(string(clusterYAML), "creationTimestamp") {
-		t.Errorf("proposal must not carry status or server fields:\n%s", clusterYAML)
-	}
-
-	decoded := &talosv1alpha1.TalosCluster{}
-	if err := sigsyaml.Unmarshal(clusterYAML, decoded); err != nil || !reflect.DeepEqual(decoded.Spec, p.Cluster.Spec) {
-		t.Fatalf("cluster YAML does not round-trip: %v", err)
-	}
-
-	poolsYAML, err := p.PoolsYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got := strings.Count(string(poolsYAML), "kind: TalosMachinePool"); got != 1 {
-		t.Fatalf("expected 1 TalosMachinePool document, got %d", got)
-	}
-
-	machinesYAML, err := p.MachinesYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got := strings.Count(string(machinesYAML), "kind: TalosMachine"); got != 3 {
-		t.Fatalf("expected 3 TalosMachine documents, got %d", got)
-	}
-}
-
 func TestBundleEncodingRoundTrips(t *testing.T) {
 	b := talostest.Bundle(t)
 
@@ -373,5 +311,23 @@ func TestBundleEncodingRoundTrips(t *testing.T) {
 
 	if h1 == "" || h1 != h2 {
 		t.Fatalf("hash must be stable across encoding: %q vs %q", h1, h2)
+	}
+}
+
+// The authorities are listed under the names status.certificates has for them.
+func TestAuthorityValidity(t *testing.T) {
+	got := adopt.AuthorityValidity(talostest.Bundle(t))
+	if len(got) != 4 {
+		t.Fatalf("a bundle has four authorities, got %d", len(got))
+	}
+
+	for _, name := range []string{"os", "kubernetes", "kubernetes-aggregator", "etcd"} {
+		if v, ok := got[name]; !ok || !v.NotAfter.After(v.NotBefore) {
+			t.Errorf("%s: validity %+v, listed %v", name, v, ok)
+		}
+	}
+
+	if len(adopt.AuthorityValidity(nil)) != 0 {
+		t.Fatal("no bundle has no authorities")
 	}
 }

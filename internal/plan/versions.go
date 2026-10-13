@@ -107,7 +107,7 @@ func KubernetesHops(from, to string, releases Releases) ([]string, string) {
 	case desired.LessThan(current):
 		return nil, fmt.Sprintf("Kubernetes is not downgraded, and %s is older than %s", core(desired), core(current))
 	case desired.Major() != current.Major():
-		return nil, fmt.Sprintf("there is no upgrade from Kubernetes %s to %s", core(current), core(desired))
+		return nil, noWayAcrossMajors(current, desired)
 	}
 
 	var hops []string
@@ -116,6 +116,11 @@ func KubernetesHops(from, to string, releases Releases) ([]string, string) {
 	}
 
 	return append(hops, core(desired)), ""
+}
+
+// noWayAcrossMajors says that Kubernetes is not upgraded from one major version to another.
+func noWayAcrossMajors(from, to *version.Version) string {
+	return fmt.Sprintf("there is no upgrade from Kubernetes %s to %s", core(from), core(to))
 }
 
 // PlanVersions works out the upgrades from current to desired. A field of desired that is empty

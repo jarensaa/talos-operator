@@ -619,14 +619,6 @@ spec:
           status:
             description: TalosClusterStatus defines the observed state of TalosCluster.
             properties:
-              abortedTargets:
-                additionalProperties:
-                  type: string
-                description: |-
-                  AbortedTargets is what the operation a human aborted was rolling out: machine name to
-                  rendered config hash. Those configs are not rolled out to those machines again; a spec that
-                  renders anything else, a revert included, rolls out and clears this.
-                type: object
               adoption:
                 description: Adoption tracks adoption progress.
                 properties:
@@ -849,6 +841,36 @@ spec:
                   type: object
                 maxItems: 10
                 type: array
+              holds:
+                additionalProperties:
+                  description: |-
+                    Holds is what a human took out of the operations of one kind, after one of them failed
+                    (docs/scope.md §8.3). Each entry maps a turn, which is a machine, to what the operation was
+                    taking it to: the hash of a config, an installer image. That is not started again for the
+                    machine; an operation that would take it to anything else is. Removing a machine has nothing
+                    it could be taken to instead, so its entries are empty and stand until the spec asks anew.
+
+                    A Kubernetes upgrade is not aborted machine by machine: its one entry, under HoldEverything,
+                    is the Kubernetes version whose upgrade was aborted (docs/scope.md §7.4).
+                  properties:
+                    aborted:
+                      additionalProperties:
+                        type: string
+                      description: 'Aborted: the operation was aborted before it reached
+                        the machine, or while it was at it.'
+                      type: object
+                    skipped:
+                      additionalProperties:
+                        type: string
+                      description: 'Skipped: the machine was left out after its turn
+                        failed.'
+                      type: object
+                  type: object
+                description: |-
+                  Holds records what a human took out of the operations of each kind: the machines that were
+                  skipped, and what an aborted operation had left to do. Neither is started again as it was.
+                  The key is the type of the operation.
+                type: object
               maintenance:
                 description: Maintenance records the upkeep the operator did.
                 properties:
@@ -857,27 +879,6 @@ spec:
                       by the operator.
                     format: date-time
                     type: string
-                type: object
-              membership:
-                description: Membership records what a human decided about machines
-                  that were to be added or removed.
-                properties:
-                  add:
-                    additionalProperties:
-                      type: string
-                    description: |-
-                      Add maps a machine to the config it was to be handed when a human skipped it, or aborted
-                      the operation that was adding it. It is not added with that config again; with any other
-                      it is.
-                    type: object
-                  remove:
-                    description: |-
-                      Remove lists the machines whose removal a human skipped or aborted. They are not removed
-                      until their spec asks for it anew: desiredState back to Present, and to Removed again.
-                    items:
-                      type: string
-                    type: array
-                    x-kubernetes-list-type: set
                 type: object
               observed:
                 description: Observed is the last observed live state.
@@ -1168,28 +1169,6 @@ spec:
                 - Managed
                 - Degraded
                 type: string
-              upgrades:
-                description: Upgrades records what a human decided about Talos upgrades
-                  that were due.
-                properties:
-                  aborted:
-                    additionalProperties:
-                      type: string
-                    description: 'Aborted: the upgrade was aborted before it reached
-                      the machine, or while it was at it.'
-                    type: object
-                  kubernetes:
-                    description: |-
-                      Kubernetes is the Kubernetes version whose upgrade a human aborted. It is not started again;
-                      an upgrade to any other version is (docs/scope.md §7.4).
-                    type: string
-                  skipped:
-                    additionalProperties:
-                      type: string
-                    description: 'Skipped: the machine was skipped after its upgrade
-                      failed.'
-                    type: object
-                type: object
               versions:
                 description: Versions is what the cluster runs, what exists, and the
                   way to what the spec asks for.

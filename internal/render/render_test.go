@@ -22,27 +22,13 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/siderolabs/talos/pkg/machinery/config"
-	"github.com/siderolabs/talos/pkg/machinery/config/machine"
-
 	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos"
 	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
 
 const (
-	bondPatch = `apiVersion: v1alpha1
-kind: BondConfig
-name: bond0
-links: [eth0, eth1]
-bondMode: 802.3ad
----
-apiVersion: v1alpha1
-kind: DHCPv4Config
-name: bond0
-`
 	// Document keys the fixtures produce.
-	keyV1alpha1 render.DocKey = "v1alpha1"
 	keyKubeNode render.DocKey = "v1alpha1/KubeNodeConfig"
 	keyBond     render.DocKey = "v1alpha1/BondConfig/bond0"
 	keyDHCP     render.DocKey = "v1alpha1/DHCPv4Config/bond0"
@@ -53,25 +39,6 @@ labels:
   example.com/layer: %s
 `
 )
-
-func input(t *testing.T, patches ...string) render.Input {
-	t.Helper()
-
-	raw := make([][]byte, 0, len(patches))
-	for _, p := range patches {
-		raw = append(raw, []byte(p))
-	}
-
-	return render.Input{
-		ClusterName:       "my-cluster",
-		Endpoint:          "https://cluster.example.com:6443",
-		KubernetesVersion: "1.37.0",
-		Contract:          config.TalosVersion1_14,
-		Bundle:            talostest.Bundle(t),
-		Role:              machine.TypeControlPlane,
-		Patches:           raw,
-	}
-}
 
 func mustRender(t *testing.T, in render.Input) *render.Config {
 	t.Helper()
@@ -85,8 +52,8 @@ func mustRender(t *testing.T, in render.Input) *render.Config {
 }
 
 func TestRenderIsDeterministic(t *testing.T) {
-	a := mustRender(t, input(t, bondPatch))
-	b := mustRender(t, input(t, bondPatch))
+	a := mustRender(t, talostest.Input(t, talostest.NetworkPatch))
+	b := mustRender(t, talostest.Input(t, talostest.NetworkPatch))
 
 	if a.Hash != b.Hash {
 		t.Fatal("identical inputs must render identical hashes")
@@ -94,16 +61,16 @@ func TestRenderIsDeterministic(t *testing.T) {
 }
 
 func TestDocumentOrderDoesNotChangeTheHash(t *testing.T) {
-	parts := strings.SplitN(bondPatch, "---\n", 2)
+	parts := strings.SplitN(talostest.NetworkPatch, "---\n", 2)
 	reordered := parts[1] + "---\n" + parts[0]
 
-	if mustRender(t, input(t, bondPatch)).Hash != mustRender(t, input(t, reordered)).Hash {
+	if mustRender(t, talostest.Input(t, talostest.NetworkPatch)).Hash != mustRender(t, talostest.Input(t, reordered)).Hash {
 		t.Fatal("document order in patches must not change the hash")
 	}
 }
 
 func TestLaterPatchLayersWin(t *testing.T) {
-	out := mustRender(t, input(t,
+	out := mustRender(t, talostest.Input(t,
 		strings.ReplaceAll(labelPatch, "%s", "cluster"),
 		strings.ReplaceAll(labelPatch, "%s", "machine"),
 	))
@@ -114,7 +81,7 @@ func TestLaterPatchLayersWin(t *testing.T) {
 }
 
 func TestJSON6902PatchesAreRejected(t *testing.T) {
-	_, err := render.Render(input(t, `- op: add
+	_, err := render.Render(talostest.Input(t, `- op: add
   path: /machine/network/hostname
   value: worker1
 `))
@@ -124,7 +91,7 @@ func TestJSON6902PatchesAreRejected(t *testing.T) {
 }
 
 func TestMissingContractIsRejected(t *testing.T) {
-	in := input(t)
+	in := talostest.Input(t)
 	in.Contract = nil
 
 	if _, err := render.Render(in); !errors.Is(err, render.ErrNoContract) {
@@ -133,15 +100,15 @@ func TestMissingContractIsRejected(t *testing.T) {
 }
 
 func TestDocumentsAreKeyed(t *testing.T) {
-	out := mustRender(t, input(t, bondPatch))
+	out := mustRender(t, talostest.Input(t, talostest.NetworkPatch))
 
-	for _, key := range []render.DocKey{keyV1alpha1, "v1alpha1/KubeClusterConfig", keyBond, keyDHCP} {
+	for _, key := range []render.DocKey{render.RootKey, "v1alpha1/KubeClusterConfig", keyBond, keyDHCP} {
 		if _, ok := out.Docs[key]; !ok {
 			t.Errorf("missing document %s (have %v)", key, out.Keys)
 		}
 	}
 
-	if out.Keys[0] != keyV1alpha1 {
+	if out.Keys[0] != render.RootKey {
 		t.Fatalf("the v1alpha1 document must come first, got %s", out.Keys[0])
 	}
 
@@ -155,7 +122,7 @@ func TestDocumentsAreKeyed(t *testing.T) {
 // TestLiveRoundTrip is the comparison adoption depends on: a node that was given the rendered
 // bytes reports them back as its live config, and that must normalize to the same hash.
 func TestLiveRoundTrip(t *testing.T) {
-	rendered := mustRender(t, input(t, bondPatch))
+	rendered := mustRender(t, talostest.Input(t, talostest.NetworkPatch))
 
 	live, err := talos.ParseMachineConfig(rendered.Bytes)
 	if err != nil {
@@ -173,7 +140,7 @@ func TestLiveRoundTrip(t *testing.T) {
 }
 
 func TestBytesOrderedLikeFollowsTheOtherConfig(t *testing.T) {
-	cfg := mustRender(t, input(t, bondPatch, strings.ReplaceAll(labelPatch, "%s", "x")))
+	cfg := mustRender(t, talostest.Input(t, talostest.NetworkPatch, strings.ReplaceAll(labelPatch, "%s", "x")))
 
 	// A config whose documents come in the reverse order.
 	reversed := &render.Config{Docs: cfg.Docs}
@@ -200,13 +167,68 @@ func TestBytesOrderedLikeFollowsTheOtherConfig(t *testing.T) {
 	// v1alpha1 stays first in a Talos container; the other documents follow the given order.
 	var want []render.DocKey
 	for _, k := range reversed.Keys {
-		if k != keyV1alpha1 {
+		if k != render.RootKey {
 			want = append(want, k)
 		}
 	}
 
-	got := slices.DeleteFunc(slices.Clone(again.Keys), func(k render.DocKey) bool { return k == keyV1alpha1 })
+	got := slices.DeleteFunc(slices.Clone(again.Keys), func(k render.DocKey) bool { return k == render.RootKey })
 	if !slices.Equal(got, want) {
 		t.Fatalf("order: got %v, want %v", got, want)
+	}
+}
+
+func TestADocumentKeySaysItsKind(t *testing.T) {
+	for key, kind := range map[render.DocKey]string{
+		render.RootKey:                  "",
+		keyKubeNode:                     "KubeNodeConfig",
+		keyBond:                         "BondConfig",
+		"v1alpha1/UserVolumeConfig/a/b": "UserVolumeConfig",
+	} {
+		if got := key.Kind(); got != kind {
+			t.Errorf("%s: kind %q, want %q", key, got, kind)
+		}
+	}
+
+	// A key built from what a document states is the key the document has in a config.
+	for key, of := range map[render.DocKey][3]string{
+		keyBond:        {"v1alpha1", "BondConfig", "bond0"},
+		keyKubeNode:    {"v1alpha1", "KubeNodeConfig", ""},
+		render.RootKey: {"", "", ""},
+	} {
+		if got := render.KeyOf(of[0], of[1], of[2]); got != key {
+			t.Errorf("%v: key %q, want %q", of, got, key)
+		}
+	}
+}
+
+func TestLayersApplyClusterThenPoolThenMachine(t *testing.T) {
+	got := render.Layered([]string{"cluster-1", "cluster-2"}, []string{"pool"}, []string{"machine"})
+	if !slices.Equal(got, []string{"cluster-1", "cluster-2", "pool", "machine"}) {
+		t.Fatalf("got %v", got)
+	}
+
+	if got := render.Layered[string](nil, nil, []string{"machine"}); !slices.Equal(got, []string{"machine"}) {
+		t.Fatalf("a machine without shared layers: %v", got)
+	}
+}
+
+func TestReproduces(t *testing.T) {
+	rendered := mustRender(t, talostest.Input(t, talostest.NetworkPatch))
+
+	live, err := talos.ParseMachineConfig(rendered.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := render.Reproduces("the specs", rendered, live); err != nil {
+		t.Fatalf("a config is reproduced by itself: %v", err)
+	}
+
+	// What differs is shown, and named after what was rendered.
+	err = render.Reproduces("the specs", mustRender(t, talostest.Input(t)), live)
+	if err == nil || !strings.HasPrefix(err.Error(), "the specs do not reproduce the live config:\n") ||
+		!strings.Contains(err.Error(), "+bondMode: 802.3ad") {
+		t.Fatalf("got %v", err)
 	}
 }

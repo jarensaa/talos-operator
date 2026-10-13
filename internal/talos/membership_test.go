@@ -31,7 +31,6 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -58,12 +57,7 @@ func reset(change func(*machineapi.ResetRequest)) *machineapi.ResetRequest {
 // A removal wipes what Talos keeps of the cluster on the machine, and nothing that is the
 // owner's: the connection itself refuses a reset in any other shape.
 func TestCheckMembership(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
+	checkAllowlist(t, accessMembership, []allowCase{
 		{"the reset of a removal", machineapi.MachineService_Reset_FullMethodName, reset(nil), true},
 		{"forfeit leadership", machineapi.MachineService_EtcdForfeitLeadership_FullMethodName, &machineapi.EtcdForfeitLeadershipRequest{}, true},
 		{"remove an etcd member", machineapi.MachineService_EtcdRemoveMemberByID_FullMethodName, &machineapi.EtcdRemoveMemberByIDRequest{}, true},
@@ -103,45 +97,11 @@ func TestCheckMembership(t *testing.T) {
 		// A graceful reset leaves etcd by itself; nothing else has a reason to.
 		{"etcd leave", machineapi.MachineService_EtcdLeaveCluster_FullMethodName, &machineapi.EtcdLeaveClusterRequest{}, false},
 		{"wipe a block device", "/storage.StorageService/BlockDeviceWipe", nil, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := accessMembership.check(tt.method, tt.req)
-			if tt.allow && err != nil {
-				t.Fatalf("expected allowed, got %v", err)
-			}
-
-			if !tt.allow && status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-		})
-	}
-
-	// And what a removal may do, the other connections may not: not even its one reset.
-	for _, a := range []access{accessReadOnly, accessConfig, accessUpgrade, accessMaintenance} {
-		for method, req := range map[string]any{
-			machineapi.MachineService_Reset_FullMethodName:                reset(nil),
-			machineapi.MachineService_EtcdRemoveMemberByID_FullMethodName: &machineapi.EtcdRemoveMemberByIDRequest{},
-		} {
-			if status.Code(a.check(method, req)) != codes.PermissionDenied {
-				t.Fatalf("%s must be refused on a connection with access %d", method, a)
-			}
-		}
-	}
+	})
 }
 
 func TestCheckMaintenance(t *testing.T) {
-	apply := func(m machineapi.ApplyConfigurationRequest_Mode, dryRun bool) *machineapi.ApplyConfigurationRequest {
-		return &machineapi.ApplyConfigurationRequest{Mode: m, DryRun: dryRun}
-	}
-
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
+	checkAllowlist(t, accessMaintenance, []allowCase{
 		{"reading a resource", cosiGetMethod, nil, true},
 		{"listing resources", cosiListMethod, nil, true},
 		{"handing over the config", machineapi.MachineService_ApplyConfiguration_FullMethodName,
@@ -161,42 +121,13 @@ func TestCheckMaintenance(t *testing.T) {
 		{"a reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, false},
 		{"install", machineapi.LifecycleService_Install_FullMethodName, &machineapi.LifecycleServiceInstallRequest{}, false},
 		{"the version", machineapi.MachineService_Version_FullMethodName, &emptypb.Empty{}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := accessMaintenance.check(tt.method, tt.req)
-			if tt.allow && err != nil {
-				t.Fatalf("expected allowed, got %v", err)
-			}
-
-			if !tt.allow && status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-		})
-	}
-
-	// A machine in maintenance mode takes a config from anyone. The connections that carry the
-	// cluster's credentials must not be the ones to hand it over.
-	for _, a := range []access{accessReadOnly, accessUpgrade, accessMembership} {
-		req := apply(machineapi.ApplyConfigurationRequest_NO_REBOOT, false)
-		if status.Code(a.check(machineapi.MachineService_ApplyConfiguration_FullMethodName, req)) != codes.PermissionDenied {
-			t.Fatalf("an apply must be refused on a connection with access %d", a)
-		}
-	}
-}
-
-func dial(a access) []grpc.DialOption {
-	return []grpc.DialOption{
-		grpc.WithChainUnaryInterceptor(a.unaryInterceptor()),
-		grpc.WithChainStreamInterceptor(a.streamInterceptor()),
-	}
+	})
 }
 
 // What the operator really sends when a machine leaves.
 func TestRemoverSendsTheResetOfARemovalAndNothingElse(t *testing.T) {
 	api, c := serve(t, dial(accessMembership)...)
-	remover := &machineryRemover{*reader(c)}
+	remover := &machineryRemover{forfeiter{*reader(c)}}
 	ctx := context.Background()
 
 	if err := remover.Reset(ctx, apiNode); err != nil {

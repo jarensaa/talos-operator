@@ -31,29 +31,21 @@ type SelectOptions struct {
 	// Exclude is a node that must never be used as the endpoint, e.g. the node being drained
 	// or rebooted. The target is still reached through another endpoint via client.WithNode.
 	Exclude netip.Addr
-	// Healthy marks endpoints known to be healthy; they are tried first.
-	Healthy map[netip.Addr]bool
 }
 
-// SelectEndpoints orders candidate control-plane endpoints for a client: healthy ones first,
-// original order otherwise preserved, and the excluded node removed.
+// SelectEndpoints returns the candidate control-plane endpoints a client is to use: all of them,
+// in the order they came, but for the excluded node.
 func SelectEndpoints(candidates []creds.Endpoint, opts SelectOptions) ([]creds.Endpoint, error) {
-	healthy := make([]creds.Endpoint, 0, len(candidates))
-	rest := make([]creds.Endpoint, 0, len(candidates))
+	selected := make([]creds.Endpoint, 0, len(candidates))
 
 	for _, ep := range candidates {
 		if opts.Exclude.IsValid() && ep.Addr == opts.Exclude {
 			continue
 		}
 
-		if opts.Healthy[ep.Addr] {
-			healthy = append(healthy, ep)
-		} else {
-			rest = append(rest, ep)
-		}
+		selected = append(selected, ep)
 	}
 
-	selected := append(healthy, rest...)
 	if len(selected) == 0 {
 		return nil, ErrNoEndpoints
 	}

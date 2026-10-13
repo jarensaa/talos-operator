@@ -19,6 +19,8 @@ package plan
 import (
 	"testing"
 	"time"
+
+	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 )
 
 const (
@@ -29,17 +31,17 @@ const (
 
 var (
 	t0     = time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
-	timing = Timing{}.WithDefaults()
+	timing = TimingOf(talosv1alpha1.Rollout{})
 	open   = Gate{Open: true}
 	closed = Gate{Reason: "etcd has a learner"}
 )
 
 func tryStep(name string) Step {
-	return Step{Name: name, Tried: true, PreviousHash: prev, DesiredHash: desired, Since: t0, Deadline: t0.Add(timing.TryTimeout)}
+	return Step{Name: name, PreviousHash: prev, DesiredHash: desired, Since: t0, Deadline: t0.Add(timing.TryTimeout)}
 }
 
 func plainStep(name string) Step {
-	return Step{Name: name, PreviousHash: prev, DesiredHash: desired, Since: t0}
+	return Step{Name: name, PreviousHash: desired, DesiredHash: desired, Since: t0}
 }
 
 func on(active, persistent string) Node {

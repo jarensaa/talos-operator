@@ -28,6 +28,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	"github.com/jarensaa/talos-operator/internal/plan"
 )
 
 // Draining a node before an upgrade reboots it (docs/scope.md §7.3). The operator does what
@@ -145,4 +149,64 @@ func (r *TalosClusterReconciler) evict(ctx context.Context, pods []corev1.Pod) (
 	}
 
 	return held, nil
+}
+
+// nodeToDrain reads the Node of that name and, while the step in flight drains it and it is
+// cordoned, the pods that have to leave it. The Node is nil when there is none of that name, and
+// podsLeft negative when the pods were not counted.
+func (r *TalosClusterReconciler) nodeToDrain(ctx context.Context, name string, cur *talosv1alpha1.OperationStep,
+) (*corev1.Node, []corev1.Pod, int, error) {
+	if name == "" {
+		return nil, nil, -1, nil
+	}
+
+	kube := &corev1.Node{}
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, kube); err != nil {
+		return nil, nil, -1, client.IgnoreNotFound(err)
+	}
+
+	if cur.Step != plan.StepDraining || !kube.Spec.Unschedulable {
+		return kube, nil, -1, nil
+	}
+
+	pods, err := r.podsToDrain(ctx, name)
+	if err != nil {
+		logf.FromContext(ctx).Info("listing the pods to drain failed, will retry", "node", name, "error", err.Error())
+
+		return kube, nil, -1, nil
+	}
+
+	return kube, pods, len(pods), nil
+}
+
+// drained carries out what a planner answered for a node that is being drained, or made
+// schedulable again: cordon it, evict what is left on it, uncordon it. It reports whether the
+// answer was one of those. Each is only done from the TalosCluster as the API server has it now.
+func (r *TalosClusterReconciler) drained(ctx context.Context, tc *talosv1alpha1.TalosCluster, action plan.Action, kube *corev1.Node,
+	pods []corev1.Pod,
+) (string, bool, error) {
+	switch action.Kind {
+	case plan.Cordon, plan.Uncordon, plan.Evict:
+	default:
+		return "", false, nil
+	}
+
+	if !r.latest(ctx, tc) {
+		return noteCatchingUp, true, nil
+	}
+
+	if action.Kind != plan.Evict {
+		return "", true, r.setUnschedulable(ctx, kube, action.Kind == plan.Cordon)
+	}
+
+	held, err := r.evict(ctx, pods)
+	if err != nil {
+		return "", true, err
+	}
+
+	if held > 0 {
+		return fmt.Sprintf("%s; a PodDisruptionBudget holds %d of them back for now", action.Message, held), true, nil
+	}
+
+	return action.Message, true, nil
 }

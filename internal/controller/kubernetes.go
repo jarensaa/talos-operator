@@ -140,79 +140,39 @@ func kubernetesImages(v machineView) map[string]plan.KubernetesImage {
 	return images
 }
 
-// kubernetesMachine is the planner's view of a machine.
-func kubernetesMachine(v machineView) plan.KubernetesMachine {
-	m := plan.KubernetesMachine{
-		Name: v.tm.Name,
-		Node: v.hostname(),
-		Hold: v.tm.Spec.Hold || v.tm.Spec.DesiredState == talosv1alpha1.DesiredStateRemoved,
-	}
-	if v.pool != nil {
-		m.ControlPlane = v.pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane
-	}
+// kubernetesMachines is the planner's view of every member.
+func kubernetesMachines(ctx context.Context, f *fleet) ([]plan.KubernetesMachine, error) {
+	planned := make([]plan.KubernetesMachine, 0, len(f.members))
 
-	m.Images = kubernetesImages(v)
-	m.Current = m.Images != nil
-
-	return m
-}
-
-// kubernetesMachines is the planner's view of every machine.
-func (r *TalosClusterReconciler) kubernetesMachines(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation,
-	pools map[string]*talosv1alpha1.TalosMachinePool, machines []talosv1alpha1.TalosMachine,
-) ([]plan.KubernetesMachine, error) {
-	planned := make([]plan.KubernetesMachine, 0, len(machines))
-
-	for i := range machines {
-		v, err := r.view(ctx, tc, obs.facts, pools, &machines[i])
+	for i := range f.members {
+		v, err := f.view(ctx, &f.members[i])
 		if err != nil {
 			return nil, err
 		}
 
-		planned = append(planned, kubernetesMachine(v))
+		m := plan.KubernetesMachine{Name: v.tm.Name, Node: v.hostname(), Hold: v.held(), ControlPlane: v.controlPlane()}
+		m.Images = kubernetesImages(v)
+		m.Current = m.Images != nil
+
+		planned = append(planned, m)
 	}
 
 	return planned, nil
 }
 
-// kubernetes owns KubernetesUpToDate: it continues the upgrade in flight, or plans one. Like
-// upgrade, it reports whether it holds the operation lock and, when an upgrade is due but may
-// not start, why.
-func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation,
-	pools map[string]*talosv1alpha1.TalosMachinePool, machines []talosv1alpha1.TalosMachine,
+// planKubernetes owns KubernetesUpToDate while no operation is in flight: it asks the planner
+// whether an upgrade is due, and starts it by taking the lock. Like planUpgrade, it reports
+// whether it did and, when an upgrade is due but may not start, why.
+func (r *TalosClusterReconciler) planKubernetes(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, f *fleet,
 ) (bool, *metav1.Condition, error) {
 	st := &tc.Status
-	timing := rolloutTiming(tc.Spec.Rollout)
-	enabled := tc.Spec.Management.Upgrades == talosv1alpha1.CapabilityEnabled
 
-	if op := st.Operation; op != nil {
-		if op.Type != talosv1alpha1.OperationKubernetesUpgrade {
-			return false, nil, nil
-		}
-
-		if !enabled {
-			// A component whose config is being tried goes back by itself, as in a config rollout.
-			r.finish(tc, talosv1alpha1.OperationAborted, "upgrades were disabled")
-
-			return false, nil, nil
-		}
-
-		note, err := r.continueKubernetes(ctx, tc, obs, pools, machines, timing)
-		reportKubernetesOperation(tc, obs, note)
-
-		return true, nil, err
-	}
-
-	if obs.facts == nil {
-		return false, nil, nil
-	}
-
-	planned, err := r.kubernetesMachines(ctx, tc, obs, pools, machines)
+	planned, err := kubernetesMachines(ctx, f)
 	if err != nil {
 		return false, nil, err
 	}
 
-	if !enabled {
+	if !tc.Spec.Management.MayUpgrade() {
 		r.reportKubernetes(ctx, tc, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), planned, false)
 
 		return false, nil, nil
@@ -230,8 +190,10 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 		}, nil
 	}
 
-	holds := upgradeHolds(tc)
-	settings := plan.KubernetesSettings{Paused: tc.Spec.Paused, Aborted: holds.Kubernetes, Policy: obs.policy, Releases: releasesOf(tc)}
+	settings := plan.KubernetesSettings{
+		Aborted: held(tc, talosv1alpha1.OperationKubernetesUpgrade).Aborted[talosv1alpha1.HoldEverything],
+		Policy:  obs.policy, Releases: releasesOf(tc),
+	}
 
 	if hop := plan.HopOf(planned, settings.Releases); hop.Due() {
 		settings.Problems, settings.Unchecked = r.checkKubernetes(ctx, obs, hop)
@@ -241,38 +203,23 @@ func (r *TalosClusterReconciler) kubernetes(ctx context.Context, tc *talosv1alph
 
 	// An abort covers one version. Once the spec asks for another, it is spent.
 	if !result.AbortStands {
-		holds.Kubernetes = ""
-	}
-
-	st.Upgrades = keptHolds(holds)
-
-	if result.MayStart() {
-		if err := timing.Validate(); err != nil {
-			result.BlockReason, result.BlockMessage = talosv1alpha1.ReasonInvalidRollout, "spec.rollout: "+err.Error()
-		}
+		hold(tc, talosv1alpha1.OperationKubernetesUpgrade, func(h *talosv1alpha1.Holds) { clear(h.Aborted) })
 	}
 
 	// Last, because it asks upstream: an image that certainly does not exist is refused before a
 	// node is asked to pull it.
 	if result.MayStart() {
-		if problem := r.imagesProblem(ctx, result.Images); problem != "" {
+		if problem := r.imagesProblem(ctx, result.Targets); problem != "" {
 			result.BlockReason, result.BlockMessage = plan.BlockIncompatible, problem
 		}
 	}
 
-	if result.MayStart() {
-		now := r.stamp()
-		st.Operation = &talosv1alpha1.Operation{
-			ID:        fmt.Sprintf("%s-%d", result.Change, now.Unix()),
-			Type:      talosv1alpha1.OperationKubernetesUpgrade,
-			Target:    result.Hop.Version,
-			Plan:      result.Pending,
-			Targets:   result.Images,
-			StartedAt: now,
-		}
+	op := r.start(tc, talosv1alpha1.OperationKubernetesUpgrade, result.Due)
+	if op != nil {
+		op.Target = result.Hop.Version
 	}
 
-	return st.Operation != nil, r.reportKubernetes(ctx, tc, result, planned, true), nil
+	return op != nil, r.reportKubernetes(ctx, tc, result, planned, true), nil
 }
 
 // talosVersions is the Talos version of every node that was read, by hostname, and the name of a
@@ -432,71 +379,35 @@ func (r *TalosClusterReconciler) proxyNote(ctx context.Context, version string) 
 	return ""
 }
 
-// reportKubernetesOperation sets KubernetesUpToDate and RolloutBlocked for the upgrade in flight.
-func reportKubernetesOperation(tc *talosv1alpha1.TalosCluster, obs observation, note string) {
-	st, gen := &tc.Status, tc.Generation
-
-	op := st.Operation
-	if op == nil {
-		// It just ended. The next reconcile plans, and reports what is left.
-		return
-	}
-
-	if f := op.Failure; f != nil {
-		msg := fmt.Sprintf("the upgrade to Kubernetes %s halted %s: %s", op.Target, haltedAt(f), f.Message)
-		setCondition(st, gen, talosv1alpha1.ConditionKubernetesUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonOperationFailed, msg)
-		setCondition(st, gen, talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed,
-			msg+" "+f.Remediation)
-
-		st.Phase = talosv1alpha1.ClusterPhaseDegraded
-
-		return
-	}
-
-	st.Phase = talosv1alpha1.ClusterPhaseManaged
-
-	setCondition(st, gen, talosv1alpha1.ConditionKubernetesUpToDate, metav1.ConditionFalse, talosv1alpha1.ReasonUpgrading,
-		fmt.Sprintf("upgrading to %s: %s", op.Target, progressOf(op, note)))
-	reportHeld(tc, obs.policy, "a component whose config is being tried is still verified and confirmed, nothing else is changed")
-}
-
-// continueKubernetes carries the upgrade in flight one step further.
-func (r *TalosClusterReconciler) continueKubernetes(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation,
-	pools map[string]*talosv1alpha1.TalosMachinePool, machines []talosv1alpha1.TalosMachine, timing plan.Timing,
-) (string, error) {
+// kubernetesTurns is what the turns of a Kubernetes upgrade do: one component on one machine each.
+// A machine that is no longer a member has an empty view.
+func (r *TalosClusterReconciler) kubernetesTurns(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, f *fleet,
+	timing plan.Timing,
+) turns {
 	op := tc.Status.Operation
 
-	// A machine that no longer exists has an empty view.
 	view := func(key string) (machineView, error) {
 		_, name := plan.SplitTurn(key)
 
-		for i := range machines {
-			if machines[i].Name == name {
-				return r.view(ctx, tc, obs.facts, pools, &machines[i])
+		return f.view(ctx, f.member(name))
+	}
+
+	return turns{
+		begin: func(key string, attempt int32) error {
+			v, err := view(key)
+			if err != nil {
+				return err
 			}
-		}
 
-		return machineView{}, nil
-	}
+			planned, err := kubernetesMachines(ctx, f)
+			if err != nil {
+				return err
+			}
 
-	begin := func(key string, attempt int32) error {
-		v, err := view(key)
-		if err != nil {
-			return err
-		}
+			r.beginKubernetes(tc, key, v, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), attempt)
 
-		planned, err := r.kubernetesMachines(ctx, tc, obs, pools, machines)
-		if err != nil {
-			return err
-		}
-
-		r.beginKubernetes(tc, key, v, plan.PlanKubernetes(planned, plan.KubernetesSettings{Releases: releasesOf(tc)}, passOf(obs)), attempt)
-
-		return nil
-	}
-
-	return r.drive(ctx, tc, obs, timing, turns{
-		begin: begin,
+			return nil
+		},
 		step: func() (string, error) {
 			v, err := view(op.Current.Machine)
 			if err != nil {
@@ -505,49 +416,20 @@ func (r *TalosClusterReconciler) continueKubernetes(ctx context.Context, tc *tal
 
 			return r.kubernetesStep(ctx, tc, obs, v, timing)
 		},
-		failed: func() error {
-			f := op.Failure
-			asked := func(annotation string) bool { return f.Token != "" && tc.Annotations[annotation] == f.Token }
+		// The version whose upgrade a human ended is the one the spec asks for, so that no later
+		// hop towards it starts either.
+		abort: func() {
+			version := op.Target
 
-			switch {
-			case asked(talosv1alpha1.AnnotationAbort):
-				r.abortKubernetes(ctx, tc, obs, pools, machines)
-				r.end(tc, talosv1alpha1.OperationAborted,
-					fmt.Sprintf("aborted after failing at %s, %s (%s): %s", f.Machine, f.Step, f.Reason, f.Message))
-			case asked(talosv1alpha1.AnnotationRetry):
-				key, attempt := f.Machine, int32(1)
-				if op.Current != nil {
-					key, attempt = turnOf(op.Current), op.Current.Attempt+1
+			if planned, err := kubernetesMachines(ctx, f); err == nil {
+				if hop := plan.HopOf(planned, releasesOf(tc)); hop.To != "" {
+					version = hop.To
 				}
-
-				// The turn starts over from what the node runs now.
-				op.Failure, op.Current = nil, nil
-
-				return begin(key, attempt)
 			}
 
-			return nil
+			hold(tc, op.Type, func(h *talosv1alpha1.Holds) { h.Aborted[talosv1alpha1.HoldEverything] = version })
 		},
-		// A Kubernetes upgrade cannot leave a node out: what follows would be newer than it.
-		skip:  func(string) error { return nil },
-		abort: func() { r.abortKubernetes(ctx, tc, obs, pools, machines) },
-	})
-}
-
-// abortKubernetes records the version whose upgrade a human aborted: the one the spec asks for,
-// so that no later hop towards it starts either.
-func (r *TalosClusterReconciler) abortKubernetes(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation,
-	pools map[string]*talosv1alpha1.TalosMachinePool, machines []talosv1alpha1.TalosMachine,
-) {
-	version := tc.Status.Operation.Target
-
-	if planned, err := r.kubernetesMachines(ctx, tc, obs, pools, machines); err == nil {
-		if hop := plan.HopOf(planned, releasesOf(tc)); hop.To != "" {
-			version = hop.To
-		}
 	}
-
-	upgradeHolds(tc).Kubernetes = version
 }
 
 // beginKubernetes persists the first step of a turn: one component on one machine. Nothing is
@@ -576,19 +458,15 @@ func (r *TalosClusterReconciler) beginKubernetes(tc *talosv1alpha1.TalosCluster,
 	case v.tm == nil:
 		// The TalosMachine is gone, so there is nothing left to configure.
 		skipped(op, key)
-	case v.tm.Spec.Hold, v.tm.Spec.DesiredState == talosv1alpha1.DesiredStateRemoved:
-		if v.pool != nil && v.pool.Spec.Role == talosv1alpha1.MachineRoleControlPlane {
-			r.end(tc, talosv1alpha1.OperationSuperseded, machine+" was put on hold, and a Kubernetes upgrade cannot leave a control plane out")
-
-			return
-		}
-
+	case v.held() && v.controlPlane():
+		r.end(tc, talosv1alpha1.OperationSuperseded, machine+" was put on hold, and a Kubernetes upgrade cannot leave a control plane out")
+	case v.held():
 		skipped(op, key)
 	case images != nil && images[component].Live == target:
 		// Nothing to apply, but the upgrade only moves past a component it has seen run.
 		step.Step, step.PreviousHash, step.DesiredHash = plan.StepVerifying, v.live.Hash, v.live.Hash
 		op.Current = step
-	case images != nil && current.Images[key] != target:
+	case images != nil && current.Targets[key] != target:
 		r.end(tc, talosv1alpha1.OperationSuperseded,
 			fmt.Sprintf("%s on %s is to get another image than this upgrade planned", component, machine))
 	default:
@@ -598,28 +476,20 @@ func (r *TalosClusterReconciler) beginKubernetes(tc *talosv1alpha1.TalosCluster,
 	}
 }
 
-// kubernetesStep asks the planner what the turn in flight needs next, and does it.
+// kubernetesStep asks the planner what the turn in flight needs next, and does it. Once the image
+// is on the node the turn is a config change like any other, with one more check: that the
+// component runs the new version.
 func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, v machineView,
 	timing plan.Timing,
 ) (string, error) {
 	op := tc.Status.Operation
 	cur := op.Current
 	now := r.now()
-
-	s := plan.Step{
-		Name:         cur.Step,
-		Tried:        cur.Step == plan.StepPulling || cur.PreviousHash != cur.DesiredHash,
-		PreviousHash: cur.PreviousHash,
-		DesiredHash:  cur.DesiredHash,
-		Since:        cur.Since.Time,
-		Deadline:     timeOf(cur.Deadline),
-		HealthySince: timeOf(cur.HealthySince),
-	}
-	node := stepNode(v)
+	s, node := stepOf(cur), stepNode(v)
 
 	// A node nothing was sent to is left alone while the upgrade is held back. The step is
 	// dropped; the turn begins again later.
-	hold := obs.policy.Hold(tc.Spec.Paused)
+	hold := obs.policy.Hold()
 	if !hold.Open && (cur.Step == plan.StepPulling || plan.Untouched(s, node, now)) {
 		op.Current = nil
 
@@ -631,42 +501,26 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 		pre = plan.Gate{Reason: "the TalosMachine no longer exists"}
 	}
 
-	checks := plan.Gate{Reason: notVerifiedYet}
+	checks, err := r.verified(ctx, obs, v.boundMachine, cur, node.Reachable, now)
+	if err != nil {
+		return "", err
+	}
 
-	if cur.Step == plan.StepVerifying && node.Reachable {
-		var err error
-		if checks, err = r.verifyNode(ctx, obs, v, cur.Since.Time, now); err != nil {
+	if checks.Open {
+		if checks, err = r.componentRuns(ctx, v.boundMachine, cur); err != nil {
 			return "", err
-		}
-
-		if checks = checks.And(obs.policy.Gates()); checks.Open {
-			if checks, err = r.componentRuns(ctx, v, cur); err != nil {
-				return "", err
-			}
 		}
 	}
 
 	action := plan.NextKubernetesStep(s, node, pre, checks, timing, now)
-	stamp := metav1.NewTime(now)
+	logAnswer(ctx, op, action, pre, "image", cur.Image, "reachable", node.Reachable, "activeHash", node.ActiveHash,
+		"persistentHash", node.PersistentHash, "previousHash", cur.PreviousHash, "desiredHash", cur.DesiredHash)
 
-	if action.Kind != plan.Wait {
-		logf.FromContext(ctx).Info("kubernetes step", "machine", cur.Machine, "component", cur.Component, "step", cur.Step,
-			"action", action.Kind.String(), "next", action.Step, "reason", action.Reason, "detail", action.Message, "image", cur.Image,
-			"reachable", node.Reachable, "activeHash", node.ActiveHash, "persistentHash", node.PersistentHash,
-			"previousHash", cur.PreviousHash, "desiredHash", cur.DesiredHash, "gate", pre.Note)
+	if note, done := answered(op, action, now); done {
+		return note, nil
 	}
 
-	switch action.Kind { //nolint:exhaustive // the actions of a Talos upgrade never come out of a Kubernetes step
-	case plan.Wait:
-		return action.Message, nil
-	case plan.Advance:
-		cur.Step, cur.Since, cur.HealthySince = action.Step, stamp, nil
-	case plan.MarkHealthy:
-		cur.HealthySince = &stamp
-	case plan.MarkUnhealthy:
-		cur.HealthySince = nil
-
-		return action.Message, nil
+	switch action.Kind {
 	case plan.Rearm:
 		deadline := metav1.NewTime(now.Add(plan.KubernetesTryTimeout(cur.Component, timing)))
 		cur.Deadline = &deadline
@@ -690,9 +544,9 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 	case plan.Confirm:
 		return r.confirm(ctx, tc, obs, v)
 	case plan.Complete:
-		verified(tc, false)
-	case plan.Fail:
-		failOperation(op, action.Reason, action.Message, now)
+		completed(tc)
+	default:
+		return "", unexpected(op, action)
 	}
 
 	return "", nil
@@ -707,8 +561,11 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 	op := tc.Status.Operation
 	cur := op.Current
 
-	if !r.latest(ctx, tc) {
-		return noteCatchingUp, nil
+	// Asked for first, although a component Talos does not run is not pulled: what is recorded
+	// below is only recorded from the TalosCluster as the API server has it now.
+	upgrader, note := clientTo(ctx, r, tc, obs, "pull the image with", r.Resolver.ResolveUpgrader)
+	if note != "" {
+		return note, nil
 	}
 
 	raw, err := talos.WithKubernetesImage(v.node.activeConfig, cur.Component, cur.Image)
@@ -725,48 +582,37 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 		return "", nil
 	}
 
-	stamp := metav1.NewTime(now)
-
 	if desired == v.live.Hash {
 		// The config names the image already: only the component is left to be seen running.
-		cur.Step, cur.PreviousHash, cur.DesiredHash, cur.Since = plan.StepVerifying, desired, desired, stamp
+		moveTo(cur, plan.StepVerifying, now)
+		cur.PreviousHash, cur.DesiredHash = desired, desired
 
 		return "", nil
+	}
+
+	// Nothing on the node runs from the image of a component Talos does not run, so there is
+	// nothing to pull to it.
+	if plan.Runs(cur.Component) {
+		// A download takes as long as it takes. The step's own timeout bounds it.
+		callCtx, cancel := context.WithTimeout(ctx, timing.StepTimeout)
+		defer cancel()
+
+		if err := upgrader.PullKubernetesImage(callCtx, v.node.address, cur.Component, cur.Image); err != nil {
+			if talos.IsUnreachable(err) {
+				return retried(ctx, op, "reach the node", err), nil
+			}
+
+			failOperation(op, plan.FailImagePull, fmt.Sprintf("could not pull %s; nothing on the node changed: %v", cur.Image, err), now)
+
+			return "", nil
+		}
 	}
 
 	// The deadline is persisted before the try is sent, as in a config rollout.
 	deadline := metav1.NewTime(now.Add(plan.KubernetesTryTimeout(cur.Component, timing)))
 
-	if !plan.Runs(cur.Component) {
-		// Nothing on the node runs from this image, so there is nothing to pull to it.
-		cur.Step, cur.PreviousHash, cur.DesiredHash, cur.Since, cur.Deadline = plan.StepTrying, v.live.Hash, desired, stamp, &deadline
-
-		return "", nil
-	}
-
-	upgrader, err := r.Resolver.ResolveUpgrader(ctx, tc, obs.endpoints)
-	if err != nil {
-		//nolint:nilerr // what the step waits for; the planner's timeouts end it if this lasts
-		return "no Talos client to pull the image with: " + err.Error(), nil
-	}
-
-	// A download takes as long as it takes. The step's own timeout bounds it.
-	callCtx, cancel := context.WithTimeout(ctx, timing.StepTimeout)
-	defer cancel()
-
-	if err := upgrader.PullKubernetesImage(callCtx, v.node.address, cur.Component, cur.Image); err != nil {
-		if talos.IsUnreachable(err) {
-			logf.FromContext(ctx).Info("pulling a Kubernetes image failed, will retry", "machine", cur.Machine, "error", err.Error())
-
-			return "the last attempt to reach the node failed: " + err.Error(), nil
-		}
-
-		failOperation(op, plan.FailImagePull, fmt.Sprintf("could not pull %s; nothing on the node changed: %v", cur.Image, err), now)
-
-		return "", nil
-	}
-
-	cur.Step, cur.PreviousHash, cur.DesiredHash, cur.Since, cur.Deadline = plan.StepTrying, v.live.Hash, desired, stamp, &deadline
+	moveTo(cur, plan.StepTrying, now)
+	cur.PreviousHash, cur.DesiredHash, cur.Deadline = v.live.Hash, desired, &deadline
 
 	return "", nil
 }
@@ -775,7 +621,7 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 // and is ready: for the kubelet by the version its Node reports, for a static pod by the pod the
 // kubelet mirrors into the API. kube-proxy is not run from a node's config, and so has nothing
 // to be seen.
-func (r *TalosClusterReconciler) componentRuns(ctx context.Context, v machineView, cur *talosv1alpha1.OperationStep) (plan.Gate, error) {
+func (r *TalosClusterReconciler) componentRuns(ctx context.Context, m boundMachine, cur *talosv1alpha1.OperationStep) (plan.Gate, error) {
 	closed := func(format string, args ...any) (plan.Gate, error) {
 		return plan.Gate{Reason: fmt.Sprintf(format, args...)}, nil
 	}
@@ -784,10 +630,7 @@ func (r *TalosClusterReconciler) componentRuns(ctx context.Context, v machineVie
 		return plan.Gate{Open: true}, nil
 	}
 
-	name := v.node.hostname
-	if id := v.tm.Status.Identity; id != nil && id.KubernetesNodeName != "" {
-		name = id.KubernetesNodeName
-	}
+	name := m.kubernetesNode()
 
 	if cur.Component == plan.ComponentKubelet {
 		want, ok := plan.VersionOf(cur.Image)

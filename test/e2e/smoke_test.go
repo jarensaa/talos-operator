@@ -153,15 +153,22 @@ func harnessTarget(ctx context.Context) (*talos.Factory, talos.Target) {
 	return f, talos.Target{Key: "harness", Credentials: c, Endpoints: controlPlanesNow(ctx, c.Endpoints)}
 }
 
+// addrsOf returns the addresses one of the harness's variables lists: E2E_CONTROLPLANES,
+// E2E_WORKERS, or E2E_MAINTENANCE_NODES, the machines it left in maintenance mode.
+func addrsOf(env string) []netip.Addr {
+	fields := strings.Fields(os.Getenv(env))
+	out := make([]netip.Addr, 0, len(fields))
+
+	for _, a := range fields {
+		out = append(out, netip.MustParseAddr(a))
+	}
+
+	return out
+}
+
 // harnessNodes returns the addresses of every configured harness node.
 func harnessNodes() []netip.Addr {
-	var nodes []netip.Addr
-
-	for _, env := range []string{"E2E_CONTROLPLANES", "E2E_WORKERS"} {
-		for _, addr := range strings.Fields(os.Getenv(env)) {
-			nodes = append(nodes, netip.MustParseAddr(addr))
-		}
-	}
+	nodes := slices.Concat(addrsOf("E2E_CONTROLPLANES"), addrsOf("E2E_WORKERS"))
 
 	Expect(nodes).NotTo(BeEmpty(), "E2E_CONTROLPLANES / E2E_WORKERS not set")
 

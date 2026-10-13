@@ -33,18 +33,8 @@ import (
 )
 
 const (
-	installImage = "factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:v1.14.2"
+	networkPatch = talostest.NetworkPatch
 
-	networkPatch = `apiVersion: v1alpha1
-kind: BondConfig
-name: bond0
-links: [eth0, eth1]
-bondMode: 802.3ad
----
-apiVersion: v1alpha1
-kind: DHCPv4Config
-name: bond0
-`
 	controlPlanePatch = `apiVersion: v1alpha1
 kind: KubeFlannelCNIConfig
 $patch: delete
@@ -63,12 +53,12 @@ provisioning:
 
 func inputs() derive.Inputs {
 	return derive.Inputs{
-		ClusterName:       "my-cluster",
-		Endpoint:          "https://cluster.example.com:6443",
-		KubernetesVersion: "1.37.0",
-		TalosVersion:      "v1.14",
+		ClusterName:       talostest.ClusterName,
+		Endpoint:          talostest.Endpoint,
+		KubernetesVersion: talostest.KubernetesVersion,
+		TalosVersion:      talostest.VersionContract,
 		Contract:          config.TalosVersion1_14,
-		InstallImage:      installImage,
+		InstallImage:      talostest.InstallImage,
 		DNSDomain:         render.DefaultDNSDomain,
 	}
 }
@@ -78,20 +68,7 @@ func inputs() derive.Inputs {
 func liveNode(t *testing.T, b *secrets.Bundle, in derive.Inputs, name string, role machine.Type, patches ...string) derive.Node {
 	t.Helper()
 
-	raw := make([][]byte, 0, len(patches))
-	for _, p := range patches {
-		raw = append(raw, []byte(p))
-	}
-
-	cfg, err := render.Generate(in.RenderInput(render.Input{Bundle: b, Role: role, Patches: raw}))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	encoded, err := cfg.Bytes()
-	if err != nil {
-		t.Fatal(err)
-	}
+	encoded := talostest.Config(t, in.RenderInput(render.Input{Bundle: b, Role: role, Patches: talostest.Patches(patches...)}))
 
 	live, err := talos.ParseMachineConfig(encoded)
 	if err != nil {
@@ -107,7 +84,7 @@ func TestInferRoundTrip(t *testing.T) {
 
 	node := liveNode(t, talostest.Bundle(t), want, "cp-1", machine.TypeControlPlane)
 
-	got, err := derive.Infer(node.Live, "v1.14.2")
+	got, err := derive.Infer(node.Live, talostest.TalosVersion)
 	if err != nil {
 		t.Fatal(err)
 	}

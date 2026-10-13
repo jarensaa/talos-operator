@@ -56,7 +56,7 @@ The design is shaped by one kind of cluster: a small bare-metal cluster that som
 | Installer images from Image Factory | Each node's schematic must be tracked and preserved across upgrades. |
 | Storage that lives on the nodes (Ceph, for one) | Node disruption must be gated on the storage system's health. Never wipe user disks. |
 | A CNI installed by something else, kube-proxy disabled | A Kubernetes upgrade must not fight whoever owns those manifests. Syncing Talos's bootstrap manifests is off by default for adopted clusters. |
-| The Kubernetes endpoint is a DNS name resolving to every node | Talos API endpoints used during upgrades must be **IPs of healthy, non-target nodes**, never the DNS name. |
+| The Kubernetes endpoint is a DNS name resolving to every node | Talos API endpoints used during upgrades must be **IPs of nodes other than the target**, never the DNS name. |
 | The secrets bundle may or may not have been kept | Recovery from cluster loss is a rebuild with fresh PKI (§12.7), so an off-cluster copy is optional break-glass, not DR. The operator holds an in-cluster copy (needed to render configs) and must never regenerate it for an existing cluster. |
 | **The files the cluster was built from are stale.** A live cluster diverges from its generated configs and patches. | The live cluster is the only source of truth for adoption. The operator derives the spec from live state, and files are at most cross-checked (§7.1). |
 
@@ -131,7 +131,7 @@ Self-hosted on a 3-CP-only cluster means the operator will drain and reboot its 
 - **2 replicas**, leader election, required pod anti-affinity, PDB `maxUnavailable: 1`.
 - **Every step is persisted before its side effect** (CACPPT's "annotate before etcd-leave" pattern). Example: `status.operation.step = Draining(node-2)` is written before the drain starts. If the leader is evicted, the standby resumes at that step.
 - **Steps are keyed on observed facts, not memory.** A reboot step stores the pre-reboot boot ID. On resume, a changed boot ID means "reboot happened".
-- **Talos calls are never routed through the target node.** `WithEndpoints` uses the IPs of healthy non-target CPs, and `client.WithNode(target)` reaches the target through apid proxying. Endpoints are re-resolved after every reboot.
+- **Talos calls are never routed through the target node.** `WithEndpoints` uses the IPs of the control planes other than the target, all of them, and `client.WithNode(target)` reaches the target through apid proxying. They are not sorted by health: a pass that could not read a member closes every gate anyway (§6.3). Endpoints are re-resolved after every reboot.
 - **The node hosting the current leader is upgraded last** in its group. This minimises failovers; it is not required for correctness.
 
 What self-hosted cannot do: recover from quorum loss, or bootstrap the cluster it lives in. Both remain out-of-band (talosctl + the existing runbook) and are documented, not automated.
@@ -290,9 +290,10 @@ status:
                                       #   message, remediation, token, and bundle: the Secret with what the
                                       #   machine said when it failed (§14.6)
   approval: { hash: 9c1e…, machines: [ … ] }   # a change waiting for a human (§6.3)
-  abortedTargets: {}                  # what an aborted rollout was applying; not started again (§8.3)
-  upgrades: { skipped: {}, aborted: {}, kubernetes: "" }   # machine -> installer image a human took out of an upgrade (§7.3);
-                                      #   the Kubernetes version whose upgrade a human aborted (§7.4)
+  holds:                              # what a human took out of the operations of each kind, by type (§8.3):
+    ConfigRollout: { skipped: {}, aborted: {} }   # machine -> what it was being taken to (a config hash, an
+    TalosUpgrade: { skipped: {}, aborted: {} }    #   installer image); not started again as it is
+    KubernetesUpgrade: { aborted: { "*": "1.37.1" } }   # the version whose upgrade was aborted (§7.4)
   versions:                           # what runs, what exists upstream, and the way to what the spec asks for (§7.5)
     talos: v1.14.1
     kubernetes: 1.36.5
@@ -394,7 +395,6 @@ status:
     desiredHash: sha256:…             # what the spec renders
     liveHash: sha256:…                # what the node runs
     appliedHash: sha256:…             # what the operator last confirmed on the node, or took over (§6.2)
-    skippedHash: sha256:…             # a rendered config a human skipped for this machine (§8.3)
     changeClass: LiveSafe             # class of the change from live to rendered, and what put it there (§6.3)
     changeReasons: [v1alpha1/KubeNodeConfig]
     diff: |                           # redacted, per document; this is what an approval is reviewed against
@@ -699,7 +699,7 @@ Rules the planner never breaks, checked over every combination of step, observat
 
 **Draining is done once, by the operator.** Talos leaves it to the client since 1.13, so nothing drains a second time (tuppr #575 was a double drain). Evictions go out without the Kubernetes client's own retries: a budget that has nothing to give answers 429 with `Retry-After`, and the client would sleep through ten of those, well over a minute per pod, inside a reconcile. The operator's own loop is what asks again.
 
-**Failures** halt the operation as a config rollout's do (§8.3), with the same three annotations. A skip or an abort covers one installer image for the machines concerned (`status.upgrades`) and is spent when the spec asks for another. A retry starts the machine's turn over from what the node runs now, and a cordon the operator set stays its own to undo.
+**Failures** halt the operation as a config rollout's do (§8.3), with the same three annotations. A skip or an abort covers one installer image for the machines concerned (`status.holds.TalosUpgrade`) and is spent when the spec asks for another. A retry starts the machine's turn over from what the node runs now, and a cordon the operator set stays its own to undo.
 
 **Pausing** leaves alone a node nothing was taken from yet. A node that is already cordoned is finished: stopping there would leave it out of the cluster.
 
@@ -741,7 +741,7 @@ What cannot be read is not fine: a check that fails to run blocks the upgrade (`
 
 A failure halts the operation (§8.3). There is no `skip-machine` here, for the reason a control plane cannot be on hold; `retry` and `abort` remain.
 
-Windows and gates hold a Kubernetes upgrade as they hold every operation (§6.4), and its `preRollout` and `postRollout` hooks run. A node's hooks do not: no node is taken out of the cluster. An aborted upgrade is not started again until the spec asks for another version (`status.upgrades.kubernetes`).
+Windows and gates hold a Kubernetes upgrade as they hold every operation (§6.4), and its `preRollout` and `postRollout` hooks run. A node's hooks do not: no node is taken out of the cluster. An aborted upgrade is not started again until the spec asks for another version (`status.holds.KubernetesUpgrade`).
 
 **The Talos access** is the two that exist: the image is pulled through the upgrade connection, into the namespace the component runs from, and the config is applied through the config connection.
 
@@ -821,7 +821,7 @@ A machine's turn:
 2. **Joining.** The machine installs itself and reboots; nothing answers for a while. It is a member once a node answers with the cluster's credentials and the pinned identity, has finished booting, has a Node that is Ready, and, for a control plane, is a voting member of etcd. It has three step timeouts for that.
 3. **Verifying.** The whole cluster, the new node included, healthy for the soak (`plan.VerifyGate`).
 
-A machine that was handed its config is never handed one again: a resumed step sees a member, and moves on. A failed turn halts the operation (§8.3). `abort` and `skip-machine` record the config the machine was to get (`status.membership.add`), and it is not added with that config again.
+A machine that was handed its config is never handed one again: a resumed step sees a member, and moves on. A failed turn halts the operation (§8.3). `abort` and `skip-machine` record the config the machine was to get (`status.holds.AddMachine`), and it is not added with that config again.
 
 **Not built:** adding several workers at once (the earlier plan; one at a time is the rule for every operation, §12.19); finding machines instead of declaring them; reporting what was found at an address whose identity is not pinned (`identity` is required).
 
@@ -893,7 +893,9 @@ This avoids the CACPPT #262 permablock.
 - Human actions, all via annotations on the TalosCluster whose value is the failure's token. The token names one failure, so an annotation left behind from an earlier one never acts on the next. The remediation text spells the three annotations out.
   - `talos.jarensaa.github.io/retry=<token>`: begin the failed machine's step again, from what the node runs now.
   - `talos.jarensaa.github.io/skip-machine=<token>`: leave the failed machine out and continue. Its rendered config is recorded as skipped and is not rolled out to it again; a spec that renders something else is.
-  - `talos.jarensaa.github.io/abort=<token>`: end the operation and leave nodes as they are. What was left of it is recorded in `status.abortedTargets` and is **not started again**; otherwise the same rollout would begin anew a moment later. A spec that renders anything else for a machine, a revert included, is a new change: it rolls out and clears the record.
+  - `talos.jarensaa.github.io/abort=<token>`: end the operation and leave nodes as they are. What was left of it is recorded and is **not started again**; otherwise the same rollout would begin anew a moment later. A spec that renders anything else for a machine, a revert included, is a new change: it rolls out and clears the record.
+
+  Both are recorded in one place and one shape for every kind of operation: `status.holds`, by the type of the operation, as `skipped` and `aborted`, each a map from the machine to what the operation was taking it to (the hash of a config, an installer image). A removal has nothing a machine could be taken to instead, so its entries are empty and stand until the spec asks for the removal anew. A Kubernetes upgrade is not aborted machine by machine: its one entry, under `*`, is the version (§7.4). An etcd defragmentation records nothing: its interval keeps the next one away.
 - Gates that can never become true are reported along with what is false. They are never silently bypassed.
 - A hook that fails halts the operation the same way (`HookFailed`, §6.4): `retry` runs the hook again as a new Job, `skip-machine` leaves out the node whose `preNode` hook failed, `abort` ends the operation.
 

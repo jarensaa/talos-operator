@@ -87,7 +87,7 @@ func TestPlanDefragment(t *testing.T) {
 		got    Defragment
 		reason string
 	}{
-		"paused": {blocked(func(s *DefragSettings) { s.Paused = true }, passOf("a", "b", "c"), fragmented), BlockPaused},
+		"paused": {blocked(func(s *DefragSettings) { s.Policy.Paused = true }, passOf("a", "b", "c"), fragmented), BlockPaused},
 		"outside its window": {
 			blocked(func(s *DefragSettings) { s.Policy.OutsideWindow = "opens at 02:00" }, passOf("a", "b", "c"), fragmented),
 			BlockOutsideWindow,
@@ -137,7 +137,7 @@ func TestNextDefragStep(t *testing.T) {
 		{name: "never healthy again", step: StepVerifying, reachable: true, checks: closed, after: long, want: Fail, detail: FailTimeout},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got := NextDefragStep(DefragStep{Name: tt.step, Since: t0, HealthySince: tt.healthySince}, tt.reachable, tt.pre, tt.checks,
+			got := NextDefragStep(Step{Name: tt.step, Since: t0, HealthySince: tt.healthySince}, tt.reachable, tt.pre, tt.checks,
 				timing, t0.Add(tt.after))
 			if got.Kind != tt.want || !strings.Contains(got.Step+" "+got.Reason+" "+got.Message, tt.detail) {
 				t.Fatalf("got %s %+v", got.Kind, got)
@@ -149,7 +149,7 @@ func TestNextDefragStep(t *testing.T) {
 	for _, step := range []string{StepDefragmenting, StepVerifying} {
 		for _, reachable := range []bool{false, true} {
 			for _, pre := range []Gate{open, closed} {
-				got := NextDefragStep(DefragStep{Name: step, Since: t0}, reachable, pre, open, timing, t0)
+				got := NextDefragStep(Step{Name: step, Since: t0}, reachable, pre, open, timing, t0)
 				if (got.Kind == Defrag) != (step == StepDefragmenting && reachable && pre.Open) {
 					t.Fatalf("%s reachable=%t gate=%t: got %s", step, reachable, pre.Open, got.Kind)
 				}

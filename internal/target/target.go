@@ -14,11 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package target resolves a TalosCluster into the clients needed to observe it: a read-only
-// Talos client built from its credentials (issued by Talos, or a supplied Secret), and a
-// Kubernetes client for the managed cluster. The operator is self-hosted first, so the managed
-// cluster's Kubernetes API is the manager's own; a management-cluster mode would swap that
-// client (docs/scope.md §4.2).
+// Package target resolves a TalosCluster into the clients that reach it: Talos clients built from
+// its credentials (issued by Talos, or a supplied Secret), and a Kubernetes client for the
+// managed cluster. The read-only client is there for the asking. Each client that can change a
+// node is handed out only while spec.management enables what it does, so that nothing which only
+// observes can come by one (docs/scope.md §8.1, invariant 6).
+//
+// The operator is self-hosted first, so the managed cluster's Kubernetes API is the manager's
+// own; a management-cluster mode would swap that client (docs/scope.md §4.2).
 package target
 
 import (
@@ -49,7 +52,9 @@ type ReaderFactory interface {
 	Reader(ctx context.Context, t talos.Target) (talos.Reader, error)
 }
 
-// ClientFactory also builds clients that can apply machine config; *talos.Factory implements it.
+// ClientFactory also builds the clients that can change a node, one for each kind of connection
+// (applying config, upgrading, removing, upkeep, and the maintenance connection to a machine
+// without a config); *talos.Factory implements it.
 type ClientFactory interface {
 	ReaderFactory
 	ConfigWriter(ctx context.Context, t talos.Target) (talos.ConfigWriter, error)
@@ -76,8 +81,10 @@ type Resolver struct {
 	// Client reads Secrets in the TalosCluster's namespace; it is also the managed cluster's
 	// Kubernetes client in self-hosted mode.
 	Client client.Client
-	// Factory builds Talos clients. It caches them per cluster and replaces a cached client when
-	// the credentials or endpoints change, so a rotated Secret takes effect on the next resolve.
+	// Factory builds Talos clients. It caches them per cluster, access, credentials and endpoints:
+	// a rotated Secret, or another choice of endpoints, takes effect on the next resolve with a
+	// client of its own, and the one it supersedes is closed once nobody has asked for it for a
+	// while (talos.Factory).
 	Factory ClientFactory
 	// Now is the clock used to check credential expiry; nil means time.Now.
 	Now func() time.Time
@@ -86,17 +93,14 @@ type Resolver struct {
 // Resolve loads tc's credentials and returns its Target. Credential problems are returned as
 // *creds.Error so the caller can report the reason in the CredentialsValid condition.
 func (r *Resolver) Resolve(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions) (*Target, error) {
-	c, endpoints, err := r.identity(ctx, tc, opts)
-	if err != nil {
-		return nil, err
-	}
+	return connect(ctx, r, tc, opts, nil, func(ctx context.Context, t talos.Target) (*Target, error) {
+		reader, err := r.Factory.Reader(ctx, t)
+		if err != nil {
+			return nil, err
+		}
 
-	reader, err := r.Factory.Reader(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
-	if err != nil {
-		return nil, err
-	}
-
-	return &Target{Talos: reader, Kube: r.Client, Credentials: c, Endpoints: endpoints}, nil
+		return &Target{Talos: reader, Kube: r.Client, Credentials: t.Credentials, Endpoints: t.Endpoints}, nil
+	})
 }
 
 // ErrKubernetesAPI marks a failure of the Kubernetes API the operator runs against, as opposed to
@@ -104,53 +108,63 @@ func (r *Resolver) Resolve(ctx context.Context, tc *talosv1alpha1.TalosCluster, 
 // cluster as unreachable.
 var ErrKubernetesAPI = errors.New("reading the Kubernetes API")
 
-// ErrNotManaged is returned for a write client while config is not Manage.
-var ErrNotManaged = errors.New("a config writer is only available while spec.management.config is Manage")
+// Why a client that can change a node is refused: spec.management does not enable what it does.
+var (
+	// ErrNotManaged is returned for a write client while config is not Manage.
+	ErrNotManaged = errors.New("a config writer is only available while spec.management.config is Manage")
+	// ErrUpgradesDisabled is returned for an upgrade client while upgrades are not enabled.
+	ErrUpgradesDisabled = errors.New("an upgrader is only available while spec.management.upgrades is Enabled")
+	// ErrMembershipDisabled is returned for the clients that add and remove machines while
+	// membership is not enabled.
+	ErrMembershipDisabled = errors.New("machines are only added and removed while spec.management.membership is Enabled")
+	// ErrMaintenanceDisabled is returned for the client that keeps etcd while maintenance is not enabled.
+	ErrMaintenanceDisabled = errors.New("etcd is only defragmented while spec.management.maintenance is Enabled")
+)
+
+// refusedUnless is the gate of a client that can change a node: nil while spec.management
+// enables what the client does, and the reason it is refused otherwise.
+func refusedUnless(enabled bool, refusal error) error {
+	if enabled {
+		return nil
+	}
+
+	return refusal
+}
+
+// connect is what every Resolve method does. A client that is refused is refused before anything
+// is read or built. Otherwise tc's credentials are loaded, its endpoints selected, and the client
+// built for them, under the cluster's UID as the key its connections are cached by.
+func connect[T any](ctx context.Context, r *Resolver, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions, refused error,
+	build func(context.Context, talos.Target) (T, error),
+) (T, error) {
+	var none T
+
+	if refused != nil {
+		return none, refused
+	}
+
+	c, endpoints, err := r.identity(ctx, tc, opts)
+	if err != nil {
+		return none, err
+	}
+
+	return build(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
+}
 
 // ResolveWriter returns a client that can apply machine config to tc's nodes. It refuses unless
 // spec.management.config is Manage, so nothing that only observes can obtain one
 // (docs/scope.md §8.1, invariant 6).
 func (r *Resolver) ResolveWriter(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions,
 ) (talos.ConfigWriter, error) {
-	if tc.Spec.Management.Config != talosv1alpha1.ConfigManagementManage {
-		return nil, ErrNotManaged
-	}
-
-	c, endpoints, err := r.identity(ctx, tc, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	return r.Factory.ConfigWriter(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
+	return connect(ctx, r, tc, opts, refusedUnless(tc.Spec.Management.ManagesConfig(), ErrNotManaged), r.Factory.ConfigWriter)
 }
-
-// ErrUpgradesDisabled is returned for an upgrade client while upgrades are not enabled.
-var ErrUpgradesDisabled = errors.New("an upgrader is only available while spec.management.upgrades is Enabled")
 
 // ResolveUpgrader returns a client that can upgrade and reboot tc's nodes. It refuses unless
 // spec.management.upgrades is Enabled and config is Manage, so nothing else can obtain one
 // (docs/scope.md §8.1, invariant 6).
 func (r *Resolver) ResolveUpgrader(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions,
 ) (talos.Upgrader, error) {
-	if tc.Spec.Management.Config != talosv1alpha1.ConfigManagementManage || tc.Spec.Management.Upgrades != talosv1alpha1.CapabilityEnabled {
-		return nil, ErrUpgradesDisabled
-	}
-
-	c, endpoints, err := r.identity(ctx, tc, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	return r.Factory.Upgrader(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
-}
-
-// ErrMembershipDisabled is returned for the clients that add and remove machines while
-// membership is not enabled.
-var ErrMembershipDisabled = errors.New("machines are only added and removed while spec.management.membership is Enabled")
-
-func membership(tc *talosv1alpha1.TalosCluster) bool {
-	return tc.Spec.Management.Config == talosv1alpha1.ConfigManagementManage &&
-		tc.Spec.Management.Membership == talosv1alpha1.CapabilityEnabled
+	return connect(ctx, r, tc, opts, refusedUnless(tc.Spec.Management.MayUpgrade(), ErrUpgradesDisabled), r.Factory.Upgrader)
 }
 
 // ResolveRemover returns a client that can take a machine out of tc. It refuses unless
@@ -158,16 +172,7 @@ func membership(tc *talosv1alpha1.TalosCluster) bool {
 // (docs/scope.md §8.1, invariant 6).
 func (r *Resolver) ResolveRemover(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions,
 ) (talos.Remover, error) {
-	if !membership(tc) {
-		return nil, ErrMembershipDisabled
-	}
-
-	c, endpoints, err := r.identity(ctx, tc, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	return r.Factory.Remover(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
+	return connect(ctx, r, tc, opts, refusedUnless(tc.Spec.Management.MayChangeMembership(), ErrMembershipDisabled), r.Factory.Remover)
 }
 
 // ResolveMaintenance returns the connection to a machine that waits in maintenance mode at addr,
@@ -175,32 +180,19 @@ func (r *Resolver) ResolveRemover(ctx context.Context, tc *talosv1alpha1.TalosCl
 // Manage. The connection carries none of the cluster's credentials; the caller closes it.
 func (r *Resolver) ResolveMaintenance(ctx context.Context, tc *talosv1alpha1.TalosCluster, addr netip.Addr,
 ) (talos.Maintenance, error) {
-	if !membership(tc) {
-		return nil, ErrMembershipDisabled
+	if err := refusedUnless(tc.Spec.Management.MayChangeMembership(), ErrMembershipDisabled); err != nil {
+		return nil, err
 	}
 
 	return r.Factory.Maintenance(ctx, addr)
 }
-
-// ErrMaintenanceDisabled is returned for the client that keeps etcd while maintenance is not enabled.
-var ErrMaintenanceDisabled = errors.New("etcd is only defragmented while spec.management.maintenance is Enabled")
 
 // ResolveKeeper returns a client that can defragment tc's etcd. It refuses unless
 // spec.management.maintenance is Enabled and config is Manage, so nothing else can obtain one
 // (docs/scope.md §8.1, invariant 6).
 func (r *Resolver) ResolveKeeper(ctx context.Context, tc *talosv1alpha1.TalosCluster, opts talos.SelectOptions,
 ) (talos.Keeper, error) {
-	if tc.Spec.Management.Config != talosv1alpha1.ConfigManagementManage ||
-		tc.Spec.Management.Maintenance != talosv1alpha1.CapabilityEnabled {
-		return nil, ErrMaintenanceDisabled
-	}
-
-	c, endpoints, err := r.identity(ctx, tc, opts)
-	if err != nil {
-		return nil, err
-	}
-
-	return r.Factory.Keeper(ctx, talos.Target{Key: string(tc.UID), Credentials: c, Endpoints: endpoints})
+	return connect(ctx, r, tc, opts, refusedUnless(tc.Spec.Management.MayMaintain(), ErrMaintenanceDisabled), r.Factory.Keeper)
 }
 
 // identity loads tc's credentials and selects its endpoints.

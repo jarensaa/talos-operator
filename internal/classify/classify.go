@@ -185,9 +185,6 @@ func sortRules(rules []pathRule) []pathRule {
 	return rules
 }
 
-// v1alpha1Key is the key of the legacy root document in a normalized config.
-const v1alpha1Key render.DocKey = "v1alpha1"
-
 // Option changes how a difference is classified.
 type Option func(*options)
 
@@ -246,51 +243,27 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 			continue
 		}
 
-		if k == v1alpha1Key && inLive && inDesired {
+		// A document only one of the configs has is classified as a whole.
+		whole := kindClass(k)
+
+		if rule, byField := fieldRuleFor(k); byField && inLive && inDesired {
 			paths, err := changedPaths(a, b)
 			if err != nil {
 				return Change{}, fmt.Errorf("compare %s: %w", k, err)
 			}
 
-			for _, p := range paths {
-				note(pathClass(p), string(k)+": "+p)
-			}
-
-			if len(paths) == 0 {
-				// The documents differ in a way the field comparison does not see.
-				note(Unknown, string(k))
-			}
-
-			continue
-		}
-
-		if kubernetesKinds[kindOf(k)] && inLive && inDesired {
-			classified, err := classifyComponent(k, a, b, note)
-			if err != nil {
-				return Change{}, err
-			}
-
-			if classified {
-				continue
-			}
-		}
-
-		// The document that names the installer: a change of the image alone is the installer's
-		// class, anything else in it only an install can bring about.
-		if isKind(k, unattendedInstallKind) && inLive && inDesired {
-			paths, err := changedPaths(a, b)
-			if err != nil {
-				return Change{}, fmt.Errorf("compare %s: %w", k, err)
-			}
-
-			if len(paths) == 1 && paths[0] == unattendedInstallImage {
-				note(Installer, string(k)+": "+paths[0])
+			if classes, ok := rule.classes(paths); ok {
+				for i, p := range paths {
+					note(classes[i], string(k)+": "+p)
+				}
 
 				continue
 			}
+
+			whole = rule.whole
 		}
 
-		note(kindClass(k), string(k))
+		note(whole, string(k))
 	}
 
 	var out Change
@@ -306,39 +279,65 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 	return out, nil
 }
 
-// classifyComponent classifies the change of a Kubernetes component's document field by field:
-// its image is the Kubernetes upgrade's to change, everything else in it is classified as the
-// document is. It reports false when the field comparison finds nothing, for the caller to
-// classify the document as a whole.
-func classifyComponent(k render.DocKey, live, desired []byte, note func(Class, string)) (bool, error) {
-	paths, err := changedPaths(live, desired)
-	if err != nil {
-		return false, fmt.Errorf("compare %s: %w", k, err)
-	}
-
-	for _, p := range paths {
-		class := kindClass(k)
-		if p == componentImage {
-			class = Kubernetes
-		}
-
-		note(class, string(k)+": "+p)
-	}
-
-	return len(paths) > 0, nil
+// fieldRule classifies a document that both configs have by the fields that differ between them,
+// instead of as a whole.
+type fieldRule struct {
+	// class is the class of one field. A field that has none leaves the document to be classified
+	// as a whole.
+	class func(path string) (Class, bool)
+	// whole is the class of the document when its fields do not say: one of them has no class, or
+	// the documents differ in a way the field comparison does not see.
+	whole Class
 }
 
-func isKind(key render.DocKey, kind string) bool { return kindOf(key) == kind }
+// fieldRuleFor returns the rule of the three kinds of document that have one.
+func fieldRuleFor(key render.DocKey) (fieldRule, bool) {
+	kind := key.Kind()
 
-// kindOf is the kind of a document key such as v1alpha1/BondConfig/bond0; empty for the legacy
-// root document.
-func kindOf(key render.DocKey) string {
-	parts := strings.Split(string(key), "/")
-	if len(parts) < 2 {
-		return ""
+	switch {
+	case key == render.RootKey:
+		// Every field of the legacy root document has a class: Unknown, if no rule names it.
+		return fieldRule{class: func(path string) (Class, bool) { return pathClass(path), true }, whole: Unknown}, true
+	case kubernetesKinds[kind]:
+		// The image of a Kubernetes component is the Kubernetes upgrade's to change. Everything
+		// else in its document is classified as the document is.
+		return fieldRule{
+			class: func(path string) (Class, bool) {
+				if path == componentImage {
+					return Kubernetes, true
+				}
+
+				return kindClass(key), true
+			},
+			whole: kindClass(key),
+		}, true
+	case kind == unattendedInstallKind:
+		// The document that names the installer: a change of the image alone is the installer's
+		// class, anything else in it only an install can bring about.
+		return fieldRule{
+			class: func(path string) (Class, bool) { return Installer, path == unattendedInstallImage },
+			whole: kindClass(key),
+		}, true
 	}
 
-	return parts[1]
+	return fieldRule{}, false
+}
+
+// classes returns the class of each of the paths. It reports false when there are none, or when
+// one of them has no class.
+func (r fieldRule) classes(paths []string) ([]Class, bool) {
+	out := make([]Class, 0, len(paths))
+
+	for _, p := range paths {
+		class, ok := r.class(p)
+		if !ok {
+			return nil, false
+		}
+
+		out = append(out, class)
+	}
+
+	return out, len(out) > 0
 }
 
 // kubernetesKinds are the documents that name the image of a Kubernetes component Talos runs,
@@ -350,15 +349,15 @@ var kubernetesKinds = map[string]bool{
 
 const componentImage = "image"
 
-// kindClass classifies a document key such as v1alpha1/BondConfig/bond0.
+// kindClass classifies a document as a whole, by its kind.
 func kindClass(key render.DocKey) Class {
-	parts := strings.Split(string(key), "/")
-	if len(parts) < 2 {
+	kind := key.Kind()
+	if kind == "" {
 		// The whole v1alpha1 document appearing or disappearing.
 		return Protected
 	}
 
-	if class, ok := kindClasses[parts[1]]; ok {
+	if class, ok := kindClasses[kind]; ok {
 		return class
 	}
 

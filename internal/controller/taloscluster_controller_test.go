@@ -18,10 +18,8 @@ package controller
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"net/netip"
-	"slices"
 	"strings"
 	"time"
 
@@ -46,9 +44,7 @@ import (
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
 	"github.com/jarensaa/talos-operator/internal/adopt"
 	"github.com/jarensaa/talos-operator/internal/plan"
-	"github.com/jarensaa/talos-operator/internal/render"
 	"github.com/jarensaa/talos-operator/internal/talos"
-	"github.com/jarensaa/talos-operator/internal/talos/creds"
 	"github.com/jarensaa/talos-operator/internal/talos/fake"
 	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 	"github.com/jarensaa/talos-operator/internal/target"
@@ -74,7 +70,7 @@ var (
 const (
 	cpUUID     = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001"
 	workerUUID = "aaaaaaaa-bbbb-4ccc-8ddd-000000000002"
-	schematic  = "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
+	schematic  = talostest.SchematicID
 )
 
 // liveConfig generates a node's config the way talosctl would, signed by the shared test bundle.
@@ -82,27 +78,12 @@ const (
 func liveConfig(role talosmachine.Type, patches ...string) []byte {
 	GinkgoHelper()
 
-	in := render.Input{
-		ClusterName:       "e2e",
-		Endpoint:          "https://" + cpAddr.String() + ":6443",
-		KubernetesVersion: kubernetesVersion,
-		Contract:          config.TalosVersion1_14,
-		Bundle:            talostest.Bundle(GinkgoT()),
-		Role:              role,
-		InstallImage:      "factory.talos.dev/metal-installer/" + schematic + ":" + talosVersion,
-	}
+	in := talostest.Input(GinkgoT(), patches...)
+	in.ClusterName, in.Endpoint = "e2e", "https://"+cpAddr.String()+":6443"
+	in.KubernetesVersion, in.InstallImage = kubernetesVersion, talostest.InstallerOf(talosVersion)
+	in.Role = role
 
-	for _, p := range patches {
-		in.Patches = append(in.Patches, []byte(p))
-	}
-
-	cfg, err := render.Generate(in)
-	Expect(err).NotTo(HaveOccurred())
-
-	raw, err := cfg.Bytes()
-	Expect(err).NotTo(HaveOccurred())
-
-	return raw
+	return talostest.Config(GinkgoT(), in)
 }
 
 // reproduceLiveConfigs sets the spec the fake's live configs were generated from (liveConfig).
@@ -117,31 +98,32 @@ func reproduceLiveConfigs(tc *talosv1alpha1.TalosCluster) {
 }
 
 // fakeNode is a healthy fake Talos node running the config liveConfig generates for its role.
-func fakeNode(addr netip.Addr, machineType, name, uuid string, etcdID uint64) fake.Node {
+func fakeNode(addr netip.Addr, role talosv1alpha1.MachineRole, name, uuid string, etcdID uint64) fake.Node {
 	GinkgoHelper()
 
-	role := talosmachine.TypeWorker
-	if machineType == fake.TypeControlPlane {
-		role = talosmachine.TypeControlPlane
+	// What a role is called by the fake, and by the config Talos generates.
+	machineType, configType := fake.TypeWorker, talosmachine.TypeWorker
+	if role == talosv1alpha1.MachineRoleControlPlane {
+		machineType, configType = fake.TypeControlPlane, talosmachine.TypeControlPlane
 	}
 
 	return fake.Node{
 		Addr: addr, MachineType: machineType, Nodename: name, EtcdMemberID: etcdID,
 		Version:           talos.VersionInfo{Tag: talosVersion},
-		MachineStatus:     talos.MachineStatus{Stage: stageRunning, Ready: true},
+		MachineStatus:     talos.MachineStatus{Stage: talos.StageRunning, Ready: true},
 		BootID:            name + "-boot-1",
 		SystemInformation: talos.SystemInformation{UUID: uuid},
 		Schematic:         talos.Schematic{ID: schematic},
 		// Like a real node booted from disk: no persistent config until something is applied.
-		Config: talos.MachineConfigs{Active: liveConfig(role)},
+		Config: talos.MachineConfigs{Active: liveConfig(configType)},
 	}
 }
 
 // observedCluster is the fake Talos cluster most specs observe: one control plane, one worker.
 func observedCluster() *fake.Scenario {
 	return fake.NewScenario(
-		fakeNode(cpAddr, fake.TypeControlPlane, cpNodename, cpUUID, 0xa1),
-		fakeNode(workerAddr, fake.TypeWorker, "e2e-worker-1", workerUUID, 0),
+		fakeNode(cpAddr, talosv1alpha1.MachineRoleControlPlane, cpNodename, cpUUID, 0xa1),
+		fakeNode(workerAddr, talosv1alpha1.MachineRoleWorker, "e2e-worker-1", workerUUID, 0),
 	)
 }
 
@@ -167,11 +149,12 @@ func condition(tc *talosv1alpha1.TalosCluster, condType string) *metav1.Conditio
 
 var _ = Describe("TalosCluster observe loop", func() {
 	var (
-		ns         string
-		scenario   *fake.Scenario
-		recorder   *events.FakeRecorder
-		reconciler *TalosClusterReconciler
-		tc         *talosv1alpha1.TalosCluster
+		ns                string
+		scenario          *fake.Scenario
+		recorder          *events.FakeRecorder
+		reconciler        *TalosClusterReconciler
+		machineReconciler *TalosMachineReconciler
+		tc                *talosv1alpha1.TalosCluster
 	)
 
 	reconcileOnce := func() {
@@ -194,31 +177,41 @@ var _ = Describe("TalosCluster observe loop", func() {
 		Fail("the reconciler kept changing the TalosCluster")
 	}
 
+	machineNames := func() []string {
+		GinkgoHelper()
+
+		var list talosv1alpha1.TalosMachineList
+		Expect(k8sClient.List(ctx, &list, client.InNamespace(ns))).To(Succeed())
+
+		names := make([]string, 0, len(list.Items))
+		for _, tm := range list.Items {
+			names = append(names, tm.Name)
+		}
+
+		return names
+	}
+
+	// reconcileAll runs both controllers once: the machines' for every TalosMachine, then the
+	// cluster's, whose proof reads their status.
+	reconcileAll := func() {
+		GinkgoHelper()
+
+		for _, name := range machineNames() {
+			_, err := machineReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: ns, Name: name}})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		reconcileOnce()
+	}
+
 	BeforeEach(func() {
-		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "observe-"}}
-		Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
-		ns = namespace.Name
+		tc = specCluster("observe-", nil)
+		ns = tc.Namespace
 
 		for _, n := range []*corev1.Node{kubeNode(cpNodename), kubeNode("e2e-worker-1")} {
 			Expect(k8sClient.Create(ctx, n)).To(Succeed())
 			Expect(k8sClient.Status().Update(ctx, n)).To(Succeed())
 		}
-
-		DeferCleanup(func() {
-			Expect(k8sClient.DeleteAllOf(ctx, &corev1.Node{})).To(Succeed())
-		})
-
-		Expect(k8sClient.Create(ctx, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: credentialsSecret, Namespace: ns},
-			Data:       map[string][]byte{creds.DefaultTalosconfigKey: talostest.AdminTalosconfig(GinkgoT(), cpAddr.String())},
-		})).To(Succeed())
-
-		tc = &talosv1alpha1.TalosCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns},
-			Spec:       talosv1alpha1.TalosClusterSpec{Credentials: secretCredentials()},
-		}
-		Expect(k8sClient.Create(ctx, tc)).To(Succeed())
-		createPools(ns)
 
 		scenario = observedCluster()
 		recorder = events.NewFakeRecorder(50)
@@ -228,6 +221,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 			Resolver: &target.Resolver{Client: k8sClient, Factory: &fake.Factory{Scenario: scenario}},
 			Recorder: recorder,
 		}
+		machineReconciler = &TalosMachineReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Resolver: reconciler.Resolver}
 	})
 
 	It("reports a healthy observed cluster without writing to Talos", func() {
@@ -516,10 +510,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 	})
 
 	Context("adoption proof", func() {
-		var (
-			machineReconciler *TalosMachineReconciler
-			machines          []*talosv1alpha1.TalosMachine
-		)
+		var machines []*talosv1alpha1.TalosMachine
 
 		adopted := func() *metav1.Condition {
 			GinkgoHelper()
@@ -539,26 +530,12 @@ var _ = Describe("TalosCluster observe loop", func() {
 			return n
 		}
 
-		// reconcileAll runs both controllers once, machines first, as the cluster's proof reads
-		// their status.
-		reconcileAll := func() {
-			GinkgoHelper()
-
-			for _, tm := range machines {
-				_, err := machineReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(tm)})
-				Expect(err).NotTo(HaveOccurred())
-			}
-
-			reconcileOnce()
-		}
-
 		BeforeEach(func() {
 			reproduceLiveConfigs(tc)
 			Expect(k8sClient.Update(ctx, tc)).To(Succeed())
 
 			// These specs bring their own resources, under their own names: every node has its
 			// TalosMachine before the operator looks, so the operator writes none.
-			machineReconciler = &TalosMachineReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Resolver: reconciler.Resolver}
 			machines = []*talosv1alpha1.TalosMachine{
 				machine(ns, "cp-1", talosv1alpha1.MachineRoleControlPlane, cpAddr, cpUUID),
 				machine(ns, "worker-1", talosv1alpha1.MachineRoleWorker, workerAddr, workerUUID),
@@ -720,7 +697,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 
 		It("waits until every live member has a TalosMachine", func() {
 			Expect(k8sClient.Delete(ctx, machines[1])).To(Succeed())
-			machines = machines[:1]
 
 			reconcileAll()
 
@@ -738,8 +714,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 		const workerNodename = "e2e-worker-1"
 
 		var (
-			machineReconciler *TalosMachineReconciler
-
 			controlPlanes = clusterName + "-control-plane"
 			workers       = clusterName + "-workers"
 		)
@@ -762,29 +736,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 			return pool
 		}
 
-		getMachine := func(name string) *talosv1alpha1.TalosMachine {
-			GinkgoHelper()
-
-			tm := &talosv1alpha1.TalosMachine{}
-			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, tm)).To(Succeed())
-
-			return tm
-		}
-
-		machineNames := func() []string {
-			GinkgoHelper()
-
-			var list talosv1alpha1.TalosMachineList
-			Expect(k8sClient.List(ctx, &list, client.InNamespace(ns))).To(Succeed())
-
-			names := make([]string, 0, len(list.Items))
-			for _, tm := range list.Items {
-				names = append(names, tm.Name)
-			}
-
-			return names
-		}
-
 		derived := func() *metav1.Condition {
 			GinkgoHelper()
 
@@ -792,18 +743,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 			Expect(c).NotTo(BeNil())
 
 			return c
-		}
-
-		// reconcileAll runs the machines' controller for every TalosMachine, then the cluster's.
-		reconcileAll := func() {
-			GinkgoHelper()
-
-			for _, name := range machineNames() {
-				_, err := machineReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: ns, Name: name}})
-				Expect(err).NotTo(HaveOccurred())
-			}
-
-			reconcileOnce()
 		}
 
 		// runAdoption lets adoption run to its end.
@@ -846,10 +785,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 			scenario.UpdateNode(workerAddr, func(n *fake.Node) { n.Config.Active = edited })
 		}
 
-		BeforeEach(func() {
-			machineReconciler = &TalosMachineReconciler{Client: k8sClient, Scheme: k8sClient.Scheme(), Resolver: reconciler.Resolver}
-		})
-
 		It("writes the resources that describe the live cluster and arrives at Adopted with nothing applied by hand", func() {
 			reconcileOnce()
 
@@ -871,7 +806,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 			Expect(getPool(workers).Spec.ClusterRef.Name).To(Equal(clusterName))
 			Expect(machineNames()).To(ConsistOf(cpNodename, workerNodename))
 
-			cp, worker := getMachine(cpNodename), getMachine(workerNodename)
+			cp, worker := getMachine(ns, cpNodename), getMachine(ns, workerNodename)
 			Expect(cp.Spec.PoolRef.Name).To(Equal(controlPlanes))
 			Expect(cp.Spec.Identity.SystemUUID).To(Equal(cpUUID))
 			Expect(cp.Spec.Address).To(Equal(cpAddr.String()))
@@ -883,7 +818,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 				raw, err := sigsyaml.Marshal(obj)
 				Expect(err).NotTo(HaveOccurred())
 
-				for _, secret := range secretMaterial(talostest.Bundle(GinkgoT())) {
+				for _, secret := range talostest.SecretValues(talostest.Bundle(GinkgoT())) {
 					Expect(string(raw)).NotTo(ContainSubstring(secret), "a derived spec leaks secret material")
 				}
 			}
@@ -931,7 +866,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 
 			Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseAdopting))
 			Expect(condition(tc, talosv1alpha1.ConditionConfigProven).Status).To(Equal(metav1.ConditionFalse))
-			Expect(meta.IsStatusConditionFalse(getMachine(cpNodename).Status.Conditions, talosv1alpha1.ConditionConfigMatchesLive)).To(BeTrue())
+			Expect(meta.IsStatusConditionFalse(getMachine(ns, cpNodename).Status.Conditions, talosv1alpha1.ConditionConfigMatchesLive)).To(BeTrue())
 		})
 
 		It("does not give a node a second TalosMachine when it has one under another name", func() {
@@ -943,13 +878,13 @@ var _ = Describe("TalosCluster observe loop", func() {
 			Expect(getPool(workers).Spec.Role).To(Equal(talosv1alpha1.MachineRoleWorker))
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: controlPlanes}, &talosv1alpha1.TalosMachinePool{})).
 				To(Satisfy(apierrors.IsNotFound), "no pool is written that no written machine is in")
-			Expect(getMachine("cp-1").Spec.PoolRef.Name).To(Equal(controlPlanePool), "the machine that was there is untouched")
+			Expect(getMachine(ns, "cp-1").Spec.PoolRef.Name).To(Equal(controlPlanePool), "the machine that was there is untouched")
 			Expect(derived().Status).To(Equal(metav1.ConditionTrue), "a node described under another name is described: %s", derived().Message)
 		})
 
 		It("keeps the resources in line with the cluster for as long as it is being adopted", func() {
 			reconcileOnce()
-			Expect(getMachine(workerNodename).Spec.Config).To(BeEmpty())
+			Expect(getMachine(ns, workerNodename).Spec.Config).To(BeEmpty())
 			Expect(getPool(workers).Spec.Config).To(BeEmpty())
 
 			editWorker()
@@ -968,7 +903,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 		It("leaves a resource as it is once someone else changed it, and says which", func() {
 			reconcileOnce()
 
-			worker := getMachine(workerNodename)
+			worker := getMachine(ns, workerNodename)
 			worker.Spec.Address = "10.5.0.99"
 			Expect(k8sClient.Update(ctx, worker)).To(Succeed())
 
@@ -976,7 +911,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 			editWorker()
 			reconcileOnce()
 
-			Expect(getMachine(workerNodename).Spec.Address).To(Equal("10.5.0.99"), "what someone else set is theirs")
+			Expect(getMachine(ns, workerNodename).Spec.Address).To(Equal("10.5.0.99"), "what someone else set is theirs")
 			Expect(derived().Status).To(Equal(metav1.ConditionFalse))
 			Expect(derived().Reason).To(Equal(talosv1alpha1.ReasonChangedElsewhere))
 			Expect(derived().Message).To(ContainSubstring("TalosMachine " + workerNodename))
@@ -992,7 +927,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 
 			reconcileOnce()
 
-			Expect(getMachine(workerNodename).Spec.PoolRef.Name).To(Equal(workerPool))
+			Expect(getMachine(ns, workerNodename).Spec.PoolRef.Name).To(Equal(workerPool))
 			Expect(derived().Reason).To(Equal(talosv1alpha1.ReasonChangedElsewhere))
 			Expect(derived().Message).To(ContainSubstring("TalosMachine " + workerNodename))
 		})
@@ -1002,7 +937,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 
 			generations := map[string]int64{
 				workers:        getPool(workers).Generation,
-				workerNodename: getMachine(workerNodename).Generation,
+				workerNodename: getMachine(ns, workerNodename).Generation,
 				clusterName:    tc.Generation,
 			}
 
@@ -1013,7 +948,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 
 			Expect(getPool(workers).Generation).To(Equal(generations[workers]))
 			Expect(getPool(workers).Spec.Config).To(BeEmpty(), "the resources no longer follow the cluster")
-			Expect(getMachine(workerNodename).Generation).To(Equal(generations[workerNodename]))
+			Expect(getMachine(ns, workerNodename).Generation).To(Equal(generations[workerNodename]))
 			Expect(tc.Generation).To(Equal(generations[clusterName]))
 
 			By("reporting that they no longer match, without going back")
@@ -1023,7 +958,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 			Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseAdopted))
 
 			By("not bringing back a resource that was deleted")
-			cp := getMachine(cpNodename)
+			cp := getMachine(ns, cpNodename)
 			cp.Annotations = map[string]string{talosv1alpha1.AnnotationOrphan: "true"}
 			Expect(k8sClient.Update(ctx, cp)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, cp)).To(Succeed())
@@ -1041,7 +976,9 @@ var _ = Describe("TalosCluster observe loop", func() {
 			// Ownership is given up in the passes after the one that adopted.
 			reconcileOnce()
 
-			for _, obj := range []client.Object{tc, getPool(workers), getPool(controlPlanes), getMachine(workerNodename), getMachine(cpNodename)} {
+			for _, obj := range []client.Object{
+				tc, getPool(workers), getPool(controlPlanes), getMachine(ns, workerNodename), getMachine(ns, cpNodename),
+			} {
 				Expect(ownsSpec(obj)).To(BeFalse(), "%T %s still names the operator as an owner of its spec", obj, obj.GetName())
 			}
 
@@ -1061,12 +998,12 @@ var _ = Describe("TalosCluster observe loop", func() {
 			By("doing the same with a machine, which also carries the status its own controller writes")
 			reconcileAll()
 
-			worker := getMachine(workerNodename)
+			worker := getMachine(ns, workerNodename)
 			withConfig := worker.Spec
 			withConfig.Config = []talosv1alpha1.ConfigSource{{Inline: editedLabel}}
 			asGitOps("TalosMachine", worker, withConfig)
 			asGitOps("TalosMachine", worker, worker.Spec)
-			Expect(getMachine(workerNodename).Spec.Config).To(BeEmpty())
+			Expect(getMachine(ns, workerNodename).Spec.Config).To(BeEmpty())
 		})
 
 		It("does not overwrite what someone else manages when its record of the adoption is lost", func() {
@@ -1074,7 +1011,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 			reconcileOnce()
 
 			By("taking the worker's machine over and changing it")
-			worker := getMachine(workerNodename)
+			worker := getMachine(ns, workerNodename)
 			taken := worker.Spec
 			taken.Address = "10.5.0.99"
 			asGitOps("TalosMachine", worker, taken)
@@ -1087,7 +1024,7 @@ var _ = Describe("TalosCluster observe loop", func() {
 			reconcileOnce()
 
 			Expect(tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseAdopting), "without its record the operator is adopting again")
-			Expect(getMachine(workerNodename).Spec.Address).To(Equal("10.5.0.99"), "and still does not touch what is someone else's")
+			Expect(getMachine(ns, workerNodename).Spec.Address).To(Equal("10.5.0.99"), "and still does not touch what is someone else's")
 			Expect(derived().Reason).To(Equal(talosv1alpha1.ReasonChangedElsewhere))
 			Expect(derived().Message).To(ContainSubstring("TalosMachine " + workerNodename))
 		})
@@ -1183,21 +1120,6 @@ var _ = Describe("TalosCluster observe loop", func() {
 		})
 	})
 })
-
-// secretMaterial lists a bundle's secret values as they appear in configs: base64-encoded keys and
-// plain tokens.
-func secretMaterial(b *secrets.Bundle) []string {
-	keys := [][]byte{b.Certs.OS.Key, b.Certs.Etcd.Key, b.Certs.K8s.Key, b.Certs.K8sAggregator.Key, b.Certs.K8sServiceAccount.Key}
-
-	out := make([]string, 0, len(keys)+4)
-	out = append(out, b.Secrets.BootstrapToken, b.Secrets.SecretboxEncryptionSecret, b.TrustdInfo.Token, b.Cluster.Secret)
-
-	for _, key := range keys {
-		out = append(out, base64.StdEncoding.EncodeToString(key))
-	}
-
-	return slices.DeleteFunc(out, func(s string) bool { return s == "" })
-}
 
 // Pools of the spec's "cluster", one per role; createPools makes them.
 const (

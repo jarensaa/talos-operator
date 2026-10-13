@@ -263,11 +263,6 @@ spec:
                   liveHash:
                     description: LiveHash fingerprints the node's active config.
                     type: string
-                  skippedHash:
-                    description: |-
-                      SkippedHash is a rendered config a human skipped for this machine after a failed rollout.
-                      The same config is not rolled out to it again.
-                    type: string
                 type: object
               etcd:
                 description: EtcdState is the machine's observed etcd membership.
@@ -430,12 +425,9 @@ spec:
                 - Provisioning
                 - Joining
                 - Ready
-                - Updating
                 - Draining
-                - Rebooting
                 - Removing
                 - Removed
-                - Failed
                 type: string
               removedAt:
                 description: |-

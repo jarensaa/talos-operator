@@ -540,34 +540,25 @@ type AdoptionStatus struct {
 	ProvenAt *metav1.Time `json:"provenAt,omitempty"`
 }
 
-// UpgradeHolds maps machines to installer images a human took out of an upgrade. An upgrade to
-// such an image is not started again for that machine; one to any other image is.
-type UpgradeHolds struct {
-	// Skipped: the machine was skipped after its upgrade failed.
+// Holds is what a human took out of the operations of one kind, after one of them failed
+// (docs/scope.md §8.3). Each entry maps a turn, which is a machine, to what the operation was
+// taking it to: the hash of a config, an installer image. That is not started again for the
+// machine; an operation that would take it to anything else is. Removing a machine has nothing
+// it could be taken to instead, so its entries are empty and stand until the spec asks anew.
+//
+// A Kubernetes upgrade is not aborted machine by machine: its one entry, under HoldEverything,
+// is the Kubernetes version whose upgrade was aborted (docs/scope.md §7.4).
+type Holds struct {
+	// Skipped: the machine was left out after its turn failed.
 	// +optional
 	Skipped map[string]string `json:"skipped,omitempty"`
-	// Aborted: the upgrade was aborted before it reached the machine, or while it was at it.
+	// Aborted: the operation was aborted before it reached the machine, or while it was at it.
 	// +optional
 	Aborted map[string]string `json:"aborted,omitempty"`
-	// Kubernetes is the Kubernetes version whose upgrade a human aborted. It is not started again;
-	// an upgrade to any other version is (docs/scope.md §7.4).
-	// +optional
-	Kubernetes string `json:"kubernetes,omitempty"`
 }
 
-// MembershipHolds records what a human decided about machines that were to be added or removed.
-type MembershipHolds struct {
-	// Add maps a machine to the config it was to be handed when a human skipped it, or aborted
-	// the operation that was adding it. It is not added with that config again; with any other
-	// it is.
-	// +optional
-	Add map[string]string `json:"add,omitempty"`
-	// Remove lists the machines whose removal a human skipped or aborted. They are not removed
-	// until their spec asks for it anew: desiredState back to Present, and to Removed again.
-	// +listType=set
-	// +optional
-	Remove []string `json:"remove,omitempty"`
-}
+// HoldEverything is the key of a hold that covers an operation as a whole and not one machine.
+const HoldEverything = "*"
 
 // VersionStep is one upgrade on the way from the versions a cluster runs to the versions its spec
 // asks for.
@@ -878,21 +869,14 @@ type TalosClusterStatus struct {
 	// +optional
 	Approval *PendingApproval `json:"approval,omitempty"`
 
-	// AbortedTargets is what the operation a human aborted was rolling out: machine name to
-	// rendered config hash. Those configs are not rolled out to those machines again; a spec that
-	// renders anything else, a revert included, rolls out and clears this.
+	// Holds records what a human took out of the operations of each kind: the machines that were
+	// skipped, and what an aborted operation had left to do. Neither is started again as it was.
+	// The key is the type of the operation.
 	// +optional
-	AbortedTargets map[string]string `json:"abortedTargets,omitempty"`
-
-	// Upgrades records what a human decided about Talos upgrades that were due.
-	// +optional
-	Upgrades *UpgradeHolds `json:"upgrades,omitempty"`
+	Holds map[OperationType]Holds `json:"holds,omitempty"`
 	// Versions is what the cluster runs, what exists, and the way to what the spec asks for.
 	// +optional
 	Versions *VersionsStatus `json:"versions,omitempty"`
-	// Membership records what a human decided about machines that were to be added or removed.
-	// +optional
-	Membership *MembershipHolds `json:"membership,omitempty"`
 	// Certificates lists the certificates the cluster depends on with the end of their validity:
 	// the operator's own client certificate, and the cluster's certificate authorities.
 	// +listType=map

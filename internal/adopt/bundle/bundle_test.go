@@ -23,7 +23,6 @@ import (
 	"testing"
 
 	"github.com/siderolabs/talos/pkg/machinery/config"
-	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 
@@ -34,20 +33,10 @@ import (
 func generateConfig(t *testing.T, b *secrets.Bundle, contract *config.VersionContract, role machine.Type) config.Provider {
 	t.Helper()
 
-	input, err := generate.NewInput("my-cluster", "https://cluster.example.com:6443", "1.37.0",
-		generate.WithSecretsBundle(b),
-		generate.WithVersionContract(contract),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	in := talostest.Input(t)
+	in.Bundle, in.Contract, in.Role = b, contract, role
 
-	cfg, err := input.Config(role)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return cfg
+	return talostest.Generate(t, in)
 }
 
 func TestRecoverRoundTripsTheBundle(t *testing.T) {
@@ -146,6 +135,102 @@ func TestVerifyNamesTheMismatchingNodeAndFields(t *testing.T) {
 	for _, secret := range []string{b.TrustdInfo.Token, other.TrustdInfo.Token, b.Cluster.Secret, "BEGIN"} {
 		if strings.Contains(msg, secret) {
 			t.Fatal("mismatch message leaks a secret")
+		}
+	}
+}
+
+func TestAuthorityCertificates(t *testing.T) {
+	b := talostest.Bundle(t)
+
+	got := bundle.AuthorityCertificates(b)
+	if len(got) != 4 {
+		t.Fatalf("a bundle has four authorities, got %d", len(got))
+	}
+
+	for _, name := range []string{"os", "kubernetes", "kubernetes-aggregator", "etcd"} {
+		if cert := got[name]; cert == nil || !cert.IsCA {
+			t.Errorf("%s: not listed as a certificate authority", name)
+		}
+	}
+
+	// One the bundle does not have, and one that is not a certificate, are left out; the others
+	// are still listed.
+	certs := *b.Certs
+	certs.Etcd = nil
+
+	notACertificate := *certs.K8s
+	notACertificate.Crt = []byte("not a certificate")
+	certs.K8s = &notACertificate
+
+	lacking := *b
+	lacking.Certs = &certs
+
+	got = bundle.AuthorityCertificates(&lacking)
+	if len(got) != 2 || got["os"] == nil || got["kubernetes-aggregator"] == nil {
+		t.Fatalf("got %d authorities of a bundle that has two", len(got))
+	}
+
+	if len(bundle.AuthorityCertificates(nil)) != 0 || len(bundle.AuthorityCertificates(&secrets.Bundle{})) != 0 {
+		t.Fatal("no bundle, and a bundle without certificates, have no authorities")
+	}
+}
+
+// A bundle read from a Secret is whatever someone put there. One that lacks a part is refused by
+// name, and never read through a section it does not have.
+func TestVerifyRefusesABundleThatLacksAPart(t *testing.T) {
+	b := talostest.Bundle(t)
+	nodes := []bundle.Node{{Name: "cp-1", Config: generateConfig(t, b, config.TalosVersion1_14, machine.TypeControlPlane)}}
+
+	noCerts := *b
+	noCerts.Certs = nil
+
+	noEtcd := *b
+	certs := *b.Certs
+	certs.Etcd = nil
+	noEtcd.Certs = &certs
+
+	noCluster := *b
+	noCluster.Cluster = nil
+
+	noTokens := *b
+	noTokens.Secrets, noTokens.TrustdInfo = nil, nil
+
+	for name, tt := range map[string]struct {
+		bundle *secrets.Bundle
+		want   []string
+	}{
+		"nothing":         {&secrets.Bundle{}, []string{"Talos API CA key", "service account key", "cluster ID", "trustd token"}},
+		"no bundle":       {nil, []string{"Talos API CA key", "secretbox encryption secret"}},
+		"no certs":        {&noCerts, []string{"Talos API CA key, etcd CA key, Kubernetes CA key, aggregator CA key, service account key"}},
+		"no etcd CA":      {&noEtcd, []string{"missing etcd CA key"}},
+		"no cluster":      {&noCluster, []string{"missing cluster ID, cluster secret"}},
+		"no tokens":       {&noTokens, []string{"missing trustd token, bootstrap token, secretbox encryption secret"}},
+		"the whole of it": {b, nil},
+	} {
+		err := bundle.Verify(tt.bundle, nodes)
+
+		if tt.want == nil {
+			if err != nil {
+				t.Errorf("%s: %v", name, err)
+			}
+
+			continue
+		}
+
+		if err == nil || !strings.HasPrefix(err.Error(), "secrets bundle is incomplete: missing ") {
+			t.Errorf("%s: got %v", name, err)
+
+			continue
+		}
+
+		for _, part := range tt.want {
+			if !strings.Contains(err.Error(), part) {
+				t.Errorf("%s: %q is not named in: %v", name, part, err)
+			}
+		}
+
+		if strings.Contains(err.Error(), b.TrustdInfo.Token) || strings.Contains(err.Error(), "BEGIN") {
+			t.Fatalf("%s: the message leaks a secret", name)
 		}
 	}
 }

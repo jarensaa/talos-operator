@@ -35,12 +35,7 @@ import (
 )
 
 func TestCheckUpkeep(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		req    any
-		allow  bool
-	}{
+	checkAllowlist(t, accessUpkeep, []allowCase{
 		{"defragment", machineapi.MachineService_EtcdDefragment_FullMethodName, &emptypb.Empty{}, true},
 		{"forfeit leadership", machineapi.MachineService_EtcdForfeitLeadership_FullMethodName, &machineapi.EtcdForfeitLeadershipRequest{}, true},
 		{"reading logs", machineapi.MachineService_Logs_FullMethodName, nil, true},
@@ -55,34 +50,7 @@ func TestCheckUpkeep(t *testing.T) {
 		{"a reboot", machineapi.MachineService_Reboot_FullMethodName, &machineapi.RebootRequest{}, false},
 		{"apply", machineapi.MachineService_ApplyConfiguration_FullMethodName,
 			&machineapi.ApplyConfigurationRequest{Mode: machineapi.ApplyConfigurationRequest_NO_REBOOT}, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := accessUpkeep.check(tt.method, tt.req)
-			if tt.allow && err != nil {
-				t.Fatalf("expected allowed, got %v", err)
-			}
-
-			if !tt.allow && status.Code(err) != codes.PermissionDenied {
-				t.Fatalf("expected PermissionDenied, got %v", err)
-			}
-		})
-	}
-
-	// Defragmenting takes a member away for a moment: no other connection may ask for it, and
-	// none at all disarms an alarm.
-	for _, a := range []access{accessReadOnly, accessConfig, accessUpgrade, accessMembership, accessMaintenance} {
-		if status.Code(a.check(machineapi.MachineService_EtcdDefragment_FullMethodName, &emptypb.Empty{})) != codes.PermissionDenied {
-			t.Fatalf("a defragmentation must be refused on a connection with access %d", a)
-		}
-	}
-
-	for _, a := range []access{accessReadOnly, accessConfig, accessUpgrade, accessMembership, accessMaintenance, accessUpkeep} {
-		if status.Code(a.check(machineapi.MachineService_EtcdAlarmDisarm_FullMethodName, &emptypb.Empty{})) != codes.PermissionDenied {
-			t.Fatalf("disarming an alarm must be refused on a connection with access %d", a)
-		}
-	}
+	})
 }
 
 func TestMachineryReadsWhatTalosSaysAboutANode(t *testing.T) {
@@ -181,7 +149,7 @@ func TestMachineryReadsTheEndOfLogs(t *testing.T) {
 
 func TestKeeperDefragmentsTheMemberItIsAskedFor(t *testing.T) {
 	api, c := serve(t, dial(accessUpkeep)...)
-	keeper := &machineryKeeper{*reader(c)}
+	keeper := &machineryKeeper{forfeiter{*reader(c)}}
 	ctx := context.Background()
 
 	if err := keeper.DefragmentEtcd(ctx, apiNode); err != nil || api.defrags != 1 {

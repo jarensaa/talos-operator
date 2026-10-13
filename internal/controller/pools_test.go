@@ -19,7 +19,6 @@ package controller
 import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,18 +27,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	"github.com/jarensaa/talos-operator/internal/talos/talostest"
 )
-
-const bondDocuments = `apiVersion: v1alpha1
-kind: BondConfig
-name: bond0
-links: [eth0, eth1]
-bondMode: 802.3ad
----
-apiVersion: v1alpha1
-kind: DHCPv4Config
-name: bond0
-`
 
 var _ = Describe("Pools and shared configs", func() {
 	var (
@@ -68,17 +57,12 @@ var _ = Describe("Pools and shared configs", func() {
 	}
 
 	BeforeEach(func() {
-		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "pools-"}}
-		Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
-		ns = namespace.Name
+		ns = specCluster("pools-", nil).Namespace
 		workersPool.Namespace = ns
-
-		Expect(k8sClient.Create(ctx, &talosv1alpha1.TalosCluster{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns}})).To(Succeed())
-		createPools(ns)
 
 		sharedNet = &talosv1alpha1.TalosMachineConfig{
 			ObjectMeta: metav1.ObjectMeta{Name: "bonded-network", Namespace: ns},
-			Spec:       talosv1alpha1.TalosMachineConfigSpec{Documents: bondDocuments},
+			Spec:       talosv1alpha1.TalosMachineConfigSpec{Documents: talostest.NetworkPatch},
 		}
 		Expect(k8sClient.Create(ctx, sharedNet)).To(Succeed())
 

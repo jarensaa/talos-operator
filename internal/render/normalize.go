@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	configdocs "github.com/siderolabs/talos/pkg/machinery/config/config"
@@ -33,8 +34,32 @@ import (
 // duplicate keys, so a key is unique within a config.
 type DocKey string
 
-// v1alpha1Key is the key of the legacy v1alpha1 root document.
-const v1alpha1Key DocKey = "v1alpha1"
+// RootKey is the key of the legacy v1alpha1 root document.
+const RootKey DocKey = "v1alpha1"
+
+// KeyOf returns the key of the document that states the given apiVersion, kind and name. One that
+// states no kind is the legacy root document.
+func KeyOf(apiVersion, kind, name string) DocKey {
+	if kind == "" {
+		return RootKey
+	}
+
+	key := apiVersion + "/" + kind
+	if name != "" {
+		key += "/" + name
+	}
+
+	return DocKey(key)
+}
+
+// Kind returns the kind of the document, such as BondConfig for v1alpha1/BondConfig/bond0. The
+// legacy root document has none.
+func (k DocKey) Kind() string {
+	_, rest, _ := strings.Cut(string(k), "/")
+	kind, _, _ := strings.Cut(rest, "/")
+
+	return kind
+}
 
 // Config is a machine config in normalized form: one canonical encoding per document, without
 // comments, so rendered and live configs compare independently of comments and document order.
@@ -123,16 +148,15 @@ func (c *Config) BytesOrderedLike(other *Config) []byte {
 
 func docKey(doc configdocs.Document) DocKey {
 	if _, ok := doc.(*v1alpha1.Config); ok {
-		return v1alpha1Key
+		return RootKey
 	}
 
-	key := doc.APIVersion() + "/" + doc.Kind()
-
-	if named, ok := doc.(configdocs.NamedDocument); ok && named.Name() != "" {
-		key += "/" + named.Name()
+	name := ""
+	if named, ok := doc.(configdocs.NamedDocument); ok {
+		name = named.Name()
 	}
 
-	return DocKey(key)
+	return KeyOf(doc.APIVersion(), doc.Kind(), name)
 }
 
 // hashDocs fingerprints documents in key order, so document order never changes the hash.

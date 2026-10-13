@@ -62,10 +62,9 @@ type Request struct {
 
 // Proposal is everything a user commits to adopt the cluster, already proven to reproduce it.
 type Proposal struct {
-	Bundle *secrets.Bundle
-	// Recovered is true when Bundle was rebuilt from the live cluster rather than supplied.
-	Recovered bool
-	Cluster   *talosv1alpha1.TalosCluster
+	// Bundle is the bundle that was supplied, or the one recovered from the live cluster.
+	Bundle  *secrets.Bundle
+	Cluster *talosv1alpha1.TalosCluster
 	// Pools holds one pool per role present, with the config its machines share.
 	Pools    []*talosv1alpha1.TalosMachinePool
 	Machines []*talosv1alpha1.TalosMachine
@@ -110,8 +109,6 @@ func Build(req Request) (*Proposal, error) {
 		if p.Bundle, err = bundle.Recover(parsed[cp.Hostname], inputs.Contract); err != nil {
 			return nil, fmt.Errorf("recover secrets from %s: %w", cp.Hostname, err)
 		}
-
-		p.Recovered = true
 	}
 
 	verifyNodes := make([]bundle.Node, 0, len(nodes))
@@ -140,12 +137,7 @@ func Build(req Request) (*Proposal, error) {
 	for _, n := range nodes {
 		pool, ok := pools[n.Role]
 		if !ok {
-			shared := layers.Worker
-			if n.Role == machine.TypeControlPlane {
-				shared = layers.ControlPlane
-			}
-
-			pool = poolSpec(req.Cluster, n.Role, shared)
+			pool = poolSpec(req.Cluster, n.Role, layers.Role(n.Role))
 			pools[n.Role] = pool
 			p.Pools = append(p.Pools, pool)
 		}
@@ -200,8 +192,8 @@ func clusterSpec(current *talosv1alpha1.TalosCluster, in derive.Inputs, layers d
 	}, nil
 }
 
-// PoolName names the pool proposed for a role.
-func PoolName(cluster string, role talosv1alpha1.MachineRole) string {
+// poolName names the pool proposed for a role.
+func poolName(cluster string, role talosv1alpha1.MachineRole) string {
 	if role == talosv1alpha1.MachineRoleControlPlane {
 		return cluster + "-control-plane"
 	}
@@ -209,13 +201,15 @@ func PoolName(cluster string, role talosv1alpha1.MachineRole) string {
 	return cluster + "-workers"
 }
 
-func poolSpec(cluster *talosv1alpha1.TalosCluster, role machine.Type, shared []string) *talosv1alpha1.TalosMachinePool {
+func poolSpec(cluster *talosv1alpha1.TalosCluster, of machine.Type, shared []string) *talosv1alpha1.TalosMachinePool {
+	role := machineRole(of)
+
 	return &talosv1alpha1.TalosMachinePool{
 		TypeMeta:   metav1.TypeMeta{APIVersion: talosv1alpha1.GroupVersion.String(), Kind: "TalosMachinePool"},
-		ObjectMeta: metav1.ObjectMeta{Name: PoolName(cluster.Name, machineRole(role)), Namespace: cluster.Namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: poolName(cluster.Name, role), Namespace: cluster.Namespace},
 		Spec: talosv1alpha1.TalosMachinePoolSpec{
 			ClusterRef: corev1.LocalObjectReference{Name: cluster.Name},
-			Role:       machineRole(role),
+			Role:       role,
 			Config:     inline(shared),
 		},
 	}
@@ -247,21 +241,15 @@ func inline(documents []string) []talosv1alpha1.ConfigSource {
 	return out
 }
 
-// ConfigSources returns a machine's config sources in the order they apply: the cluster's
-// layer, its pool's, then its own (docs/scope.md §6.1).
+// ConfigSources returns a machine's config sources in the order they apply (render.Layered).
 func ConfigSources(cluster *talosv1alpha1.TalosClusterSpec, pool *talosv1alpha1.TalosMachinePoolSpec,
 	m *talosv1alpha1.TalosMachineSpec,
 ) []talosv1alpha1.ConfigSource {
-	out := make([]talosv1alpha1.ConfigSource, 0, len(cluster.Config)+len(pool.Config)+len(m.Config))
-	out = append(out, cluster.Config...)
-	out = append(out, pool.Config...)
-
-	return append(out, m.Config...)
+	return render.Layered(cluster.Config, pool.Config, m.Config)
 }
 
-// InlineDocuments returns the contents of inline config sources. References to
-// TalosMachineConfigs and Secrets are resolved by the caller.
-func InlineDocuments(sources []talosv1alpha1.ConfigSource) [][]byte {
+// inlineDocuments returns the contents of inline config sources, which are all a proposal has.
+func inlineDocuments(sources []talosv1alpha1.ConfigSource) [][]byte {
 	out := make([][]byte, 0, len(sources))
 	for _, s := range sources {
 		out = append(out, []byte(s.Inline))
@@ -278,7 +266,7 @@ func proveSpecs(p *Proposal, nodes []LiveNode, parsed map[string]config.Provider
 		poolIdx := slices.IndexFunc(p.Pools, func(pool *talosv1alpha1.TalosMachinePool) bool { return pool.Name == tm.Spec.PoolRef.Name })
 		pool := &p.Pools[poolIdx].Spec
 
-		in, err := RenderInput(&p.Cluster.Spec, pool, p.Bundle, InlineDocuments(ConfigSources(&p.Cluster.Spec, pool, &tm.Spec)))
+		in, err := RenderInput(&p.Cluster.Spec, pool, p.Bundle, inlineDocuments(ConfigSources(&p.Cluster.Spec, pool, &tm.Spec)))
 		if err != nil {
 			return fmt.Errorf("%s: %w", n.Hostname, err)
 		}
@@ -288,23 +276,8 @@ func proveSpecs(p *Proposal, nodes []LiveNode, parsed map[string]config.Provider
 			return fmt.Errorf("%s: render proposed spec: %w", n.Hostname, err)
 		}
 
-		want, err := render.Normalize(parsed[n.Hostname])
-		if err != nil {
+		if err := render.Reproduces("proposed specs", got, parsed[n.Hostname]); err != nil {
 			return fmt.Errorf("%s: %w", n.Hostname, err)
-		}
-
-		diffs, err := render.Diff(got, want)
-		if err != nil {
-			return fmt.Errorf("%s: %w", n.Hostname, err)
-		}
-
-		if len(diffs) > 0 {
-			var text strings.Builder
-			for _, d := range diffs {
-				text.WriteString(d.Text)
-			}
-
-			return fmt.Errorf("%s: proposed specs do not reproduce the live config:\n%s", n.Hostname, text.String())
 		}
 	}
 
