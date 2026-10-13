@@ -357,7 +357,7 @@ Where the files hold a TalosCluster and none of its machines, the check renders 
 The image has a third command, for a repository that wants its versions bumped without a bot:
 
 ```bash
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/jarensaa/talos-operator:v0.13.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/jarensaa/talos-operator:v0.14.0 \
   bump clusters/my-cluster
 ```
 

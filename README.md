@@ -268,7 +268,7 @@ It fails when the Talos and Kubernetes versions do not go together, when the ins
 Without a bot, the same image bumps the versions itself. Run on a schedule, it writes the next Talos or Kubernetes release into the TalosCluster it finds, one step for every run, and prints what it wrote for your script to commit:
 
 ```bash
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/jarensaa/talos-operator:v0.13.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work ghcr.io/jarensaa/talos-operator:v0.14.0 \
   bump clusters/my-cluster
 ```
 

@@ -43,7 +43,7 @@ jobs:
         id: bump
         run: |
           bumped=$(docker run --rm --user "$(id -u):$(id -g)" --volume "$PWD:/work" --workdir /work \
-            ghcr.io/jarensaa/talos-operator:v0.13.0 \
+            ghcr.io/jarensaa/talos-operator:v0.14.0 \
             bump --patch clusters/my-cluster)
           echo "bumped=${bumped##*: }" >> "$GITHUB_OUTPUT"
 
