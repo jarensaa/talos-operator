@@ -1,0 +1,60 @@
+# An example GitHub Actions workflow for a repository that holds a cluster's manifests: every
+# night it writes the next patch release of Talos or Kubernetes into the TalosCluster and pushes
+# the change, for Flux or whatever applies the repository to deliver. Nothing here upgrades
+# anything: the operator rolls out what the TalosCluster says, inside the cluster's maintenance
+# windows and behind its gates.
+#
+# It is the alternative to a bot (renovate.json5). The command knows what the operator knows: it
+# writes only a version the operator upgrades to from the one in the file, one step for every
+# run, and only one that passes the validate check (validate-workflow.yml). So what it pushes
+# needs no check of its own.
+#
+# With --patch it stays on the minors the file names. A new minor is a decision: run the command
+# without --patch in a job that opens a pull request instead of pushing, and read the release
+# notes before merging.
+#
+# It runs the operator's own image. Use the tag of the operator release the cluster runs: which
+# versions go together is what that release was built with.
+#
+# This is a starting point. It has not been run against a repository by the operator's own tests.
+name: Bump cluster versions
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: bump-cluster-versions
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The command prints what it wrote, one line for every cluster, and nothing when there is
+      # no newer release to take. It fails when a newer release could not be taken for a reason
+      # that is not a rule of Talos or Kubernetes: an image that is not published yet, usually,
+      # which the next night finds.
+      - name: Bump
+        id: bump
+        run: |
+          bumped=$(docker run --rm --user "$(id -u):$(id -g)" --volume "$PWD:/work" --workdir /work \
+            ghcr.io/jarensaa/talos-operator:v0.14.0 \
+            bump --patch clusters/my-cluster)
+          echo "bumped=${bumped##*: }" >> "$GITHUB_OUTPUT"
+
+      # A push with the workflow's own token starts no other workflow. Where the main branch is
+      # protected, the rule has to let this one through.
+      - name: Commit and push
+        if: steps.bump.outputs.bumped != ''
+        env:
+          BUMPED: ${{ steps.bump.outputs.bumped }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --all --message "Bump $BUMPED"
+          git push
