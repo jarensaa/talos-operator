@@ -206,12 +206,99 @@ func TestBuildNeedsAControlPlane(t *testing.T) {
 	}
 }
 
+// A cluster installed from the installer with a signed boot image is adopted as one: the spec
+// says so, and the specs proposed reproduce the nodes' configs, which Build proves before it
+// returns.
+func TestBuildAdoptsAClusterOnTheSecureBootInstaller(t *testing.T) {
+	image := strings.Replace(installImage, "metal-installer/", "metal-installer-secureboot/", 1)
+
+	p, err := adopt.Build(adopt.Request{Nodes: liveCluster(t, talostest.Bundle(t), image), Cluster: observedCluster()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	installer := p.Cluster.Spec.ConfigGeneration.Installer
+	if !installer.SecureBoot || installer.Platform != "metal" || installer.SchematicID != schematic {
+		t.Fatalf("installer: %+v", installer)
+	}
+}
+
 func TestBuildRefusesNonFactoryInstallers(t *testing.T) {
 	nodes := liveCluster(t, talostest.Bundle(t), "ghcr.io/siderolabs/installer:v1.14.0")
 
 	if _, err := adopt.Build(adopt.Request{Nodes: nodes, Cluster: observedCluster()}); err == nil ||
 		!strings.Contains(err.Error(), "not an Image Factory image") {
 		t.Fatalf("expected a non-factory installer to be refused, got %v", err)
+	}
+}
+
+// The installer whose boot image is signed is an image of its own, and what a machine with
+// Secure Boot on is installed from: it is read from a live config and written back the same.
+func TestInstallerImageNamesTheSecureBootInstaller(t *testing.T) {
+	plain := talosv1alpha1.Installer{FactoryURL: "https://factory.example.com", Platform: "metal", SchematicID: schematic}
+	signed := plain
+	signed.SecureBoot = true
+
+	for image, want := range map[string]talosv1alpha1.Installer{
+		"factory.example.com/metal-installer/" + schematic + ":v1.14.2":            plain,
+		"factory.example.com/metal-installer-secureboot/" + schematic + ":v1.14.2": signed,
+	} {
+		got, tag, err := adopt.ParseInstallerImage(image)
+		if err != nil || got != want || tag != "v1.14.2" {
+			t.Fatalf("%s: parsed %+v %q, %v", image, got, tag, err)
+		}
+
+		if back, err := adopt.InstallerImage(got, tag); err != nil || back != image {
+			t.Fatalf("%s: built %q, %v", image, back, err)
+		}
+	}
+
+	for _, image := range []string{
+		"factory.example.com/metal-secureboot/" + schematic + ":v1.14.2",
+		"factory.example.com/-installer-secureboot/" + schematic + ":v1.14.2",
+		"factory.example.com/metal-installer-secureboot-installer/" + schematic[:10] + ":v1.14.2",
+	} {
+		if got, _, err := adopt.ParseInstallerImage(image); err == nil {
+			t.Errorf("%s: expected an error, got %+v", image, got)
+		}
+	}
+}
+
+// A pool says for its own machines whether their installer is the signed one, either way.
+func TestInstallTargetTakesAPoolsSecureBootSetting(t *testing.T) {
+	spec := func(secureBoot bool) *talosv1alpha1.TalosClusterSpec {
+		return &talosv1alpha1.TalosClusterSpec{
+			Versions: &talosv1alpha1.Versions{Talos: "v1.14.2"},
+			ConfigGeneration: &talosv1alpha1.ConfigGeneration{Installer: &talosv1alpha1.Installer{
+				FactoryURL: "https://factory.example.com", Platform: "metal", SchematicID: schematic, SecureBoot: secureBoot,
+			}},
+		}
+	}
+	pool := func(secureBoot *bool) *talosv1alpha1.TalosMachinePoolSpec {
+		return &talosv1alpha1.TalosMachinePoolSpec{Installer: &talosv1alpha1.PoolInstaller{SecureBoot: secureBoot}}
+	}
+	yes, no := true, false
+
+	for _, tt := range []struct {
+		cluster bool
+		pool    *talosv1alpha1.TalosMachinePoolSpec
+		want    bool
+	}{
+		{false, &talosv1alpha1.TalosMachinePoolSpec{}, false},
+		{true, &talosv1alpha1.TalosMachinePoolSpec{}, true},
+		{true, pool(nil), true},
+		{false, pool(&yes), true},
+		{true, pool(&no), false},
+	} {
+		install, err := adopt.InstallTarget(spec(tt.cluster), tt.pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if install.SecureBoot != tt.want || strings.Contains(install.Image, "-installer-secureboot/") != tt.want ||
+			install.FactoryURL != "https://factory.example.com" {
+			t.Errorf("cluster %t, pool %+v: got %+v", tt.cluster, tt.pool.Installer, install)
+		}
 	}
 }
 

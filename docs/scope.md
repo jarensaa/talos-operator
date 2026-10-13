@@ -102,7 +102,8 @@ internal/controller
 internal/talos              Talos access layer (only package that imports machinery/client)
   clientfactory             cert minting from bundle, endpoint selection, WithNode targeting
   observe                   typed COSI reads: Version, MachineStatus, BootID, SystemInformation,
-                            ImageFactorySchematic, MachineConfig, Members, Nodename, UnattendedInstallStatus
+                            ImageFactorySchematic, MachineConfig, Members, Nodename, UnattendedInstallStatus,
+                            SecurityState; and one file, the firmware's Secure Boot db (§7.3)
   ops                       mutating calls (ApplyConfiguration, ImageService.Pull, LifecycleService.Upgrade,
                             Reboot, Reset, Bootstrap, Etcd*), each idempotent and with a timeout
 internal/render             config generation + patch layering + normalisation + hashing + semantic diff
@@ -209,6 +210,8 @@ spec:
       factoryURL: https://factory.talos.dev
       platform: metal
       schematicID: 376567988ad3...   # default for all pools; a pool may override it
+      secureBoot: false              # true: the installer whose boot image Image Factory signs
+                                     # (metal-installer-secureboot); a pool may override it (§7.3)
     options:                          # mirrors generate.Input options that matter
       dnsDomain: cluster.local
       podSubnets: [10.244.0.0/16]
@@ -314,7 +317,8 @@ metadata:
 spec:
   clusterRef: { name: my-cluster }     # immutable
   role: ControlPlane                   # immutable; ControlPlane | Worker; selects the generation template
-  installer: { schematicID: null }     # override the cluster default, e.g. for a pool needing other extensions
+  installer: { schematicID: null,      # override the cluster default, e.g. for a pool needing other extensions
+               secureBoot: null }      # or for a pool of machines with Secure Boot on among others without
   config:                              # pool layer, applied after the cluster's (§5 config sources)
     - configRef: { name: nvme-install-disk }
   # M3+: rollout: { maxUnavailable: 1 }  (control-plane pools are always serial, §8.1)
@@ -658,8 +662,18 @@ An upgrade is due when a node does not run the Talos version in `spec.versions.t
 2. A downgrade. Talos allows some, but a downgraded node may not understand the config it has, and nothing here can prove that it does.
 3. A jump Talos does not allow: `compatibility.ParseTalosVersion(target).UpgradeableFrom(current)`. Talos allows skipping minors when its table permits, for instance 1.12 to 1.14.
 4. A Kubernetes version the target does not run: `KubernetesVersion(current).SupportedWith(target)`. The Kubernetes upgrade then has to come first.
+5. A machine whose firmware has Secure Boot on, and an installer whose boot image is not signed (below).
 
 An installer image that does not exist is found at the first node's pull, which is before anything on any node changed. The node is where the answer is: it pulls through its own registry configuration, and the operator may not be able to reach the registry at all.
+
+**Secure Boot: every node is asked before the first is touched.** Firmware that enforces Secure Boot boots an image only if its signature database (`db`) holds the image's own hash, the certificate that signed it, or the certificate that issued that one. Everything else an upgrade can get wrong is found while the node still runs what it ran. This is found at the reboot, by a node that does not come back until someone stands in front of it. So it is asked first, of every machine in the plan, and one machine that would not boot the new system refuses the upgrade of all of them (`talos.SecureBootInstallerProblem`, `talos.SecureBootTrustProblem`; `TalosUpToDate=False`, `Incompatible`). A machine on hold is not in the plan and is not asked about.
+- *Which installer.* Image Factory builds two for a schematic: `<platform>-installer`, whose boot image nobody signed (`T/pkg/imager/imager.go:472-498`), and `<platform>-installer-secureboot`, whose boot image it signs. `installer.secureBoot` names the second, for the cluster or for a pool. A machine whose firmware has Secure Boot on (`SecurityState`, which Talos sets only while the firmware enforces it) is not upgraded with the first. That is decided from what the node says, in every pass.
+- *Whether the firmware trusts it.* A machine can run a signed image without trusting who signed it: its `db` holds the hash of that one image, enrolled by hand. The next image has another hash. Whether a `db` trusts the signer can only be told with the signer's certificate, and nothing in the cluster has it: Talos 1.14 reports the PCR signing key of the image it booted, not the Secure Boot one (`ukiSigningKeyFingerprint` exists and is never set). So the operator reads the `db` from the node and asks the Image Factory the installer names for its signing certificate (`GET /secureboot/signing-cert.pem`). The firmware is trusted to boot the new system when its `db` holds that certificate or one that issued it.
+- *When.* When an upgrade would otherwise start: it is due, enabled, inside its window, behind open gates. Not before, and never at rest. The certificate is kept for six hours, so one upgrade asks once; a cluster with no machine that has Secure Boot on asks nobody. This is the one question the operator puts to something outside the cluster without `versionSources.enabled` (§7.5, §12.28).
+- *Not knowing holds the upgrade up* (`Unverified`). Elsewhere a source that does not answer refuses nothing, because the node finds out for itself before anything changed (§7.5). Here the node finds out by not booting. A `db` that cannot be read, or an Image Factory that does not answer, leaves every node untouched, says so, and is asked again.
+- *The access.* `MachineService.Read` reads any file of a node, its secrets included. The read allowlist lets it through for one path, the `db` variable under `/sys/firmware/efi/efivars`, which holds certificates and hashes (`internal/talos/allowlist.go`). No connection reads any other file.
+
+What this does not cover: a `dbx` that revokes the signer, firmware that is in `db` terms fine and broken otherwise, and a machine added in maintenance mode (§7.6), which is installed from whatever its config names. A change of `secureBoot` alone is a change of the installer's name in the config, applied by a config rollout once the node runs the version and schematic it names (§6.3); it reinstalls nothing, and the next upgrade installs from it.
 
 **Plan** (`plan.PlanUpgrade`). One node at a time. A machine whose node is unhealthy first, for the reason a config rollout has (§6.3). Then workers before control planes. Within a group the etcd leader and the node the operator itself runs on go last: each is a handover that upgrading that node costs, and neither is needed more than once.
 
@@ -689,7 +703,7 @@ Rules the planner never breaks, checked over every combination of step, observat
 
 **Pausing** leaves alone a node nothing was taken from yet. A node that is already cordoned is finished: stopping there would leave it out of the cluster.
 
-**The Talos access** is a third kind of connection (`talos.Upgrader`), next to reading and applying config: pull, install to the inactive slot, hand off etcd leadership, reboot, and nothing else. It cannot apply config, install from scratch, reset, roll back, or change etcd membership, and the deprecated `MachineService.Upgrade`, which takes `force`, is not on its list. It is handed out only while `upgrades` is `Enabled`.
+**The Talos access** is a third kind of connection (`talos.Upgrader`), next to reading and applying config: pull, install to the inactive slot, hand off etcd leadership, reboot, and nothing else. What the preflight reads, it reads as any Reader may. It cannot apply config, install from scratch, reset, roll back, or change etcd membership, and the deprecated `MachineService.Upgrade`, which takes `force`, is not on its list. It is handed out only while `upgrades` is `Enabled`.
 
 Maintenance windows, the user's gates and hooks apply to an upgrade as to every operation (§6.4). A node's `preNode` hooks run before its installer is pulled, its `postNode` hooks after it is verified.
 
@@ -759,9 +773,11 @@ What is found out is used for exactly three things:
 
 Every answer has three values, and "not known" is neither yes nor no. A source that is down, a registry that wants credentials, or an operator that was not told to ask, refuses nothing and reports nothing: what a node can pull is for the node to find out, through its own registry configuration (§7.3).
 
+One question is asked whether or not `versionSources.enabled` is set, and is the exception to "not known refuses nothing": which certificate an Image Factory signs boot images with, before an upgrade of a machine whose firmware has Secure Boot on (§7.3, §12.28). It goes through `catalog` like the rest, by an interface of its own (`catalog.Signer`), so that an operator that was not told to ask what exists cannot.
+
 **The check** (`manager validate`). The same binary, run on the manifests in a repository, with no cluster and no secret:
 - the versions go together, are ones this operator upgrades to, and, given the manifests as they were before the change (`--base`), can be reached from there: no downgrade, no jump Talos does not make;
-- the installer of the cluster and of every pool with a schematic of its own exists, and so do the images of the Kubernetes components that the rendered configs name. Where the files hold a cluster and none of its machines, as they do where the operator wrote those when it adopted the cluster, a control plane is rendered from the cluster alone to find them. Here "not known" is a failure: a check that passes because a site was down is not one to rely on;
+- the installer of the cluster and of every pool with a schematic or a Secure Boot setting of its own exists, and so do the images of the Kubernetes components that the rendered configs name. Where the files hold a cluster and none of its machines, as they do where the operator wrote those when it adopted the cluster, a control plane is rendered from the cluster alone to find them. Here "not known" is a failure: a check that passes because a site was down is not one to rely on;
 - maintenance windows and gate expressions can be understood, which the API server does not check;
 - every machine's config renders, with secrets made up for the purpose. A machine whose config comes partly from a Secret is not rendered, and is named;
 - a field the API does not have is an error, where the API server would drop it without a word.
@@ -778,7 +794,7 @@ It exits 1 when something is wrong and prints what; on GitHub Actions each probl
 
 What it wrote goes to standard output, one line for every cluster, and everything else to standard error, so that a script has its commit message. It exits 0 when it wrote a version or there is none newer to take, 1 when it wrote none because a newer release could not be taken for a reason that is not one of the rules, or because the manifests have a problem as they are, and 2 when the files could not be read or written.
 
-Like the check, it works from what the file asks for, which is not what the cluster runs: a second bump may be committed before the first is rolled out, and the operator then plans from the nodes to wherever the spec has got to. It knows nothing of a release's age and takes one the day it is out, where the Renovate example waits some days (§12.28). And it is not the operator choosing a version: the operator in a cluster rolls out what its spec says and changes no spec. This edits a file in a working tree; what is committed is the repository's to decide. `docs/examples` has a workflow that runs it every night.
+Like the check, it works from what the file asks for, which is not what the cluster runs: a second bump may be committed before the first is rolled out, and the operator then plans from the nodes to wherever the spec has got to. It knows nothing of a release's age and takes one the day it is out, where the Renovate example waits some days (§12.29). And it is not the operator choosing a version: the operator in a cluster rolls out what its spec says and changes no spec. This edits a file in a working tree; what is committed is the repository's to decide. `docs/examples` has a workflow that runs it every night.
 
 **What decides the order of things** stays as it was: one operation at a time (§8.1), a failed operation halts until a human acts (§8.3), and nothing starts outside a window.
 
@@ -1065,7 +1081,7 @@ What the earlier plan kept under "M9, later" and is no longer planned (§12.26):
 - **Bootstrapping a cluster from nothing** (§7.8).
 - **A management-cluster mode.** Without bootstrapping there is little left for one to do that the operator inside the cluster does not.
 - **Discovering machines instead of declaring them** (SideroLink, configs pulled by UUID).
-- **The operator choosing versions.** A bot, or the `bump` command on a schedule, proposes them in the repository that holds the spec, and `validate` checks them (§7.5, §12.2, §12.28).
+- **The operator choosing versions.** A bot, or the `bump` command on a schedule, proposes them in the repository that holds the spec, and `validate` checks them (§7.5, §12.2, §12.29).
 - **A command-line tool that runs the same planners.** What an operator cannot do for the cluster it lives in is a recovery, and recovery is `talosctl` and the owner's runbook (§1); the `render` command went the same way (§14.5). The `bump` command (§7.5) is not that tool: it edits a file in a repository and reaches no cluster.
 - **A watchdog for failures that appear after a change was confirmed** (§8.5).
 
@@ -1117,7 +1133,7 @@ R1 is covered by M1–M3, R3 by M2, R2 by M4–M6, and R4 by M7 and M8. No miles
 Decided 2026-10-08:
 
 1. **Topology: self-hosted first.** The operator runs inside the cluster it manages. The core is written against a target-cluster abstraction so that a management-cluster mode could be added. None is planned (26).
-2. **Automatic upgrades = Renovate bumps Git.** The operator rolls out spec version changes automatically, within maintenance windows and behind gates. The operator choosing versions by itself is not planned (26), and `autoUpgrade` is dropped from the v1alpha1 API. A repository without a bot bumps Git with the operator's own command (28).
+2. **Automatic upgrades = Renovate bumps Git.** The operator rolls out spec version changes automatically, within maintenance windows and behind gates. The operator choosing versions by itself is not planned (26), and `autoUpgrade` is dropped from the v1alpha1 API. A repository without a bot bumps Git with the operator's own command (29).
 3. **New-node trust: mandatory UUID pin** in `TalosMachine.spec.identity`.
 4. **Config ownership: full render.** The operator owns the complete config, and everything human-authored is config documents layered onto the generated defaults (§6.1).
 
@@ -1169,7 +1185,14 @@ Decided 2026-10-08:
    - **No credentials for people.** The plan had optional talosconfig and kubeconfig Secrets for administrators, refreshed on a timer. The operator holds the cluster's authorities and could mint them, and that is the reason not to: an administrator's credential lying in a Secret is readable by whatever can read Secrets in that namespace, renewed forever, and revoked by nothing. Whoever holds the cluster's secrets makes one with `talosctl` when needed. What the operator does is say when the certificates it knows end, by how much of each is left: Talos issues the operator's own for six hours and renews it, an authority lasts ten years, and one rule has to cover both.
    - **The metrics switch covers the controller manager and the scheduler, not etcd.** Reading Talos's source for this showed that etcd is handed its arguments only when it is started and is restarted for no config change. A switch that named a metrics address for etcd would be rolled out, verified and in sync, and change nothing until the node reboots. The same is true of any etcd argument a user declares, which §6.3 had wrong. The fix is an operation that restarts etcd member by member; it is not built (§10).
    - **Shipping Talos's logs is config the user declares.** It needs a collector listening on every node, which is the owner's to run, and with that it is three lines of config that roll out like any other. A field of the spec that renders those three lines adds a name to learn and nothing else. The guide has the lines.
-28. **A version can be bumped by the operator's own binary, in the repository** (decided 2026-10-12, by the owner). Decision 2 left choosing versions to a bot such as Renovate, and 26 dropped the operator choosing them. Both stand for the operator in a cluster: it rolls out its spec and never changes one. What is added is a command beside `validate`, for a repository that is applied by Flux and has a script on a schedule: `manager bump` writes the next version into the file (§7.5). A bot knows nothing of Talos: it proposes whatever is newest, and the check turns down what cannot work. The command is built with the rules the operator is built with, so what it writes is the next step that can be taken: Talos before Kubernetes where the versions allow it, the other way round where they do not, one step for every run, and nothing this operator does not upgrade to. It asks what the check asks (22), from wherever it is run and never from a cluster.
+28. **Secure Boot is checked before an upgrade, with one question to Image Factory that needs no switch** (decided 2026-10-12). An upgrade on a real cluster took down a control plane whose firmware trusted its boot image by hash and not by signer; the node stayed down until the next image's hash was enrolled at its console. The operator had done what it was built to do, and that was the problem: it had read nothing about Secure Boot.
+   - **Every node is asked before the first is touched, and one "no" refuses them all.** Upgrading the nodes that would boot and stopping at the one that would not leaves a cluster on two versions waiting for a visit to a machine. The owner who wants that says so, by putting the machine on hold.
+   - **The certificate is asked of Image Factory, always, as a preflight.** Decision 22 lets the operator ask upstream only when told to, because those questions are asked every few hours for as long as the operator runs. This one is asked when an upgrade is about to start, of the service the installer is about to be pulled from anyway, and only for a cluster that has a machine with Secure Boot on. Comparing the nodes' `db`s with each other needs no question and proves nothing: three machines can agree and all be wrong. The owner's decision was that a call per upgrade is fine and a call every quarter of an hour is not.
+   - **Not knowing refuses.** That departs from decision 22 too, for the reason in §7.3: everywhere else the node finds out before anything changed, and here it finds out by not coming back.
+   - **The spec says which installer, the node says whether it needs it.** The operator could pick the signed installer by itself for a machine with Secure Boot on. It does not: the installer is in the machine's config, which the spec renders, and a config that depended on what a node's firmware said in some pass would not be the spec's any more. So the spec names it (`installer.secureBoot`, for the cluster or a pool), adoption reads it from the config a node has, and a mismatch is a refusal that says what to set.
+   - **One file of a node is read.** The firmware's `db` is not a Talos resource. Reading it means `MachineService.Read`, which reads anything; the allowlist admits that one path and tests that it admits no other, the way the removal's reset is admitted in one shape (§7.7).
+   - **Nothing of it is in status.** What a `db` holds is read where it is decided and said in the refusal. A machine's Secure Boot state as a metric, and an alert for a machine that trusts its image by hash, would need it in status first (§12.24); that is not built.
+29. **A version can be bumped by the operator's own binary, in the repository** (decided 2026-10-12, by the owner). Decision 2 left choosing versions to a bot such as Renovate, and 26 dropped the operator choosing them. Both stand for the operator in a cluster: it rolls out its spec and never changes one. What is added is a command beside `validate`, for a repository that is applied by Flux and has a script on a schedule: `manager bump` writes the next version into the file (§7.5). A bot knows nothing of Talos: it proposes whatever is newest, and the check turns down what cannot work. The command is built with the rules the operator is built with, so what it writes is the next step that can be taken: Talos before Kubernetes where the versions allow it, the other way round where they do not, one step for every run, and nothing this operator does not upgrade to. It asks what the check asks (22), from wherever it is run and never from a cluster.
    - **The check finds the Kubernetes images without the machines.** A repository often holds the TalosCluster and nothing else, since adoption writes the pools and machines into the cluster, and the check then rendered no config and looked for no image. A bump would have written a Kubernetes release the day it came out, before the kubelet image Talos runs was published, and the upgrade would have been refused, or, where the operator asks nothing upstream, halted on the first pull. The check now renders a control plane from the cluster alone where it has no machine to render, for `validate` as for `bump`.
    - **Not built: waiting some days after a release.** The Renovate example does. Neither Image Factory nor the Kubernetes release site says when a release came out, and asking a third service for dates is a decision of its own (22).
    - **Not built: asking the cluster.** A bump on top of one that is still being rolled out is taken by the operator in one plan (§7.5). A script that would rather wait can read `status.versions.plan` before it runs the command.
@@ -1304,7 +1327,7 @@ Built with M6: §7.5 describes it. What the earlier plan had here and M6 left ou
 
 ### 14.5 Version bump automation
 
-Built with M6 as far as it is the operator's: the `validate` command (§7.5) and, in `docs/examples`, a Renovate configuration and a workflow that runs the check. Added since (§12.28): the `bump` command (§7.5), which writes the next version into the files itself, and a workflow that runs it on a schedule.
+Built with M6 as far as it is the operator's: the `validate` command (§7.5) and, in `docs/examples`, a Renovate configuration and a workflow that runs the check. Added since (§12.29): the `bump` command (§7.5), which writes the next version into the files itself, and a workflow that runs it on a schedule.
 
 Out of scope: a `render` command that prints machine configs from the manifests and a secrets bundle, for rebuilding a cluster by hand. A cluster that is lost is rebuilt with fresh PKI from its owner's own runbook (§1, §12.7), so configs rendered with the old bundle are not what a rebuild needs, and their output would be a secret to handle outside the cluster.
 

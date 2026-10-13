@@ -174,7 +174,42 @@ kubectl -n talos-operator describe taloscluster my-cluster   # TalosUpToDate car
 - a downgrade;
 - a jump Talos doesn't allow in one step;
 - a Kubernetes version the new Talos release doesn't run. Upgrade Kubernetes first then;
-- an installer Image Factory doesn't build: a release or a schematic it doesn't have, or an extension the schematic names that the release lacks.
+- an installer Image Factory doesn't build: a release or a schematic it doesn't have, or an extension the schematic names that the release lacks;
+- a machine with Secure Boot on that would not boot the new system. See below.
+
+### Secure Boot
+
+A machine whose firmware has Secure Boot on boots only what that firmware trusts. Two things have to be right, and the operator checks both for every machine before it touches the first. If one machine fails, none is upgraded.
+
+**The installer has to be the signed one.** Image Factory builds two installers for a schematic. Only `metal-installer-secureboot` carries a boot image that is signed. Say so in the spec:
+
+```yaml
+spec:
+  configGeneration:
+    installer:
+      schematicID: 376567988ad3...
+      secureBoot: true
+```
+
+A pool can set `installer.secureBoot` for its own machines, either way, if only some machines have Secure Boot on. Adoption reads the setting from the installer your nodes' configs name. The signed installer also boots on a machine without Secure Boot.
+
+**The firmware has to trust who signed it.** A machine that was installed from Talos's Secure Boot ISO with its firmware in setup mode has Image Factory's certificate enrolled. A machine that was booted some other way, with each image approved by hand, trusts those images by their hash and nothing else. It runs fine, and it will not boot the next image. The operator finds that out before the upgrade starts: it reads the firmware's signature database from the node, asks Image Factory for its signing certificate, and compares.
+
+`TalosUpToDate` is then false with reason `Incompatible`, names the machine, and says which certificate is missing and what the firmware holds instead. To fix it, download the certificate and add it to the signature database (`db`) in the machine's firmware setup, as an additional entry, not a replacement:
+
+```bash
+curl -o signing-cert.pem https://factory.talos.dev/secureboot/signing-cert.pem
+```
+
+```bash
+openssl x509 -in signing-cert.pem -outform DER -out signing-cert.cer
+```
+
+It has to be done at the machine: a running system cannot extend that database. The upgrade starts by itself once the certificate is there. To upgrade the other machines first, set `hold: true` on the one that is not ready.
+
+If the operator cannot tell, the reason is `Unverified` and nothing is touched either: Image Factory did not answer, or the node's firmware could not be read. It asks again by itself.
+
+This is the one thing the operator asks outside the cluster without being told to (see [below](#what-the-operator-asks-and-whom)): once, when an upgrade is about to start, and only if a machine in it has Secure Boot on.
 
 ### When a node doesn't come through
 
@@ -277,7 +312,7 @@ status:
 
 ### What the operator asks, and whom
 
-Out of the box the operator talks to nothing but the cluster it manages, and `status.versions` has no `available`. With `versionSources.enabled: true` in the chart's values it asks services outside the cluster what exists, a few times a day and never during an upgrade:
+Out of the box the operator talks to nothing but the cluster it manages, with one exception: before a Talos upgrade of a machine with Secure Boot on, it asks the Image Factory your installer names for its signing certificate ([Secure Boot](#secure-boot)). `status.versions` has no `available`. With `versionSources.enabled: true` in the chart's values it asks services outside the cluster what exists, a few times a day and never during an upgrade:
 
 | Whom | What |
 |---|---|
@@ -287,7 +322,7 @@ Out of the box the operator talks to nothing but the cluster it manages, and `st
 
 It only reads, only over HTTPS, and says who it is in every request. What it learns is used to refuse an upgrade to something that does not exist before a node tries to pull it, and to take a Kubernetes upgrade over several minors through the newest release of each. If a service does not answer, nothing is refused: the nodes find out when they pull.
 
-It is off unless you switch it on because these are other people's services, and using them from your cluster is yours to decide. Nothing is less safe without it. Which versions go together, which steps Talos and Kubernetes allow, and what a Kubernetes release removed are rules the operator is built with, not something it asks for. A release that does not exist is then found by the first node that fails to pull it, before anything on that node is changed, and the upgrade halts there. And a Kubernetes upgrade over several minors goes through the first release of each minor in between, so take one minor at a time.
+It is off unless you switch it on because these are other people's services, and using them from your cluster is yours to decide. Nothing is less safe without it. (The Secure Boot question is asked either way, because there a node that cannot boot is found only when it is already down.) Which versions go together, which steps Talos and Kubernetes allow, and what a Kubernetes release removed are rules the operator is built with, not something it asks for. A release that does not exist is then found by the first node that fails to pull it, before anything on that node is changed, and the upgrade halts there. And a Kubernetes upgrade over several minors goes through the first release of each minor in between, so take one minor at a time.
 
 The check below asks the same services, once for every pull request it runs on, whether the operator does or not.
 

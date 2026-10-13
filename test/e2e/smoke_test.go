@@ -22,6 +22,7 @@ import (
 	"context"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -93,30 +94,42 @@ func harnessWriter(ctx context.Context) talos.ConfigWriter {
 	return w
 }
 
-// controlPlanesNow keeps the endpoints that are control planes of the cluster as it is now. The
-// harness's talosconfig was written when the cluster was built, and the suite replaces a control
-// plane since (adoption_test.go): the address of the one that left is then a machine in
-// maintenance mode, or a worker, and neither forwards a request.
-func controlPlanesNow(ctx context.Context, endpoints []creds.Endpoint) []creds.Endpoint {
+// controlPlaneAddrsNow is the addresses of the control planes of the cluster as it is now. The
+// harness's own list (E2E_CONTROLPLANES, and the endpoints of its talosconfig) was written when the
+// cluster was built, and the suite replaces a control plane since (adoption_test.go): one address
+// on it is then a machine in maintenance mode, or a worker, and the control plane that took its
+// place is not on it.
+func controlPlaneAddrsNow(ctx context.Context) []netip.Addr {
 	GinkgoHelper()
 
 	var nodes corev1.NodeList
 	Expect(k8sClient.List(ctx, &nodes, client.HasLabels{"node-role.kubernetes.io/control-plane"})).To(Succeed())
 
-	now := map[string]bool{}
+	var now []netip.Addr
 
 	for _, node := range nodes.Items {
 		for _, addr := range node.Status.Addresses {
-			if addr.Type == corev1.NodeInternalIP {
-				now[addr.Address] = true
+			if parsed, err := netip.ParseAddr(addr.Address); err == nil && addr.Type == corev1.NodeInternalIP {
+				now = append(now, parsed)
 			}
 		}
 	}
 
+	Expect(now).NotTo(BeEmpty(), "the cluster has no control plane with an address")
+
+	return now
+}
+
+// controlPlanesNow keeps the endpoints that are control planes of the cluster as it is now: what
+// is no longer one forwards no request.
+func controlPlanesNow(ctx context.Context, endpoints []creds.Endpoint) []creds.Endpoint {
+	GinkgoHelper()
+
+	now := controlPlaneAddrsNow(ctx)
 	out := make([]creds.Endpoint, 0, len(endpoints))
 
 	for _, ep := range endpoints {
-		if now[ep.Addr.String()] {
+		if slices.Contains(now, ep.Addr) {
 			out = append(out, ep)
 		}
 	}

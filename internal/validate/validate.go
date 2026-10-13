@@ -395,7 +395,7 @@ func (c *check) versions() bool {
 }
 
 // installers are the installers the cluster's machines are installed from: the cluster's own, and
-// one for every pool that has a schematic of its own.
+// one for every pool that has a schematic or a Secure Boot setting of its own.
 func (c *check) installers() []adopt.Install {
 	var out []adopt.Install
 
@@ -458,7 +458,8 @@ func (c *check) upstream() {
 	} else {
 		for _, install := range c.installers() {
 			c.asked("the installer "+install.Image,
-				c.opts.Source.Installer(c.ctx, installer.Installer.FactoryURL, installer.Installer.Platform, install.SchematicID, install.Version))
+				c.opts.Source.Installer(c.ctx, install.FactoryURL, installer.Installer.Platform, install.SchematicID, install.Version,
+					install.SecureBoot))
 		}
 	}
 }
