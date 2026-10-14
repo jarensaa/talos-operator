@@ -907,8 +907,9 @@ spec:
                     - id
                     x-kubernetes-list-type: map
                   kubernetesVersion:
-                    description: KubernetesVersion is the lowest control-plane Kubernetes
-                      version observed.
+                    description: |-
+                      KubernetesVersion is the lowest version a kubelet of the cluster's Nodes reports. A node in
+                      the middle of an upgrade's step reports the version it tries.
                     type: string
                   observedAt:
                     description: ObservedAt is when this observation completed.
@@ -1144,7 +1145,9 @@ spec:
                       Targets maps each planned machine to the rendered config hash it is to reach, and Bases to
                       the live config hash it had when the operation was planned. An operation applies exactly
                       these pairs. A machine that renders, or runs, something else by the time its turn comes ends
-                      the operation, so the new change is planned, classified and approved afresh.
+                      the operation, so the new change is planned, classified and approved afresh. A Kubernetes
+                      upgrade maps each turn to the image its component is to name, and "kube-proxy/<machine>" to
+                      the kube-proxy image a control plane's kubelet turn brings along.
                     type: object
                   type:
                     description: Type of operation.
@@ -1226,8 +1229,10 @@ spec:
                       type: object
                     type: array
                   talos:
-                    description: 'Talos and Kubernetes are the versions the cluster
-                      runs: the lowest among its nodes.'
+                    description: |-
+                      Talos and Kubernetes are the versions the cluster runs: the lowest among its nodes. While an
+                      upgrade is in flight that includes a version a node only tries; VersionsReachable says when
+                      it is.
                     type: string
                 type: object
             type: object

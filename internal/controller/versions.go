@@ -144,9 +144,18 @@ func (r *TalosClusterReconciler) observeVersions(ctx context.Context, tc *talosv
 		steps = append(steps, step.String())
 	}
 
-	switch {
+	switch op := st.Operation; {
 	case way.Problem != "":
 		reachable(metav1.ConditionFalse, talosv1alpha1.ReasonIncompatible, "%s", way.Problem)
+	case op != nil && (op.Type == talosv1alpha1.OperationTalosUpgrade || op.Type == talosv1alpha1.OperationKubernetesUpgrade):
+		// What runs is not yet what is kept: a node in the middle of its step runs a version that
+		// is tried, and goes back to the one before if it is not confirmed.
+		message := fmt.Sprintf("a %s is in flight, and the versions it brings are not confirmed on every node yet", op.Type)
+		if len(steps) > 0 {
+			message += fmt.Sprintf("; %d upgrade(s) lead from what runs now to what the spec asks for: %s", len(steps), strings.Join(steps, "; "))
+		}
+
+		reachable(metav1.ConditionTrue, talosv1alpha1.ReasonUpgrading, "%s", message)
 	case len(steps) == 0:
 		reachable(metav1.ConditionTrue, talosv1alpha1.ReasonUpToDate, "the cluster runs Talos %s and Kubernetes %s, as its spec asks",
 			current.Talos, current.Kubernetes)

@@ -94,11 +94,11 @@ func (r *TalosClusterReconciler) verifyNode(ctx context.Context, obs observation
 
 	renewed := lease.Spec.RenewTime
 	if renewed == nil || !renewed.After(since) {
-		return closed("the kubelet of %s has not renewed its Lease since the config was applied", name)
+		return closed("no heartbeat from Node %s since the config was applied: its kubelet has not renewed its Lease", name)
 	}
 
 	if now.Sub(renewed.Time) > leaseFreshness {
-		return closed("the kubelet of %s has not renewed its Lease for more than %s", name, leaseFreshness)
+		return closed("no heartbeat from Node %s for more than %s: its kubelet has not renewed its Lease", name, leaseFreshness)
 	}
 
 	return plan.Gate{Open: true}, nil

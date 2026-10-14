@@ -140,7 +140,8 @@ var _ = Describe("Kubernetes upgrade", func() {
 						running[key] = image
 					}
 
-					if !plan.Runs(component) {
+					// Nothing runs from the kube-proxy image a control plane's config names.
+					if component == plan.ComponentProxy {
 						continue
 					}
 
@@ -200,7 +201,7 @@ var _ = Describe("Kubernetes upgrade", func() {
 		Expect(h.operation().Target).To(Equal(patch))
 		Expect(h.operation().Plan).To(Equal([]string{
 			"kube-apiserver/" + cp1Machine, "kube-controller-manager/" + cp1Machine, "kube-scheduler/" + cp1Machine,
-			"kube-proxy/" + cp1Machine, "kubelet/" + cp1Machine, "kubelet/" + worker1, "kubelet/" + worker2,
+			"kubelet/" + cp1Machine, "kubelet/" + worker1, "kubelet/" + worker2,
 		}))
 		Expect(upToDate().Reason).To(Equal(talosv1alpha1.ReasonUpgrading))
 
@@ -217,6 +218,21 @@ var _ = Describe("Kubernetes upgrade", func() {
 		Expect(h.operation().Current.Deadline.Sub(h.clock)).To(BeNumerically("<=", plan.DefaultTryTimeout),
 			"no other turn gets more than any change")
 
+		// A confirmed turn is the node's new baseline at once, not only once the upgrade ends.
+		h.runUntil("the first worker is tried", turnIs(plan.ComponentKubelet, worker1, plan.StepVerifying))
+		confirmedHash, err := configHash(h.scenario.Node(cpAddr).Config.Active)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(h.machine(cp1Machine).Status.Config.AppliedHash).To(Equal(confirmedHash))
+
+		// Every kubelet runs the new version once the last is tried; the cluster has it once the
+		// last is confirmed.
+		h.runUntil("the last kubelet is tried", turnIs(plan.ComponentKubelet, worker2, plan.StepVerifying))
+		h.round()
+		Expect(h.tc.Status.Versions.Kubernetes).To(Equal(patch))
+
+		reachable := condition(h.tc, talosv1alpha1.ConditionVersionsReachable)
+		Expect(reachable.Reason).To(Equal(talosv1alpha1.ReasonUpgrading), reachable.Message)
+
 		h.runUntil("the upgrade ends", func() bool { return len(kubernetesOperations()) == 1 })
 		Expect(kubernetesOperations()[0].Outcome).To(Equal(talosv1alpha1.OperationSucceeded))
 
@@ -226,11 +242,11 @@ var _ = Describe("Kubernetes upgrade", func() {
 			cp1Machine + " registry.k8s.io/kube-scheduler:v" + patch,
 			cp1Machine + " " + kubelet + patch, worker1 + " " + kubelet + patch, worker2 + " " + kubelet + patch,
 		}))
-		// Five changes of the control plane's config, the kube-proxy image among them, for which
-		// nothing is pulled; then one for each worker's kubelet.
+		// Four changes of the control plane's config, the last of which brings the kube-proxy image
+		// along, for which nothing is pulled; then one for each worker's kubelet.
 		Expect(h.applies()).To(Equal([]string{
 			tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine),
-			tried(cp1Machine), confirmed(cp1Machine), tried(cp1Machine), confirmed(cp1Machine),
+			tried(cp1Machine), confirmed(cp1Machine),
 			tried(worker1), confirmed(worker1), tried(worker2), confirmed(worker2),
 		}))
 
@@ -245,7 +261,7 @@ var _ = Describe("Kubernetes upgrade", func() {
 		// Nothing is left for a config rollout: every image the version names is the upgrade's.
 		h.runUntil("everything settles", settled)
 		Expect(upToDate().Message).To(ContainSubstring("all 3 nodes"))
-		Expect(h.applies()).To(HaveLen(14))
+		Expect(h.applies()).To(HaveLen(12))
 		Expect(h.tc.Status.History).To(HaveLen(1))
 		Expect(drain(h.recorder)).To(ContainElement(ContainSubstring("KubernetesUpgradeStarted")))
 	})

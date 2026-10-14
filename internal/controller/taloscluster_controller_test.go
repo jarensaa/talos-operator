@@ -636,6 +636,32 @@ var _ = Describe("TalosCluster observe loop", func() {
 				scenario.AssertNoMutations(GinkgoT())
 			})
 
+			It("stops judging the adoption preconditions once handed over", func() {
+				setConfig(talosv1alpha1.ConfigManagementManage)
+				reconcileAll()
+				Expect(condition(tc, talosv1alpha1.ConditionConfigHandover).Status).To(Equal(metav1.ConditionTrue))
+
+				reconcileAll()
+				Expect(condition(tc, talosv1alpha1.ConditionAdoptionPreconditionsMet)).To(BeNil())
+				Expect(tc.Status.Adoption.Preconditions).To(BeEmpty())
+				drain(recorder)
+
+				// What a rollout of the operator's own looks like between its try and its confirm.
+				scenario.UpdateNode(workerAddr, func(n *fake.Node) { n.Config.Persistent = []byte("version: v1alpha1\nstaged: true\n") })
+				reconcileAll()
+
+				Expect(condition(tc, talosv1alpha1.ConditionAdoptionPreconditionsMet)).To(BeNil())
+				Expect(drain(recorder)).NotTo(ContainElement(ContainSubstring(talosv1alpha1.ConditionAdoptionPreconditionsMet)))
+
+				// The proof's gate is asked again, and with it the preconditions, once config is observed only.
+				setConfig(talosv1alpha1.ConfigManagementObserve)
+				reconcileAll()
+
+				met := condition(tc, talosv1alpha1.ConditionAdoptionPreconditionsMet)
+				Expect(met.Status).To(Equal(metav1.ConditionFalse))
+				Expect(met.Message).To(ContainSubstring(plan.PreconditionNoPendingConfig))
+			})
+
 			It("reports drift after the handover and acts on nothing", func() {
 				setConfig(talosv1alpha1.ConfigManagementManage)
 				reconcileAll()

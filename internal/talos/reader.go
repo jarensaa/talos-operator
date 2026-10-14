@@ -209,8 +209,8 @@ type MachineConfigs struct {
 	// internal/app/machined/pkg/controllers/config/acquire.go:224 in v1.14). When set, it differs
 	// from Active while a staged apply is pending.
 	//
-	// A TRY apply changes only Active, so during its rollback window (default 1m) Persistent can
-	// be nil or equal to the pre-TRY config while Active differs.
+	// A TRY apply changes only Active, so during its rollback window Persistent is nil, or the
+	// config before the try while Active differs: a try then looks like a staged apply.
 	Persistent []byte
 }
 

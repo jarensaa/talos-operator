@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -38,6 +39,7 @@ import (
 // The Kubernetes upgrade executor (docs/scope.md §7.4). An upgrade changes the image a node's
 // config names for a component, one component on one node at a time, in the order
 // plan.PlanKubernetes gives. Each change is the node's live config with that one image replaced,
+// and on a control plane's kubelet the kube-proxy image too, which nothing runs from; it is
 // applied the way every config change is: tried, verified from outside, confirmed. The only
 // things added to a config step are the pull before it and one more check after it: that the
 // component runs the new version.
@@ -441,7 +443,7 @@ func (r *TalosClusterReconciler) beginKubernetes(tc *talosv1alpha1.TalosCluster,
 ) {
 	op := tc.Status.Operation
 	component, machine := plan.SplitTurn(key)
-	target := op.Targets[key]
+	target, want := op.Targets[key], plan.TurnImages(op.Targets, key)
 
 	step := &talosv1alpha1.OperationStep{
 		Machine:   machine,
@@ -462,11 +464,11 @@ func (r *TalosClusterReconciler) beginKubernetes(tc *talosv1alpha1.TalosCluster,
 		r.end(tc, talosv1alpha1.OperationSuperseded, machine+" was put on hold, and a Kubernetes upgrade cannot leave a control plane out")
 	case v.held():
 		skipped(op, key)
-	case images != nil && images[component].Live == target:
+	case images != nil && names(images, want):
 		// Nothing to apply, but the upgrade only moves past a component it has seen run.
 		step.Step, step.PreviousHash, step.DesiredHash = plan.StepVerifying, v.live.Hash, v.live.Hash
 		op.Current = step
-	case images != nil && current.Targets[key] != target:
+	case images != nil && !maps.Equal(plan.TurnImages(current.Targets, key), want):
 		r.end(tc, talosv1alpha1.OperationSuperseded,
 			fmt.Sprintf("%s on %s is to get another image than this upgrade planned", component, machine))
 	default:
@@ -474,6 +476,38 @@ func (r *TalosClusterReconciler) beginKubernetes(tc *talosv1alpha1.TalosCluster,
 		// that wait is bounded.
 		op.Current = step
 	}
+}
+
+// names reports whether a node's config names every image a turn brings its components to.
+func names(images map[string]plan.KubernetesImage, want map[string]string) bool {
+	for component, image := range want {
+		if images[component].Live != image {
+			return false
+		}
+	}
+
+	return true
+}
+
+// turnConfig is the node's config raw with every image the turn in flight changes replaced: the
+// component's own, and what its turn brings along.
+func turnConfig(raw []byte, op *talosv1alpha1.Operation) ([]byte, error) {
+	cur := op.Current
+	images := plan.TurnImages(op.Targets, plan.TurnKey(cur.Component, cur.Machine))
+
+	for _, component := range plan.Changes(cur.Component) {
+		image, ok := images[component]
+		if !ok {
+			continue
+		}
+
+		var err error
+		if raw, err = talos.WithKubernetesImage(raw, component, image); err != nil {
+			return nil, err
+		}
+	}
+
+	return raw, nil
 }
 
 // kubernetesStep asks the planner what the turn in flight needs next, and does it. Once the image
@@ -527,7 +561,7 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 	case plan.Pull:
 		return r.pullComponent(ctx, tc, obs, v, timing, now)
 	case plan.Try:
-		raw, err := talos.WithKubernetesImage(v.node.activeConfig, cur.Component, cur.Image)
+		raw, err := turnConfig(v.node.activeConfig, op)
 		if err != nil {
 			failOperation(op, plan.FailRejected, err.Error(), now)
 
@@ -537,13 +571,19 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 		// The planner only asks for a try while the node runs the config the step started from, so
 		// the patch gives the config that was recorded then. Anything else is not sent.
 		if hash, _ := configHash(raw); hash != cur.DesiredHash {
-			return "the node's config with the new image is not the config this step recorded", nil
+			return "the node's config with the new images is not the config this step recorded", nil
 		}
 
 		return r.tryConfig(ctx, tc, obs, v, raw, now)
 	case plan.Confirm:
 		return r.confirm(ctx, tc, obs, v)
 	case plan.Complete:
+		// The node runs, persistently, a config the operator put there: its new baseline, as
+		// after any config change (docs/scope.md §8.5.1).
+		if err := r.recordApplied(ctx, v.tm, cur.DesiredHash); err != nil {
+			return "", err
+		}
+
 		completed(tc)
 	default:
 		return "", unexpected(op, action)
@@ -553,22 +593,23 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 }
 
 // pullComponent pulls the component's image to the node, and then records the config change that
-// follows: the node's config as it is now, and as it is with the image replaced. A pull changes
-// nothing on the node and can be repeated, so a pass that is interrupted simply does it again.
+// follows: the node's config as it is now, and as it is with the turn's images replaced. A pull
+// changes nothing on the node and can be repeated, so a pass that is interrupted simply does it
+// again.
 func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1alpha1.TalosCluster, obs observation, v machineView,
 	timing plan.Timing, now time.Time,
 ) (string, error) {
 	op := tc.Status.Operation
 	cur := op.Current
 
-	// Asked for first, although a component Talos does not run is not pulled: what is recorded
-	// below is only recorded from the TalosCluster as the API server has it now.
+	// Asked for first, although an image the node's config names already is not pulled: what is
+	// recorded below is only recorded from the TalosCluster as the API server has it now.
 	upgrader, note := clientTo(ctx, r, tc, obs, "pull the image with", r.Resolver.ResolveUpgrader)
 	if note != "" {
 		return note, nil
 	}
 
-	raw, err := talos.WithKubernetesImage(v.node.activeConfig, cur.Component, cur.Image)
+	raw, err := turnConfig(v.node.activeConfig, op)
 	if err != nil {
 		failOperation(op, plan.FailRejected, err.Error(), now)
 
@@ -577,7 +618,7 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 
 	desired, err := configHash(raw)
 	if err != nil {
-		failOperation(op, plan.FailRejected, fmt.Sprintf("the config with the %s image replaced does not parse", cur.Component), now)
+		failOperation(op, plan.FailRejected, fmt.Sprintf("the config with the %s images replaced does not parse", cur.Component), now)
 
 		return "", nil
 	}
@@ -590,9 +631,9 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 		return "", nil
 	}
 
-	// Nothing on the node runs from the image of a component Talos does not run, so there is
-	// nothing to pull to it.
-	if plan.Runs(cur.Component) {
+	// A turn that only brings the kube-proxy image along runs the image its component runs now,
+	// which is on the node.
+	if live, err := talos.KubernetesImages(v.node.activeConfig); err != nil || live[cur.Component] != cur.Image {
 		// A download takes as long as it takes. The step's own timeout bounds it.
 		callCtx, cancel := context.WithTimeout(ctx, timing.StepTimeout)
 		defer cancel()
@@ -619,15 +660,11 @@ func (r *TalosClusterReconciler) pullComponent(ctx context.Context, tc *talosv1a
 
 // componentRuns checks that the component of the step in flight runs the image the step applied,
 // and is ready: for the kubelet by the version its Node reports, for a static pod by the pod the
-// kubelet mirrors into the API. kube-proxy is not run from a node's config, and so has nothing
-// to be seen.
+// kubelet mirrors into the API. kube-proxy is not run from a node's config, has no turn, and so
+// nothing to be seen.
 func (r *TalosClusterReconciler) componentRuns(ctx context.Context, m boundMachine, cur *talosv1alpha1.OperationStep) (plan.Gate, error) {
 	closed := func(format string, args ...any) (plan.Gate, error) {
 		return plan.Gate{Reason: fmt.Sprintf(format, args...)}, nil
-	}
-
-	if !plan.Runs(cur.Component) {
-		return plan.Gate{Open: true}, nil
 	}
 
 	name := m.kubernetesNode()
