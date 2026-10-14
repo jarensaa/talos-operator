@@ -447,7 +447,7 @@ desired(node) =
 ### 6.2 Drift detection
 - Every reconcile reads the live `MachineConfigs.config.talos.dev/v1alpha1` resource (this needs `os:admin`; the resource is Sensitive).
 - It compares the live config with the desired config **per document** (keyed by `kind`+`name`), with comments removed. The text diff from the server is order-sensitive, so it is not used for this.
-- It also checks the `persistent` config ID. Talos only creates it on an apply in the current boot; a node booted from disk has none (`acquire.go:224`). If it exists and differs from `active`, a staged apply is pending, and the operator does not apply anything. A TRY apply changes only `active`, so this check cannot see one in progress. The operator tracks its own TRY applies through `status.operation` (§8.5.1).
+- It also checks the `persistent` config ID. Talos only creates it on an apply in the current boot; a node booted from disk has none (`acquire.go:224`). If it exists and differs from `active`, a staged apply is pending, and the operator does not apply anything. A TRY apply changes only `active`, so this check cannot tell one in progress from a staged apply: it sees none on a node with no `persistent` config yet, and one on a node where an earlier apply of the same boot created it. The operator tracks its own TRY applies through `status.operation` (§8.5.1).
 - Each TalosMachine records `status.config.appliedHash`: the config the operator last confirmed on the node, or the live config it took over at the handover. That separates the two reasons a node can differ from its rendered config:
   - the spec renders something else than was applied: a **change**, which is rolled out whatever the drift policy;
   - the spec still renders what was applied, but the node runs something else: **drift**. `driftPolicy: Report` sets `ConfigInSync=False` (`Drift`) and leaves the node alone; the redacted diff is in the machine's status. `Enforce` rolls the node back to its rendered config, like any other change.
@@ -570,7 +570,7 @@ spec:
 
 The operator then does the following:
 1. **Discovery.** Enumerate `Members` and `EtcdMemberList`. For every node, read Version, MachineType, `MachineStatus`, `SystemInformation`, `ImageFactorySchematic`, `Nodename`, and the active and persistent MachineConfig.
-2. **Preconditions.** Each one is reported as a condition, and all must hold before stage 3:
+2. **Preconditions.** Each one is reported as a condition, and all must hold before stage 3. They are judged for as long as something asks them: adopting, the proof, and the handover (stage 4), which repeats the proof's gate. Once config is handed over they are not judged, and `AdoptionPreconditionsMet` is gone from status: an operation asks after the cluster's health through its own gates (§8), and its own try would fail `no pending staged config` on every step.
    - every member reachable, `running` and ready;
    - etcd healthy, with its member set equal to the CP set;
    - no pending staged config (no `persistent` config, or one equal to `active`);
@@ -726,15 +726,15 @@ An upgrade is due when a node's config names another image of a Kubernetes compo
 
 What cannot be read is not fine: a check that fails to run blocks the upgrade (`AwaitingStatus`).
 
-**Plan** (`plan.PlanKubernetes`). `kube-apiserver` on every control plane, then `kube-controller-manager`, then `kube-scheduler`, then the kube-proxy image of each control plane's config, then the kubelet on control planes and on workers. It is talosctl's order. A component that already runs the hop's version is left out. It starts only when the whole cluster is healthy.
+**Plan** (`plan.PlanKubernetes`). `kube-apiserver` on every control plane, then `kube-controller-manager`, then `kube-scheduler`, then the kubelet on control planes and on workers. It is talosctl's order, but for kube-proxy: the kubelet's turn on a control plane brings the kube-proxy image of its config along, in the same try. Nothing runs from that image, whether the config enables kube-proxy or not, so there is nothing to verify of it, and a turn of its own would be a try, a soak and a confirm of every control plane for nothing. A component that already runs the hop's version is left out; a control plane's kubelet keeps its turn while the kube-proxy image is not there yet. It starts only when the whole cluster is healthy.
 
 **Per-step** (`plan.NextKubernetesStep`), for one component on one node:
 
 | Step | What happens | If it does not work |
 |---|---|---|
-| `Pulling` | Wait for the gate (§6.3, §6.4), then pull the image to the node, so the component is down only for its restart. Nothing is pulled for kube-proxy. | `ImagePullFailed`. Nothing changed. |
+| `Pulling` | Wait for the gate (§6.3, §6.4), then pull the image to the node, so the component is down only for its restart. Nothing is pulled for kube-proxy, nor for a kubelet whose turn only brings the kube-proxy image along. | `ImagePullFailed`. Nothing changed. |
 | `Trying` | Apply the config with the new image in `TRY` mode (§8.5.1). | Talos reverts it. |
-| `Verifying` | The component runs the new version and is ready (the static pod's mirror pod; the Node's `kubeletVersion`; nothing for kube-proxy), and the whole cluster and every gate are healthy for the soak. | `RolledBack`: Talos puts the previous image back when the try window ends. |
+| `Verifying` | The component runs the new version and is ready (the static pod's mirror pod; the Node's `kubeletVersion`), and the whole cluster and every gate are healthy for the soak. | `RolledBack`: Talos puts the previous image back when the try window ends. |
 | `Confirming` | Make the config persistent. | |
 
 **The API server's turn gets a longer try** (`plan.KubernetesTryTimeout`): `stepTimeout` to be healthy again, then the soak and the margin to confirm in, instead of `tryTimeout`. Its restart takes the Kubernetes API away from everything on its node, and on a cluster with one control plane from everything: the controller manager and the scheduler lose their leases and restart, the operator loses its own, and nothing can be verified until the API answers. On QEMU, with one control plane, the API was back after 80 seconds and the cluster was not whole again within the three minutes a four-minute try left, so Talos took back a change that was fine. A cluster in that state is settling, not unhealthy, and gets what a node gets to come back after a reboot. The price is on the other side: an API server that really does not come up is reverted after that longer time.
@@ -745,7 +745,7 @@ Windows and gates hold a Kubernetes upgrade as they hold every operation (§6.4)
 
 **The Talos access** is the two that exist: the image is pulled through the upgrade connection, into the namespace the component runs from, and the config is applied through the config connection.
 
-**Not done, by decision (§12.20):** the manifests Talos applies when a cluster is bootstrapped (kube-proxy, CoreDNS, their RBAC). Talos applies them once and never again, and on an adopted cluster they have often been changed or replaced since. The upgrade does bring the kube-proxy image of each control plane's config in line, as talosctl does, so that the manifest Talos would apply names the cluster's version; that changes nothing that runs. A kube-proxy DaemonSet that is left behind the cluster's version is named in `KubernetesUpToDate`.
+**Not done, by decision (§12.20):** the manifests Talos applies when a cluster is bootstrapped (kube-proxy, CoreDNS, their RBAC). Talos applies them once and never again, and on an adopted cluster they have often been changed or replaced since. The upgrade does bring the kube-proxy image of each control plane's config in line, as talosctl does, so that the manifest Talos would apply names the cluster's version; that changes nothing that runs, and goes with the kubelet's turn. A kube-proxy DaemonSet that is left behind the cluster's version is named in `KubernetesUpToDate`.
 
 ### 7.5 Version awareness (R2)
 
@@ -755,7 +755,7 @@ Implemented in `internal/plan/versions.go` (the way), `internal/catalog` (what e
 
 **The way** (`plan.PlanVersions`). From the versions a cluster runs to the versions its spec asks for, as a sequence of upgrades, or the reason there is none. Talos and Kubernetes take turns as their versions allow: a Talos version is only installed while it runs the Kubernetes version the cluster has then, and a Kubernetes version only reached, one minor at a time, while the nodes' Talos runs it. Where both could go next, Talos does. The planner starts nothing. Each upgrade still decides for itself whether it may start, by the same rules, which are Talos's own (`compatibility`); the plan is that answer worked out ahead.
 
-**Status** (`status.versions`, condition `VersionsReachable`). What the cluster runs, the plan, and what exists upstream. `VersionsReachable` is false, with the reason, when the spec asks for versions there is no way to: a Talos release that does not run the Kubernetes version asked for, a downgrade, a jump Talos does not make.
+**Status** (`status.versions`, condition `VersionsReachable`). What the cluster runs, the plan, and what exists upstream. `VersionsReachable` is false, with the reason, when the spec asks for versions there is no way to: a Talos release that does not run the Kubernetes version asked for, a downgrade, a jump Talos does not make. What runs is the lowest version among the nodes, the one a node only tries included: a kubelet in the middle of its step already reports the version it tries, and goes back if the step is not confirmed. So while a Talos or Kubernetes upgrade is in flight, `VersionsReachable` says `Upgrading`, never `UpToDate`; that the cluster has what its spec asks for is said once the operation is over.
 
 **What goes together is compiled in.** Which Kubernetes a Talos release runs, which steps each allows, and what a Kubernetes release removed (flags, feature gates, admission plugins, APIs) are the rules of `machinery`'s `compatibility` package and of go-kubernetes's upgrade checks, the ones `talosctl` uses. They are Sidero's to keep and reach the operator by a dependency bump; the operator keeps no matrix of its own beside them, which would only ever be the same rules, later. An operator therefore knows nothing of a Talos minor newer than the one it was built for, and says so.
 

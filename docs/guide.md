@@ -30,7 +30,7 @@ The conditions tell you where it is:
 |---|---|
 | `CredentialsValid` | Talos issued the certificate. `TalosAPIAccessDisabled` here means step 1 didn't take effect. |
 | `TalosAPIReachable`, `Healthy` | The operator can read every node, and Talos's own health checks pass. |
-| `AdoptionPreconditionsMet` | The cluster is in a state that's safe to adopt. The status lists each check. |
+| `AdoptionPreconditionsMet` | The cluster is in a state that's safe to adopt. The status lists each check. Once `config: Manage` is handed over, it is no longer reported. |
 | `SecretsMatchLive` | The secrets bundle, recovered or supplied, is the one every node's config was made with. |
 | `ResourcesDerived` | The operator wrote the pools and machines. False with reason `ChangedElsewhere` names resources it left alone because someone else set a value the cluster contradicts. |
 | `ConfigProven` | The resources render exactly what every node runs, and Talos's dry run agrees. The first time this is true, the cluster is adopted. |
@@ -246,7 +246,7 @@ A config rollout never changes the images of these components: no other componen
 
 ### What happens
 
-One component on one node at a time, in this order: the API server on every control plane, then the controller manager on each, then the scheduler, then the kube-proxy image that each control plane's config names (see below), then the kubelet on control planes and on workers. `status.operation.plan` lists the turns, as `kube-apiserver/<machine>`.
+One component on one node at a time, in this order: the API server on every control plane, then the controller manager on each, then the scheduler, then the kubelet on control planes and on workers. A control plane's kubelet turn also updates the kube-proxy image its config names (see below), in the same change: nothing runs from that image, so it gets no turn of its own. `status.operation.plan` lists the turns, as `kube-apiserver/<machine>`.
 
 | Step | What happens |
 |---|---|

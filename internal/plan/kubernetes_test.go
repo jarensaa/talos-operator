@@ -184,7 +184,6 @@ func TestPlanKubernetesOrder(t *testing.T) {
 		"kube-apiserver/cp1", "kube-apiserver/cp2",
 		"kube-controller-manager/cp1", "kube-controller-manager/cp2",
 		"kube-scheduler/cp1", "kube-scheduler/cp2",
-		"kube-proxy/cp1", "kube-proxy/cp2",
 		"kubelet/cp1", "kubelet/cp2", "kubelet/w1", "kubelet/w2",
 	}
 	if !slices.Equal(got.Pending, want) || !got.MayStart() {
@@ -193,8 +192,19 @@ func TestPlanKubernetesOrder(t *testing.T) {
 
 	if got.Targets["kube-apiserver/cp1"] != "registry.k8s.io/kube-apiserver:v1.37.1" ||
 		got.Targets["kubelet/w2"] != "ghcr.io/siderolabs/kubelet:v1.37.1" ||
-		len(got.Targets) != len(want) {
+		len(got.Targets) != len(want)+2 {
 		t.Fatalf("images: %v", got.Targets)
+	}
+
+	// kube-proxy has no turn: a control plane's kubelet brings its image along.
+	if images := TurnImages(got.Targets, "kubelet/cp1"); len(images) != 2 ||
+		images[ComponentKubelet] != "ghcr.io/siderolabs/kubelet:v1.37.1" ||
+		images[ComponentProxy] != "registry.k8s.io/kube-proxy:v1.37.1" {
+		t.Fatalf("the kubelet's turn on a control plane: %v", images)
+	}
+
+	if images := TurnImages(got.Targets, "kubelet/w1"); len(images) != 1 {
+		t.Fatalf("the kubelet's turn on a worker: %v", images)
 	}
 
 	if want := []string{kubeCP1, "cp2", "w1", "w2"}; !slices.Equal(got.Behind, want) {
@@ -219,10 +229,21 @@ func TestPlanKubernetesOrder(t *testing.T) {
 
 	want = []string{
 		"kube-apiserver/cp2", "kube-controller-manager/cp2", "kube-scheduler/cp1", "kube-scheduler/cp2",
-		"kube-proxy/cp1", "kube-proxy/cp2", "kubelet/cp1", "kubelet/cp2", "kubelet/w2",
+		"kubelet/cp1", "kubelet/cp2", "kubelet/w2",
 	}
 	if !slices.Equal(resumed.Pending, want) {
 		t.Fatalf("resumed: got %v\nwant %v", resumed.Pending, want)
+	}
+
+	// A kubelet that names the hop's version already still has its turn while the kube-proxy image
+	// of its config does not, and keeps its own image.
+	machines[2] = machines[2].running(ComponentKubelet, kubeNew)
+	proxyOnly := PlanKubernetes(machines, KubernetesSettings{}, healthyPass())
+
+	if !slices.Contains(proxyOnly.Pending, "kubelet/cp1") ||
+		proxyOnly.Targets["kubelet/cp1"] != "ghcr.io/siderolabs/kubelet:v1.37.1" ||
+		proxyOnly.Targets["kube-proxy/cp1"] != "registry.k8s.io/kube-proxy:v1.37.1" {
+		t.Fatalf("proxy only: %v %v", proxyOnly.Pending, proxyOnly.Targets)
 	}
 
 	if resumed.Change == got.Change || resumed.Change == "" {
@@ -233,7 +254,7 @@ func TestPlanKubernetesOrder(t *testing.T) {
 	// image its rendered config names.
 	far := PlanKubernetes([]KubernetesMachine{kubeControlPlane(kubeCP1, "1.35.4", kubeNew), kubeWorker("w1", "1.35.4", kubeNew)},
 		KubernetesSettings{}, healthyPass())
-	if far.Hop.Version != "1.36.0" || far.Targets["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.0" || len(far.Pending) != 6 {
+	if far.Hop.Version != "1.36.0" || far.Targets["kubelet/w1"] != "ghcr.io/siderolabs/kubelet:v1.36.0" || len(far.Pending) != 5 {
 		t.Fatalf("far: %+v", far)
 	}
 
@@ -375,13 +396,29 @@ func TestNextKubernetesStep(t *testing.T) {
 	}
 }
 
-// Talos runs every component from a node's config but kube-proxy, whose image the config only
-// names for a manifest.
-func TestRuns(t *testing.T) {
-	for _, component := range KubernetesComponents {
-		if Runs(component) != (component != ComponentProxy) {
-			t.Errorf("%s: runs %v", component, Runs(component))
+// Every image a config names is changed by exactly one turn, and only kube-proxy, which Talos does
+// not run, by another component's.
+func TestChanges(t *testing.T) {
+	changedBy := map[string][]string{}
+
+	for _, turn := range KubernetesTurns {
+		if Changes(turn)[0] != turn {
+			t.Errorf("%s: its turn changes %v, its own image not first", turn, Changes(turn))
 		}
+
+		for _, c := range Changes(turn) {
+			changedBy[c] = append(changedBy[c], turn)
+		}
+	}
+
+	for _, component := range KubernetesComponents {
+		if len(changedBy[component]) != 1 {
+			t.Errorf("%s: changed by %v", component, changedBy[component])
+		}
+	}
+
+	if slices.Contains(KubernetesTurns, ComponentProxy) || !slices.Equal(changedBy[ComponentProxy], []string{ComponentKubelet}) {
+		t.Errorf("kube-proxy: a turn of its own %v, changed by %v", slices.Contains(KubernetesTurns, ComponentProxy), changedBy[ComponentProxy])
 	}
 }
 

@@ -227,6 +227,15 @@ func adopting(tc *talosv1alpha1.TalosCluster, obs observation) bool {
 		meta.IsStatusConditionTrue(tc.Status.Conditions, talosv1alpha1.ConditionAdoptionPreconditionsMet)
 }
 
+// judgingAdoption reports whether the adoption preconditions gate anything: adopting, the proof,
+// and the handover, which repeats the proof's gate. Once config is handed over, nothing does: an
+// operation asks after the cluster's health through its own gates (plan.TouchGate,
+// plan.VerifyGate), which know the node it is changing (docs/scope.md §7.1 stage 1).
+func judgingAdoption(tc *talosv1alpha1.TalosCluster) bool {
+	return !tc.Spec.Management.ManagesConfig() ||
+		!meta.IsStatusConditionTrue(tc.Status.Conditions, talosv1alpha1.ConditionConfigHandover)
+}
+
 // observation is one pass over the live cluster. A failed step leaves later fields unset and
 // records why; conditions are derived from what was reached.
 type observation struct {
@@ -658,7 +667,15 @@ func (r *TalosClusterReconciler) applyObservation(tc *talosv1alpha1.TalosCluster
 		setCondition(st, gen, talosv1alpha1.ConditionHealthy, metav1.ConditionUnknown, talosv1alpha1.ReasonUnreachable, obs.healthErrorMsg)
 	}
 
-	if obs.facts != nil {
+	switch {
+	case !judgingAdoption(tc):
+		// Nothing asks them any more, and the operator's own rollouts would fail them.
+		meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionAdoptionPreconditionsMet)
+
+		if st.Adoption != nil {
+			st.Adoption.Preconditions = nil
+		}
+	case obs.facts != nil:
 		if st.Adoption == nil {
 			st.Adoption = &talosv1alpha1.AdoptionStatus{}
 		}

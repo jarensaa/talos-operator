@@ -47,8 +47,8 @@ const (
 	ComponentKubelet           = k8s.KubeletID
 	// ComponentProxy is kube-proxy, which Talos does not run: a control plane's config names its
 	// image for the manifest Talos applies when a cluster is bootstrapped. The image belongs to
-	// the Kubernetes version like the others, so an upgrade brings it in line; nothing is pulled
-	// or restarted for it.
+	// the Kubernetes version like the others, so an upgrade brings it in line, along with the
+	// kubelet; nothing is pulled or restarted for it.
 	ComponentProxy = "kube-proxy"
 )
 

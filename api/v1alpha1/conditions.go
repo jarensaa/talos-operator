@@ -52,7 +52,8 @@ const (
 	// the Kubernetes version its spec asks for (docs/scope.md §7.4).
 	ConditionKubernetesUpToDate = "KubernetesUpToDate"
 	// ConditionVersionsReachable reports whether there is a sequence of upgrades from the versions
-	// the cluster runs to the versions its spec asks for (docs/scope.md §7.5).
+	// the cluster runs to the versions its spec asks for (docs/scope.md §7.5). While a Talos or
+	// Kubernetes upgrade is in flight its reason is Upgrading, never UpToDate.
 	ConditionVersionsReachable = "VersionsReachable"
 	// ConditionMembershipCurrent reports whether the cluster's machines are the ones that are
 	// declared: every TalosMachine that is Present is a member, and none that is Removed still is
@@ -152,7 +153,7 @@ const (
 	ReasonAwaitingKubernetesUpgrade = "AwaitingKubernetesUpgrade"
 	// ReasonOutsideWindow: no maintenance window is open (docs/scope.md §6.4).
 	ReasonOutsideWindow = "OutsideWindow"
-	// Reasons of TalosUpToDate and KubernetesUpToDate.
+	// Reasons of TalosUpToDate and KubernetesUpToDate. Upgrading is one of VersionsReachable too.
 	ReasonUpgrading        = "Upgrading"
 	ReasonUpgradesDisabled = "UpgradesDisabled"
 	ReasonIncompatible     = "Incompatible"

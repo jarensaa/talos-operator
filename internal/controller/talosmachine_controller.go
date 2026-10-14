@@ -72,9 +72,9 @@ func (r *TalosMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	keepTransitions(original.Status.Conditions, tm.Status.Conditions)
 
 	if !equality.Semantic.DeepEqual(original.Status, tm.Status) {
-		// A merge patch of what this pass changed. The cluster's rollout writes status.config's
-		// appliedHash and skippedHash, which this controller never sets, so neither needs to
-		// yield to the other and no conflict can arise.
+		// A merge patch of what this pass changed. The cluster's operations write status.config's
+		// appliedHash and status.removedAt (patchMachine), which this controller never sets, so
+		// neither needs to yield to the other and no conflict can arise.
 		if err := r.Status().Patch(ctx, tm, client.MergeFrom(original)); err != nil {
 			return ctrl.Result{}, fmt.Errorf("patch status: %w", err)
 		}

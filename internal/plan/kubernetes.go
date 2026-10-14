@@ -36,19 +36,44 @@ const (
 	ComponentControllerManager = "kube-controller-manager"
 	ComponentScheduler         = "kube-scheduler"
 	// ComponentProxy is kube-proxy. Talos does not run it; a control plane's config names its
-	// image, and an upgrade brings that in line with the rest.
+	// image, and the kubelet's turn on that control plane brings it in line with the rest. Nothing
+	// runs from it to be seen, so it has no turn of its own.
 	ComponentProxy   = "kube-proxy"
 	ComponentKubelet = "kubelet"
 )
 
-// KubernetesComponents lists the components in upgrade order.
+// KubernetesComponents lists the components a config names an image for, in upgrade order.
 var KubernetesComponents = []string{
 	ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentProxy, ComponentKubelet,
 }
 
-// Runs reports whether Talos runs the component on a node. What it does not run has no image to
-// pull and nothing to be seen running.
-func Runs(component string) bool { return component != ComponentProxy }
+// KubernetesTurns lists the components that have turns, in upgrade order: the ones Talos runs.
+var KubernetesTurns = []string{ComponentAPIServer, ComponentControllerManager, ComponentScheduler, ComponentKubelet}
+
+// Changes lists the components whose image a component's turn changes, its own first: the
+// kubelet's also brings the kube-proxy image of a control plane's config along.
+func Changes(component string) []string {
+	if component == ComponentKubelet {
+		return []string{ComponentKubelet, ComponentProxy}
+	}
+
+	return []string{component}
+}
+
+// TurnImages is the image a turn brings each component it changes to, by component, from an
+// operation's targets.
+func TurnImages(targets map[string]string, key string) map[string]string {
+	component, machine := SplitTurn(key)
+	images := map[string]string{}
+
+	for _, c := range Changes(component) {
+		if image, ok := targets[TurnKey(c, machine)]; ok {
+			images[c] = image
+		}
+	}
+
+	return images
+}
 
 // TurnKey names one turn of a Kubernetes upgrade: one component on one machine.
 func TurnKey(component, machine string) string { return component + "/" + machine }
@@ -257,9 +282,10 @@ type KubernetesSettings struct {
 
 // KubernetesUpgrade is the planner's answer to "is a Kubernetes upgrade due, and may it start?".
 // Its turns are one component on one machine each: the API server on every control plane, then
-// the controller manager, the scheduler, the kube-proxy image of each control plane's config, and
-// the kubelet on control planes and then on workers. Its targets are the images the components
-// are to name. Held lists the workers that need the upgrade and are on hold.
+// the controller manager, the scheduler, and the kubelet on control planes and then on workers,
+// which brings the kube-proxy image of a control plane's config along. Its targets are the images
+// the components are to name, by TurnKey, kube-proxy's included. Held lists the workers that need
+// the upgrade and are on hold.
 type KubernetesUpgrade struct {
 	Due
 	Hop KubernetesHop
@@ -303,20 +329,39 @@ func PlanKubernetes(machines []KubernetesMachine, s KubernetesSettings, p Pass) 
 		return out
 	}
 
-	for _, component := range KubernetesComponents {
+	for _, component := range KubernetesTurns {
 		for _, m := range ordered {
-			image, has := m.Images[component]
-			if !m.Current || !has {
+			if _, has := m.Images[component]; !m.Current || !has {
 				continue
 			}
 
-			target := out.Hop.target(image)
-			if image.Live == target {
-				continue
+			// What the turn brings each image it changes to, and which of them are not there yet.
+			targets, changes, downgrade := map[string]string{}, []string(nil), false
+
+			for _, c := range Changes(component) {
+				image, has := m.Images[c]
+				if !has {
+					continue
+				}
+
+				target := out.Hop.target(image)
+				targets[c] = target
+
+				if image.Live == target {
+					continue
+				}
+
+				if live, _ := ImageVersion(image.Live); version.MustParseGeneric(out.Hop.Version).LessThan(live) {
+					downgrades = append(downgrades, fmt.Sprintf("%s runs %s %s", m.Name, c, core(live)))
+					downgrade = true
+
+					continue
+				}
+
+				changes = append(changes, TurnKey(c, m.Name)+" "+image.Live+" "+target)
 			}
 
-			if live, _ := ImageVersion(image.Live); version.MustParseGeneric(out.Hop.Version).LessThan(live) {
-				downgrades = append(downgrades, fmt.Sprintf("%s runs %s %s", m.Name, component, core(live)))
+			if downgrade || len(changes) == 0 {
 				continue
 			}
 
@@ -330,10 +375,12 @@ func PlanKubernetes(machines []KubernetesMachine, s KubernetesSettings, p Pass) 
 				continue
 			}
 
-			key := TurnKey(component, m.Name)
-			out.Pending = append(out.Pending, key)
-			out.Targets[key] = target
-			lines = append(lines, key+" "+image.Live+" "+target)
+			out.Pending = append(out.Pending, TurnKey(component, m.Name))
+			for c, target := range targets {
+				out.Targets[TurnKey(c, m.Name)] = target
+			}
+
+			lines = append(lines, changes...)
 		}
 	}
 
