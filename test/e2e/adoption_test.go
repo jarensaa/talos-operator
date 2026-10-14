@@ -1492,8 +1492,9 @@ var _ = Describe("Adoption and config management", Ordered, func() {
 		By("waiting for the upgrade to go through every component on every node")
 		// The API server is restarted on the way, and with a single control plane nothing answers
 		// meanwhile: the test, like the operator, simply asks again.
-		// Four images in a control plane's config besides the kubelet's, and a kubelet on every node.
-		turns := 4*len(controlPlanes) + len(nodes)
+		// Three components on every control plane besides the kubelet, and a kubelet on every node,
+		// which brings the kube-proxy image of a control plane's config along.
+		turns := 3*len(controlPlanes) + len(nodes)
 		Eventually(func(g Gomega) {
 			refresh(ctx, g)
 			if op := tc.Status.Operation; op != nil {
