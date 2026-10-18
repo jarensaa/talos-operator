@@ -30,6 +30,10 @@ const (
 	maxHealthMessage = 512
 )
 
+// maxHaltedMessage is how much of a failure's message a Halted Event quotes: an Event's message
+// holds 1 KiB, and the rest of it names where the operation halted and the token.
+const maxHaltedMessage = 640
+
 // observeHealth reads what Talos itself says about the node (docs/scope.md §14.2). Each part
 // describes a moment, so it is there only when it was read in this pass: nil when nothing was.
 func observeHealth(tgt talos.Reader, reads *nodeReads) *talosv1alpha1.NodeHealth {

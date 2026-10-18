@@ -92,7 +92,7 @@ The timings are in `spec.rollout`. A node takes at least `soak`, whatever the ch
 
 ### When a node doesn't come out healthy
 
-The operator doesn't confirm, Talos puts the previous config back, and the rollout halts. No other node is touched. `RolloutBlocked` is true with reason `OperationFailed`, and `status.operation.failure` says what happened and what you can do. Each option is an annotation that carries the failure's token:
+The operator doesn't confirm, Talos puts the previous config back, and the rollout halts. No other node is touched. `RolloutBlocked` is true with reason `OperationFailed`, and `status.operation.failure` says what happened (`message`, `reason`) and what you can do (`remediation`), with the failure's `token`. The `RolloutHalted` Event names the token too, but not the remediation: an Event holds 1 KiB. Each option is an annotation that carries the token:
 
 ```bash
 TOKEN=$(kubectl -n talos-operator get taloscluster my-cluster -o jsonpath='{.status.operation.failure.token}')

@@ -406,7 +406,10 @@ var _ = Describe("Config rollout", func() {
 			Expect(h.blocked().Reason).To(Equal(talosv1alpha1.ReasonOperationFailed))
 			Expect(h.inSync().Reason).To(Equal(talosv1alpha1.ReasonOperationFailed))
 			Expect(h.tc.Status.Phase).To(Equal(talosv1alpha1.ClusterPhaseDegraded))
-			Expect(drain(h.recorder)).To(ContainElement(ContainSubstring("RolloutHalted")))
+			halted := ContainSubstring("RolloutHalted")
+			Expect(drain(h.recorder)).To(ContainElement(SatisfyAll(halted, ContainSubstring(f.Token),
+				Not(ContainSubstring(f.Remediation)), WithTransform(func(e string) int { return len(e) }, BeNumerically("<=", 1024)))),
+				"the Event names the token and leaves the remediation to status, within what an Event holds")
 
 			live := h.scenario.Node(workerAddr)
 			Expect(string(live.Config.Active)).NotTo(ContainSubstring(deadResolver), "the node is back on its previous config")
