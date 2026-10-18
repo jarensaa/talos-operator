@@ -341,7 +341,7 @@ It reads the TalosCluster, TalosMachinePool, TalosMachine and TalosMachineConfig
 - with `--base`, the manifests as they were before the change, the step is one that can be taken: no downgrade, no jump Talos does not make;
 - the installer exists, for the cluster and for every pool with a schematic of its own, extensions included, and so do the Kubernetes images;
 - maintenance windows and gate expressions can be understood;
-- every machine's config renders, with secrets made up for the purpose. A machine whose config comes partly from a Secret is not rendered, and is named;
+- every machine's config renders, with secrets made up for the purpose. The config sources that come from a Secret, which the check does not have, are left out: the machine is rendered without them and named, and the rest of its config is checked all the same;
 - no document has a field the API does not know, which the API server would drop without a word.
 
 It exits with 1 when something is wrong, and with 2 when the files cannot be read. If a service it asks does not answer, that is a failure too; `--offline` skips the questions. On GitHub Actions every problem is an annotation, and the run's summary lists the upgrades the change means.

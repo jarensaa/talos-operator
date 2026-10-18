@@ -544,22 +544,20 @@ func (c *check) renders() {
 
 			about := "TalosMachine " + named(tm)
 
-			if slices.ContainsFunc(adopt.ConfigSources(spec, &pool.Spec, &tm.Spec), func(src talosv1alpha1.ConfigSource) bool {
-				return src.SecretKeyRef != nil
-			}) {
-				c.findings = append(c.findings, Finding{Object: about, Skipped: true,
-					Message: "part of its config comes from a Secret, which this check does not have, so it was not rendered"})
-
-				continue
+			tc, pool, tm, fromSecrets := withoutSecrets(c.tc, pool, tm)
+			if fromSecrets > 0 {
+				c.findings = append(c.findings, Finding{Object: about, Skipped: true, Message: fmt.Sprintf(
+					"%d of its config sources come from a Secret, which this check does not have: it was rendered without them, "+
+						"and what they hold was not checked", fromSecrets)})
 			}
 
-			rendering, problem, err := controller.RenderMachine(c.ctx, reader, c.tc, pool, tm)
+			rendering, problem, err := controller.RenderMachine(c.ctx, reader, tc, pool, tm)
 			if err != nil {
 				problem = err.Error()
 			}
 
 			if problem != "" {
-				c.findings = append(c.findings, Finding{Object: about, Message: "its config does not render: " + problem})
+				c.findings = append(c.findings, Finding{Object: about, Message: "its config does not render: " + problem + withoutThem(fromSecrets)})
 
 				continue
 			}
@@ -612,19 +610,19 @@ func (c *check) alone(reader client.Reader) (images []string, why string) {
 	pool := &talosv1alpha1.TalosMachinePool{Spec: talosv1alpha1.TalosMachinePoolSpec{Role: talosv1alpha1.MachineRoleControlPlane}}
 	tm := &talosv1alpha1.TalosMachine{ObjectMeta: metav1.ObjectMeta{Namespace: c.tc.Namespace}}
 
-	if slices.ContainsFunc(adopt.ConfigSources(&c.tc.Spec, &pool.Spec, &tm.Spec), func(src talosv1alpha1.ConfigSource) bool {
-		return src.SecretKeyRef != nil
-	}) {
-		return nil, "part of the cluster's own config comes from a Secret, which this check does not have"
+	tc, pool, tm, fromSecrets := withoutSecrets(c.tc, pool, tm)
+	if fromSecrets > 0 {
+		c.skipped(fmt.Sprintf("%d of the cluster's own config sources come from a Secret, which this check does not have: "+
+			"a control plane was rendered without them, and an image they name was not looked for", fromSecrets))
 	}
 
-	rendering, problem, err := controller.RenderMachine(c.ctx, reader, c.tc, pool, tm)
+	rendering, problem, err := controller.RenderMachine(c.ctx, reader, tc, pool, tm)
 	if err != nil {
 		problem = err.Error()
 	}
 
 	if problem != "" {
-		return nil, "a control plane does not render from the cluster alone (" + problem + ")"
+		return nil, "a control plane does not render from the cluster alone (" + problem + withoutThem(fromSecrets) + ")"
 	}
 
 	named, err := talos.KubernetesImages(rendering.Bytes)
@@ -639,6 +637,33 @@ func (c *check) alone(reader client.Reader) (images []string, why string) {
 	}
 
 	return images, ""
+}
+
+// withoutSecrets returns copies of a machine, its pool and its cluster without the config sources
+// that come from a Secret, which this check does not have, and how many it left out. What the
+// other sources hold is checked all the same.
+func withoutSecrets(tc *talosv1alpha1.TalosCluster, pool *talosv1alpha1.TalosMachinePool, tm *talosv1alpha1.TalosMachine,
+) (*talosv1alpha1.TalosCluster, *talosv1alpha1.TalosMachinePool, *talosv1alpha1.TalosMachine, int) {
+	tc, pool, tm = tc.DeepCopy(), pool.DeepCopy(), tm.DeepCopy()
+	left := 0
+
+	for _, sources := range []*[]talosv1alpha1.ConfigSource{&tc.Spec.Config, &pool.Spec.Config, &tm.Spec.Config} {
+		before := len(*sources)
+		*sources = slices.DeleteFunc(*sources, func(src talosv1alpha1.ConfigSource) bool { return src.SecretKeyRef != nil })
+		left += before - len(*sources)
+	}
+
+	return tc, pool, tm, left
+}
+
+// withoutThem says, after why a config does not render, that it was rendered without the sources
+// from Secrets, if there were any: a document there may be what the others need.
+func withoutThem(fromSecrets int) string {
+	if fromSecrets == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf(" (rendered without its %d config source(s) from a Secret, which may be why)", fromSecrets)
 }
 
 // files answers the reads of rendering from the manifests: the shared configs they hold, and the
