@@ -92,8 +92,9 @@ type Reader interface {
 	// SecureBootDB returns what node's firmware trusts to boot: the certificates and image hashes
 	// in its signature database. It is read from the one file of a node the operator may read.
 	SecureBootDB(ctx context.Context, node netip.Addr) (SecureBootDB, error)
-	// Logs returns the end of the log of one of node's Talos services: its last lines, and of
-	// those the last 128 KiB.
+	// Logs returns the end of the log of one of node's Talos services: its last lines (all it
+	// keeps when lines is negative), without Talos's records of reads it answered, and of those
+	// the last 128 KiB.
 	Logs(ctx context.Context, node netip.Addr, service string, lines int32) ([]byte, error)
 	// Dmesg returns the end of node's kernel log.
 	Dmesg(ctx context.Context, node netip.Addr) ([]byte, error)
