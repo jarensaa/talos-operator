@@ -519,7 +519,7 @@ func (r *TalosClusterReconciler) kubernetesStep(ctx context.Context, tc *talosv1
 	op := tc.Status.Operation
 	cur := op.Current
 	now := r.now()
-	s, node := stepOf(cur), stepNode(v)
+	s, node := stepOf(cur), withServices(ctx, obs, v, cur, stepNode(v))
 
 	// A node nothing was sent to is left alone while the upgrade is held back. The step is
 	// dropped; the turn begins again later.

@@ -107,6 +107,8 @@ kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github
 kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/abort=$TOKEN
 ```
 
+A node that is back on its previous config is only reported as `RolledBack` once its container runtime and kubelet run again, and etcd on a control plane. When they don't, within the step timeout, the reason is `RolledBackUnhealthy` and the message names them: the change broke the node in a way its revert did not undo, or the node was unhealthy before. It needs repair, often a reboot, before anything else.
+
 After an abort the same change isn't started again. Change the spec, or revert it, and the operator rolls out whatever it renders then.
 
 **What the node said.** When an operation halts at a machine, the operator asks that machine for the state of its Talos services and the end of their logs and of the kernel's, and keeps them in a Secret. `status.operation.failure.bundle` names it:

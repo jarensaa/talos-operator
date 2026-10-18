@@ -17,6 +17,7 @@ limitations under the License.
 package plan
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -187,9 +188,41 @@ func TestTryThatCutsTheNodeOffIsNeverConfirmed(t *testing.T) {
 		t.Fatalf("expected to wait out the grace period, got %s", got.Kind)
 	}
 
-	got := NextStep(step, on(prev, ""), open, open, timing, step.Deadline.Add(RollbackGrace))
+	back := on(prev, "")
+	back.ServicesRead = true
+
+	got := NextStep(step, back, open, open, timing, step.Deadline.Add(RollbackGrace))
 	if got.Kind != Fail || got.Reason != FailRolledBack {
 		t.Fatalf("expected RolledBack, got %+v", got)
+	}
+
+	// Back on its previous config without the services it needs is not back: the node is given
+	// the step's timeout for them, and then it is said that it did not recover.
+	broken := back
+	broken.ServicesDown = "kubelet does not run"
+
+	for _, after := range []time.Duration{RollbackGrace, RollbackGrace + timing.StepTimeout - time.Second} {
+		if got := NextStep(step, broken, open, open, timing, step.Deadline.Add(after)); got.Kind != Wait {
+			t.Fatalf("after %s: a node whose services do not run yet must be waited for, got %+v", after, got)
+		}
+	}
+
+	got = NextStep(step, broken, open, open, timing, step.Deadline.Add(RollbackGrace+timing.StepTimeout))
+	if got.Kind != Fail || got.Reason != FailRolledBackUnhealthy || !strings.Contains(got.Message, "kubelet does not run") {
+		t.Fatalf("expected RolledBackUnhealthy naming the kubelet, got %+v", got)
+	}
+
+	// Services that were not read are not known to run.
+	unread := on(prev, "")
+	unread.ServicesUnread = "services: unavailable"
+
+	if got := NextStep(step, unread, open, open, timing, step.Deadline.Add(RollbackGrace)); got.Kind != Wait {
+		t.Fatalf("a node whose services were not read must not be reported as back, got %+v", got)
+	}
+
+	got = NextStep(step, unread, open, open, timing, step.Deadline.Add(RollbackGrace+timing.StepTimeout))
+	if got.Kind != Fail || got.Reason != FailRolledBackUnhealthy || !strings.Contains(got.Message, "services: unavailable") {
+		t.Fatalf("expected RolledBackUnhealthy saying the services were not read, got %+v", got)
 	}
 
 	// The node never returns: this needs a human.

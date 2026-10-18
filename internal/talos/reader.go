@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"time"
 )
 
@@ -199,6 +200,41 @@ type ServiceStatus struct {
 	Healthy bool
 	// Unknown is true when the service has no health check.
 	Unknown bool
+}
+
+// The IDs Talos gives the services a node cannot do its work without.
+const (
+	ServiceCRI     = "cri"
+	ServiceKubelet = "kubelet"
+	ServiceEtcd    = "etcd"
+)
+
+// ServicesDown names, of the services a node of machineType cannot do its work without, those
+// that do not run or are not healthy in services, as Reader.Services read them: the container
+// runtime of its workloads and the kubelet on every node, and etcd on a control plane. Talos
+// keeps a service's resource only while the service runs (controllers/v1alpha1/service.go:72-92
+// in Talos v1.14), so one that is missing does not run. A service without a health check is as
+// healthy as running makes it.
+func ServicesDown(machineType string, services []ServiceStatus) []string {
+	needed := []string{ServiceCRI, ServiceKubelet}
+	if machineType == MachineTypeControlPlane {
+		needed = append(needed, ServiceEtcd)
+	}
+
+	var down []string
+
+	for _, id := range needed {
+		i := slices.IndexFunc(services, func(s ServiceStatus) bool { return s.ID == id })
+
+		switch {
+		case i < 0 || !services[i].Running:
+			down = append(down, id+" does not run")
+		case !services[i].Healthy && !services[i].Unknown:
+			down = append(down, id+" is not healthy")
+		}
+	}
+
+	return down
 }
 
 // MachineConfigs holds a node's machine config as Talos stores it.

@@ -428,6 +428,30 @@ var _ = Describe("Config rollout", func() {
 			Expect(h.operation().Failure.Reason).To(Equal(plan.FailRolledBack))
 		})
 
+		It("does not report a node back on its previous config as recovered while its kubelet does not run", func() {
+			deadline := windowPasses()
+			h.expireTry(worker1)
+
+			// The revert raced a restart: Talos lost the kubelet, so it no longer lists it.
+			h.scenario.UpdateNode(workerAddr, func(n *fake.Node) {
+				n.Services = []talos.ServiceStatus{{ID: talos.ServiceCRI, Running: true, Healthy: true}}
+			})
+
+			h.at(deadline.Add(plan.RollbackGrace + plan.DefaultStepTimeout - time.Second))
+			Expect(h.failed()).To(BeFalse(), "the node gets stepTimeout for its services to come back")
+			Expect(h.operation().Current.Step).To(Equal(plan.StepRollingBack))
+
+			h.at(deadline.Add(plan.RollbackGrace + plan.DefaultStepTimeout))
+			Expect(h.failed()).To(BeTrue())
+
+			f := h.operation().Failure
+			Expect(f.Reason).To(Equal(plan.FailRolledBackUnhealthy))
+			Expect(f.Message).To(ContainSubstring("kubelet does not run"))
+			Expect(f.Remediation).To(ContainSubstring("not the services it needs"))
+			Expect(f.Remediation).NotTo(ContainSubstring("did not stay healthy under the new one"))
+			Expect(h.applies()).To(Equal([]string{tried(worker1)}), "nothing else is sent to the node")
+		})
+
 		It("escalates when the node does not come back on its previous config", func() {
 			deadline := windowPasses()
 
@@ -786,10 +810,14 @@ var _ = Describe("Config rollout", func() {
 
 		h.expireTry(worker2)
 		h.at(deadline.Add(plan.RollbackGrace))
+		Expect(h.failed()).To(BeFalse(), "a node back on its previous config whose kubelet is not healthy is waited for")
 
+		// It was unhealthy before, and is after: back on its previous config is not back.
+		h.at(deadline.Add(plan.RollbackGrace + plan.DefaultStepTimeout))
 		Expect(h.failed()).To(BeTrue())
 		Expect(h.operation().Failure.Machine).To(Equal(worker2))
-		Expect(h.operation().Failure.Reason).To(Equal(plan.FailRolledBack))
+		Expect(h.operation().Failure.Reason).To(Equal(plan.FailRolledBackUnhealthy))
+		Expect(h.operation().Failure.Message).To(ContainSubstring("kubelet is not healthy"))
 		Expect(h.applies()).To(Equal([]string{tried(worker2)}), "never confirmed, and worker-1 never touched")
 
 		h.advance(time.Hour)

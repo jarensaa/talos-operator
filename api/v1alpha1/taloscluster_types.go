@@ -740,7 +740,7 @@ type OperationFailure struct {
 	// Remediation suggests the next human action.
 	// +optional
 	Remediation string `json:"remediation,omitempty"`
-	// Reason is a machine-readable cause, e.g. RolledBack or NodeUnreachableAfterRollback.
+	// Reason is a machine-readable cause, e.g. RolledBack, RolledBackUnhealthy or NodeUnreachableAfterRollback.
 	// +optional
 	Reason string `json:"reason,omitempty"`
 	// Hook is the stage of the hook that failed, if a hook did.

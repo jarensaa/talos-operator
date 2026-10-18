@@ -941,6 +941,7 @@ The operator applies **every** config change this way (§6.3). The protocol for 
 If the node is not verified in time, the operator does **not** confirm.
 - It stops hoping 30s before the deadline (`RollingBack`), waits until 30s after it, then requires the node to be reachable on `previousHash`.
 - It then marks the operation failed with reason `RolledBack` and halts (§8.3) before any other node is touched.
+- Back on `previousHash` is not yet recovered: a revert restarts what the try restarted, and one that goes wrong leaves the node on its old config without its kubelet or its container runtime. So the services the node needs (`cri` and `kubelet`, and `etcd` on a control plane) are read then, and a service Talos does not list does not run. The failure is `RolledBack` only once they run; until `stepTimeout` after the grace they are waited for, and then the failure is `RolledBackUnhealthy`, which names them, or says they could not be read. Its remediation does not claim the node is fine.
 - A standby replica that takes over mid-protocol resumes from the persisted step and follows the same rules: what to do next is decided from the step and what the node reports, never from memory.
 - A confirm that did land, but whose answer was lost, is recognised by the read-back even after the deadline.
 - If the node does not come back on `previousHash` within `stepTimeout`, the failure is `NodeUnreachableAfterRollback`. This needs a human, because Talos's revert is only logged if it fails (`config rollback failed`).
