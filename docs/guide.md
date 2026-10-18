@@ -193,7 +193,7 @@ spec:
       secureBoot: true
 ```
 
-A pool can set `installer.secureBoot` for its own machines, either way, if only some machines have Secure Boot on. Adoption reads the setting from the installer your nodes' configs name. The signed installer also boots on a machine without Secure Boot.
+A pool can set `installer.secureBoot` for its own machines, either way, if only some machines have Secure Boot on. Adoption reads the setting from the installer your nodes' configs name. If those name the unsigned installer while the machines boot with Secure Boot on, the `InstallerBootable` condition of the TalosCluster says so before any upgrade is asked for, and names the machines. The signed installer also boots on a machine without Secure Boot.
 
 **The firmware has to trust who signed it.** A machine that was installed from Talos's Secure Boot ISO with its firmware in setup mode has Image Factory's certificate enrolled. A machine that was booted some other way, with each image approved by hand, trusts those images by their hash and nothing else. It runs fine, and it will not boot the next image. The operator finds that out before the upgrade starts: it reads the firmware's signature database from the node, asks Image Factory for its signing certificate, and compares.
 
@@ -619,6 +619,7 @@ The metrics endpoint is HTTPS and asks the Kubernetes API whether the scraper ma
 | `TalosConfigDrift` | warning | A node no longer runs the config the operator applied, and `driftPolicy: Report` leaves it so. |
 | `TalosNodeWithoutMachine` | warning | The cluster has a node that no TalosMachine describes. |
 | `TalosVersionsUnreachable` | warning | The spec asks for versions there is no way to. |
+| `TalosInstallerNotBootable` | warning | A machine's firmware has Secure Boot on and its spec names the unsigned installer: no upgrade of it can start. |
 | `TalosClusterUnhealthy` | warning | Talos's own health check has failed for 15 minutes. |
 | `TalosMachineNotObserved` | warning | The operator has not been able to read a node for 10 minutes. |
 | `TalosMachineNotReady` | warning | A node answers and has not been ready for 15 minutes. |

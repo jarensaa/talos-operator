@@ -351,6 +351,33 @@ var _ = Describe("Talos upgrade", func() {
 			}
 		})
 
+		It("says at rest that a firmware with Secure Boot on would not boot the unsigned installer, and asks nobody", func() {
+			// The installer the spec names is the plain one, as on a cluster adopted from configs that
+			// name it while its nodes boot a signed image: nothing is due, and nothing could be.
+			h.advance(time.Minute)
+
+			c := condition(h.tc, talosv1alpha1.ConditionInstallerBootable)
+			Expect(c).NotTo(BeNil())
+			Expect(c.Status).To(Equal(metav1.ConditionFalse))
+			Expect(c.Reason).To(Equal(talosv1alpha1.ReasonIncompatible))
+			Expect(c.Message).To(ContainSubstring("/metal-installer/"))
+			Expect(c.Message).To(ContainSubstring("is not signed"))
+			for _, n := range rolloutNodes {
+				Expect(c.Message).To(ContainSubstring(n.name))
+			}
+
+			Expect(factory.Asked).To(BeZero(), "the Image Factory is asked only when an upgrade starts")
+			Expect(h.scenario.CallsFor(fake.MethodSecureBootDB)).To(BeEmpty())
+			untouched()
+
+			h.updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.ConfigGeneration.Installer.SecureBoot = true })
+			h.advance(time.Minute)
+
+			c = condition(h.tc, talosv1alpha1.ConditionInstallerBootable)
+			Expect(c.Status).To(Equal(metav1.ConditionTrue))
+			Expect(factory.Asked).To(BeZero())
+		})
+
 		It("refuses to touch any node while one would not boot the new system, and upgrades them all once it would", func() {
 			firmware(worker2, pinned())
 

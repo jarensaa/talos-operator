@@ -48,6 +48,11 @@ const (
 	// ConditionTalosUpToDate reports whether every node runs the Talos version and installer its
 	// spec asks for (docs/scope.md §7.3).
 	ConditionTalosUpToDate = "TalosUpToDate"
+	// ConditionInstallerBootable reports whether every member's firmware would boot the installer
+	// its spec names, as far as the cluster itself tells: one with Secure Boot on does not boot the
+	// unsigned installer. Whether it trusts the certificate a signed one is signed with is asked
+	// only when an upgrade starts (docs/scope.md §7.3).
+	ConditionInstallerBootable = "InstallerBootable"
 	// ConditionKubernetesUpToDate reports whether every node's config names, and every node runs,
 	// the Kubernetes version its spec asks for (docs/scope.md §7.4).
 	ConditionKubernetesUpToDate = "KubernetesUpToDate"
