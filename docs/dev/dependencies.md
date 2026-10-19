@@ -26,6 +26,7 @@ Dependabot proposes the bumps (`.github/dependabot.yml`): weekly, a few days aft
 - **A new minor of machinery** is a new Talos to support, not a bump. It arrives as a pull request of its own and stays open until the work is done: the config version contract, the versions the e2e runs, and the table above.
 - **`k8s.io/*` and controller-runtime** move together, in one pull request. The envtest binaries follow them: the `Makefile` reads their version from `go.mod`.
 - **GitHub Actions and the release tooling** are committed as `ci` and `chore`, and release nothing.
+- **The release tooling is judged by `pnpm test:release`**, which runs the plugins `.releaserc.json` configures on sample commits and writes their release notes, as the release job does. A bump of one of them that the others cannot work with fails there, on its pull request, and not in the release after it was merged: a major of `conventional-changelog-conventionalcommits` that needs a newer changelog writer than the stable `@semantic-release/release-notes-generator` loads waits until the generator has one.
 
 **What merges by itself** (`.github/workflows/dependabot-merge.yml`), once every required check has passed:
 
