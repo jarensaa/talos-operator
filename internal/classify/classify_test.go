@@ -365,3 +365,78 @@ func TestClassifyADocumentAsAWhole(t *testing.T) {
 		}
 	}
 }
+
+// Talos can lose the kubelet when one change restarts it and the container runtime at once, in
+// the try and again in its revert: such a change is not rolled out. Either of them alone is.
+func TestAChangeThatRestartsTheRuntimeAndTheKubeletIsRefused(t *testing.T) {
+	bundle := talostest.Bundle(t)
+	base := rendered(t, bundle)
+
+	const (
+		customization = "apiVersion: v1alpha1\nkind: CRICustomizationConfig\nname: runsc\n" +
+			"content: |\n  [plugins.\"io.containerd.cri.v1.runtime\".containerd.runtimes.runsc]\n    runtime_type = \"io.containerd.runsc.v1\"\n"
+		runtimeSpec = "apiVersion: v1alpha1\nkind: CRIBaseRuntimeSpecConfig\noverrides:\n  process:\n    rlimits:\n" +
+			"      - type: RLIMIT_NOFILE\n        hard: 1024\n        soft: 1024\n"
+		auth    = "apiVersion: v1alpha1\nkind: RegistryAuthConfig\nname: registry.example.com\nusername: user\npassword: secret\n"
+		mirror  = "apiVersion: v1alpha1\nkind: RegistryMirrorConfig\nname: docker.io\nendpoints:\n  - url: https://mirror.example.com\n"
+		kubelet = "apiVersion: v1alpha1\nkind: KubeletConfig\nextraArgs:\n  max-pods: \"200\"\n"
+		label   = "apiVersion: v1alpha1\nkind: KubeNodeConfig\nlabels:\n  example.com/zone: a\n"
+		taint   = "apiVersion: v1alpha1\nkind: KubeNodeConfig\ntaints:\n  example.com/dedicated: gpu:NoSchedule\n"
+
+		legacyPart = "machine:\n  files:\n    - path: /etc/cri/conf.d/20-customization.part\n      op: create\n" +
+			"      content: |\n        [plugins]\n"
+		legacyFile = "machine:\n  files:\n    - path: /var/etc/example\n      op: create\n      content: example\n"
+		legacyAuth = "machine:\n  registries:\n    config:\n      registry.example.com:\n        auth:\n          username: user\n"
+	)
+
+	tests := []struct {
+		name    string
+		patches []string
+		want    classify.Class
+		reasons []string
+	}{
+		{"a CRI customization alone", []string{customization}, classify.LiveSafe, nil},
+		{"a kubelet argument alone", []string{kubelet}, classify.LiveSafe, nil},
+		{"a CRI customization and a kubelet argument", []string{customization, kubelet}, classify.RestartsTogether,
+			[]string{"restarts cri: v1alpha1/CRICustomizationConfig/runsc", "restarts kubelet: v1alpha1/KubeletConfig"}},
+		{"the base runtime spec and a kubelet argument", []string{runtimeSpec, kubelet}, classify.RestartsTogether,
+			[]string{"restarts cri: v1alpha1/CRIBaseRuntimeSpecConfig"}},
+		{"a registry's credentials and a kubelet argument", []string{auth, kubelet}, classify.RestartsTogether,
+			[]string{"restarts cri: v1alpha1/RegistryAuthConfig/registry.example.com"}},
+		// Mirrors are in containerd's hosts directory, which it reads without a restart.
+		{"a registry mirror and a kubelet argument", []string{mirror, kubelet}, classify.LiveSafe, nil},
+		// Labels are put on the Node through the API; taints are part of how the kubelet registers.
+		{"a CRI customization and a node label", []string{customization, label}, classify.LiveSafe, nil},
+		{"a CRI customization and a node taint", []string{customization, taint}, classify.RestartsTogether,
+			[]string{"restarts kubelet: v1alpha1/KubeNodeConfig: taints.example.com/dedicated"}},
+		// The legacy document's forms of them restart the runtime the same way.
+		{"the legacy CRI customization and a kubelet argument", []string{legacyPart, kubelet}, classify.RestartsTogether,
+			[]string{"restarts cri: v1alpha1: machine.files[path=/etc/cri/conf.d/20-customization.part]"}},
+		{"another legacy file and a kubelet argument", []string{legacyFile, kubelet}, classify.LiveSafe, nil},
+		{"legacy registry credentials and a node taint", []string{legacyAuth, taint}, classify.RestartsTogether,
+			[]string{"restarts cri: v1alpha1: machine.registries.config.registry.example.com.auth.username"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := classify.Classify(base, rendered(t, bundle, tt.patches...))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if got.Class != tt.want {
+				t.Fatalf("class: got %q (%v), want %q", got.Class, got.Reasons, tt.want)
+			}
+
+			for _, reason := range tt.reasons {
+				if !slices.Contains(got.Reasons, reason) {
+					t.Fatalf("reasons %q lack %q", got.Reasons, reason)
+				}
+			}
+
+			if got.Class == classify.RestartsTogether && !got.Class.Blocked() {
+				t.Fatal("a change that restarts both must not be rolled out")
+			}
+		})
+	}
+}

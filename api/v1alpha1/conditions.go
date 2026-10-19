@@ -146,10 +146,13 @@ const (
 	ReasonOperationFailed   = "OperationFailed"
 	ReasonProtectedChange   = "ProtectedChange"
 	ReasonRequiresReinstall = "RequiresReinstall"
-	ReasonAwaitingApproval  = "AwaitingApproval"
-	ReasonAborted           = "Aborted"
-	ReasonGateClosed        = "GateClosed"
-	ReasonInvalidRollout    = "InvalidRollout"
+	// ReasonRestartsTogether: a change restarts the container runtime and the kubelet at once,
+	// which a rollout does not apply; it is to be made as two changes (docs/scope.md §6.3).
+	ReasonRestartsTogether = "RestartsTogether"
+	ReasonAwaitingApproval = "AwaitingApproval"
+	ReasonAborted          = "Aborted"
+	ReasonGateClosed       = "GateClosed"
+	ReasonInvalidRollout   = "InvalidRollout"
 	// ReasonAwaitingUpgrade: the config names another installer image than a node runs, which a
 	// Talos upgrade brings about, not a config rollout.
 	ReasonAwaitingUpgrade = "AwaitingUpgrade"

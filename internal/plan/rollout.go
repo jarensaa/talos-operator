@@ -150,6 +150,9 @@ func PlanRollout(machines []Machine, s Settings, p Pass) Rollout {
 		classBlock(pending, classify.Protected, BlockProtected, "protected config would change, which the operator never does"),
 		classBlock(pending, classify.BootTime, BlockRequiresReinstall,
 			"the change only takes effect through a reinstall, which is not supported yet"),
+		classBlock(pending, classify.RestartsTogether, BlockRestartsTogether,
+			"the change restarts the container runtime and the kubelet at once, and Talos can lose the kubelet when "+
+				"it restarts both, in the try and again in its revert; make it as two changes, one restarting each"),
 		classBlock(pending, classify.Kubernetes, BlockAwaitingKubernetes,
 			"the config names another version of a Kubernetes component than the node runs, which a "+
 				"Kubernetes upgrade brings about, in its own order (spec.management.upgrades)"),

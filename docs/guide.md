@@ -117,7 +117,7 @@ After an abort the same change isn't started again. Change the spec, or revert i
 kubectl -n talos-operator get secret my-cluster-support-bundle -o jsonpath='{.data.kubelet\.log\.gz}' | base64 -d | gunzip
 ```
 
-It holds `failure.txt` (what failed, and what could not be read), `services.txt`, `dmesg.log.gz`, and a log each of `machined`, `apid`, `kubelet` and `cri`, and of `etcd` on a control plane. Each log is its last 500 lines. A few things to know:
+It holds `failure.txt` (what failed, and what could not be read), `services.txt`, `dmesg.log.gz`, and a log each of `machined`, `apid`, `kubelet` and `cri`, and of `etcd` on a control plane. Each log is the end of what Talos keeps of it, at most 128 KiB, without the lines that only record a read Talos answered, so what happened when the step failed is still there. A few things to know:
 
 - There is one bundle per cluster. The next failure overwrites it, and it goes when the TalosCluster does.
 - A node that does not answer has nothing to say. The operator tries for five minutes after the failure, and `bundle` then says why there is none (`not collected: ...`).
@@ -130,6 +130,7 @@ It holds `failure.txt` (what failed, and what could not be read), `services.txt`
 |---|---|
 | `ProtectedChange` | The change touches cluster identity: a CA, a token, the cluster name, a hostname. The operator never applies these. |
 | `RequiresReinstall` | The change only takes effect through a reinstall, such as a different installer image. Not supported yet. |
+| `RestartsTogether` | The change restarts both the container runtime and the kubelet on a node: a CRI customization, the base runtime spec or a registry's credentials, together with the kubelet's settings, a credential provider, or the node's taints or address. Talos can lose the kubelet when it restarts both at once, and the revert of the try races the same way. Make it as two changes, one after the other. |
 | `AwaitingApproval` | The change touches storage, or something the operator has no rule for. Review each machine's `status.config.diff`, then approve with the hash from `status.approval`: `kubectl annotate taloscluster my-cluster talos.jarensaa.github.io/approve-diff=<hash>`. The approval is for exactly that change. |
 | `GateClosed` | A node other than the one to be changed isn't healthy, or the cluster as a whole isn't, so no node is touched. The message says what is wrong. |
 | `Paused` | `spec.paused` is set. |

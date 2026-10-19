@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/siderolabs/talos/pkg/machinery/constants"
 	yaml "go.yaml.in/yaml/v4"
 
 	"github.com/jarensaa/talos-operator/internal/render"
@@ -60,6 +61,12 @@ const (
 	// (§7.3). As a config change it is applied once the node runs what the image installs, and
 	// then it changes nothing on the node: see Installed.
 	Installer Class = "Installer"
+	// RestartsTogether changes restart containerd and the kubelet at once. Talos stops both in the
+	// same moment, the kubelet through the containerd that is stopping, and can lose the kubelet:
+	// the old one keeps running outside Talos's supervision while Talos reports it failed, and the
+	// revert of the try restarts both again and races the same way. A config rollout does not
+	// apply such a change; it is to be made as two, one restarting each (restartKinds).
+	RestartsTogether Class = "RestartsTogether"
 	// Kubernetes changes name another image of a Kubernetes component: the API server, controller
 	// manager, scheduler, kube-proxy or kubelet. A config rollout never applies them: a Kubernetes
 	// upgrade does, one component at a time and the API servers first (§7.4).
@@ -73,8 +80,8 @@ const (
 
 // severity orders the classes.
 var severity = map[Class]int{
-	None: 0, LiveSafe: 1, ControlPlaneRestart: 2, Connectivity: 3, Storage: 4, Unknown: 5, Kubernetes: 6, Installer: 7, BootTime: 8,
-	Protected: 9,
+	None: 0, LiveSafe: 1, ControlPlaneRestart: 2, Connectivity: 3, Storage: 4, Unknown: 5, RestartsTogether: 6, Kubernetes: 7,
+	Installer: 8, BootTime: 9, Protected: 10,
 }
 
 // Worse reports whether c is more severe than other.
@@ -86,7 +93,7 @@ func (c Class) NeedsApproval() bool { return c == Storage || c == Unknown }
 // Blocked reports whether a config rollout does not apply the change: because the operator never
 // makes it, or because an upgrade has to bring the node there first.
 func (c Class) Blocked() bool {
-	return c == Protected || c == BootTime || c == Installer || c == Kubernetes
+	return c == Protected || c == BootTime || c == Installer || c == Kubernetes || c == RestartsTogether
 }
 
 // Change is the classification of the difference between two configs.
@@ -96,6 +103,19 @@ type Change struct {
 	// v1alpha1 document. Only the reasons of the most severe class are listed.
 	Reasons []string
 }
+
+// The kinds of the kubelet's documents, which more than one rule names.
+const (
+	kubeletKind  = "KubeletConfig"
+	kubeNodeKind = "KubeNodeConfig"
+)
+
+// The services Talos restarts for a config change that the classifier tells apart: the container
+// runtime of the workloads, and the kubelet.
+const (
+	restartsCRI     = "cri"
+	restartsKubelet = "kubelet"
+)
 
 // kindClasses classifies whole config documents by kind. A kind not listed is Unknown.
 var kindClasses = map[string]Class{
@@ -141,7 +161,7 @@ var kindClasses = map[string]Class{
 	"KubeAuditPolicyConfig": ControlPlaneRestart, "KubeAuthenticationConfig": ControlPlaneRestart,
 	"KubeAuthorizerConfig": ControlPlaneRestart,
 
-	"KubeNodeConfig": LiveSafe, "KubeletConfig": LiveSafe, "KubeCredentialProviderConfig": LiveSafe,
+	kubeNodeKind: LiveSafe, kubeletKind: LiveSafe, "KubeCredentialProviderConfig": LiveSafe,
 	// Talos applies the kube-proxy manifest once, when the cluster is bootstrapped, and never again
 	// (§12.20): what the config says about kube-proxy changes nothing that runs. Its image still
 	// belongs to the Kubernetes version (kubernetesKinds).
@@ -241,6 +261,7 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 	}
 
 	byClass := map[Class][]string{}
+	restarted := map[string][]string{}
 
 	note := func(class Class, reason string) {
 		if class == Installer {
@@ -267,6 +288,15 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 			continue
 		}
 
+		services, err := restarts(k, a, b, inLive && inDesired)
+		if err != nil {
+			return Change{}, fmt.Errorf("compare %s: %w", k, err)
+		}
+
+		for service, reason := range services {
+			restarted[service] = append(restarted[service], reason)
+		}
+
 		// A document only one of the configs has is classified as a whole.
 		whole := kindClass(k)
 
@@ -290,6 +320,14 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 		note(whole, string(k))
 	}
 
+	if len(restarted[restartsCRI]) > 0 && len(restarted[restartsKubelet]) > 0 {
+		for _, service := range []string{restartsCRI, restartsKubelet} {
+			for _, reason := range restarted[service] {
+				byClass[RestartsTogether] = append(byClass[RestartsTogether], "restarts "+service+": "+reason)
+			}
+		}
+	}
+
 	var out Change
 
 	for class, reasons := range byClass {
@@ -301,6 +339,140 @@ func Classify(live, desired *render.Config, opts ...Option) (Change, error) {
 	slices.Sort(out.Reasons)
 
 	return out, nil
+}
+
+// restartKinds are the documents any change of which restarts a service. Talos restarts the
+// container runtime when its config or the base runtime spec changes
+// (controllers/cri/service.go:96-110 in Talos v1.14); its config holds the CRI customizations and
+// the registries' credentials, but not their mirrors or TLS, which are in its hosts directory
+// (controllers/files/cri_config.go, containerd.GenerateCRIConfig). It restarts the kubelet when
+// the kubelet's spec changes (controllers/k8s/kubelet_service.go:213-244), which is made of the
+// kubelet's own document and the credential providers (controllers/k8s/kubelet_config.go:68-101).
+var restartKinds = map[string]string{
+	"CRICustomizationConfig": restartsCRI, "CRIBaseRuntimeSpecConfig": restartsCRI, "RegistryAuthConfig": restartsCRI,
+	kubeletKind: restartsKubelet, "KubeCredentialProviderConfig": restartsKubelet,
+}
+
+// kubeNodeRestarts are the fields of KubeNodeConfig the kubelet's spec is made of: how the node
+// registers, by which address, and with which taints (kubelet_config.go:91-95). Its labels and
+// annotations are put on the Node through the Kubernetes API instead.
+var kubeNodeRestarts = []string{"skipNodeRegistration", "registerWithFQDN", "nodeIP", "taints"}
+
+// restarts returns, of a document that differs between two configs, the services the difference
+// restarts, each with what restarts it. both is whether both configs have the document.
+func restarts(key render.DocKey, a, b []byte, both bool) (map[string]string, error) {
+	out := map[string]string{}
+
+	switch kind := key.Kind(); {
+	case restartKinds[kind] != "":
+		out[restartKinds[kind]] = string(key)
+	case kind == kubeNodeKind:
+		// One that appears or goes is compared with none: only its fields say what changes.
+		paths, err := changedPaths(orEmpty(a), orEmpty(b))
+		if err != nil {
+			return nil, err
+		}
+
+		for _, p := range paths {
+			if slices.ContainsFunc(kubeNodeRestarts, func(field string) bool { return underPath(p, field) }) {
+				out[restartsKubelet] = string(key) + ": " + p
+			}
+		}
+	case key == render.RootKey && both:
+		return rootRestarts(a, b)
+	}
+
+	return out, nil
+}
+
+// orEmpty is a document, or an empty one where there is none.
+func orEmpty(doc []byte) []byte {
+	if len(doc) == 0 {
+		return []byte("{}")
+	}
+
+	return doc
+}
+
+// rootRestarts returns what a difference in the legacy v1alpha1 document restarts: the kubelet for
+// its settings and the node's taints; the container runtime for the base runtime spec, the
+// credentials of a registry, and the file machine.files writes a CRI customization to
+// (constants.CRICustomizationConfigPart).
+func rootRestarts(a, b []byte) (map[string]string, error) {
+	paths, err := changedPaths(a, b)
+	if err != nil {
+		return nil, err
+	}
+
+	out := map[string]string{}
+	at := func(service, path string) { out[service] = string(render.RootKey) + ": " + path }
+
+	for _, p := range paths {
+		switch {
+		case underPath(p, "machine.kubelet"), underPath(p, "machine.nodeTaints"):
+			at(restartsKubelet, p)
+		case underPath(p, "machine.baseRuntimeSpecOverrides"):
+			at(restartsCRI, p)
+		case strings.HasPrefix(p, "machine.registries.config.") && (strings.HasSuffix(p, ".auth") || strings.Contains(p, ".auth.")):
+			at(restartsCRI, p)
+		case p == "machine.files":
+			changed, err := criPartChanged(a, b)
+			if err != nil {
+				return nil, err
+			}
+
+			if changed {
+				at(restartsCRI, p+"[path="+criCustomizationPart+"]")
+			}
+		}
+	}
+
+	return out, nil
+}
+
+// criCustomizationPart is where machine.files writes a customization of the container runtime's
+// config (constants.CRICustomizationConfigPart, under /etc).
+var criCustomizationPart = "/etc/" + constants.CRICustomizationConfigPart
+
+// criPartChanged reports whether the file machine.files writes a CRI customization to differs
+// between two legacy documents.
+func criPartChanged(a, b []byte) (bool, error) {
+	part := func(doc []byte) (any, error) {
+		var root struct {
+			Machine struct {
+				Files []map[string]any `yaml:"files"`
+			} `yaml:"machine"`
+		}
+
+		if err := yaml.Unmarshal(doc, &root); err != nil {
+			return nil, err
+		}
+
+		for _, f := range root.Machine.Files {
+			if f["path"] == criCustomizationPart {
+				return f, nil
+			}
+		}
+
+		return nil, nil
+	}
+
+	left, err := part(a)
+	if err != nil {
+		return false, err
+	}
+
+	right, err := part(b)
+	if err != nil {
+		return false, err
+	}
+
+	return !reflect.DeepEqual(left, right), nil
+}
+
+// underPath reports whether path is field or a field under it.
+func underPath(path, field string) bool {
+	return path == field || strings.HasPrefix(path, field+".")
 }
 
 // fieldRule classifies a document that both configs have by the fields that differ between them,
@@ -367,7 +539,7 @@ func (r fieldRule) classes(paths []string) ([]Class, bool) {
 // kubernetesKinds are the documents that name the image of a Kubernetes component Talos runs,
 // each in its "image" field (machinery config/types/k8s).
 var kubernetesKinds = map[string]bool{
-	"KubeAPIServerConfig": true, "KubeControllerManagerConfig": true, "KubeSchedulerConfig": true, "KubeletConfig": true,
+	"KubeAPIServerConfig": true, "KubeControllerManagerConfig": true, "KubeSchedulerConfig": true, kubeletKind: true,
 	"KubeProxyConfig": true,
 }
 
