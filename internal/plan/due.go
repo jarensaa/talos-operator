@@ -62,7 +62,9 @@ const (
 	BlockNotCurrent        = talosv1alpha1.ReasonAwaitingStatus
 	BlockProtected         = talosv1alpha1.ReasonProtectedChange
 	BlockRequiresReinstall = talosv1alpha1.ReasonRequiresReinstall
-	BlockAwaitingUpgrade   = talosv1alpha1.ReasonAwaitingUpgrade
+	// BlockRestartsTogether: the change restarts the container runtime and the kubelet at once.
+	BlockRestartsTogether = talosv1alpha1.ReasonRestartsTogether
+	BlockAwaitingUpgrade  = talosv1alpha1.ReasonAwaitingUpgrade
 	// BlockAwaitingKubernetes: a Kubernetes upgrade has to change the config first.
 	BlockAwaitingKubernetes = talosv1alpha1.ReasonAwaitingKubernetesUpgrade
 	BlockAborted            = talosv1alpha1.ReasonAborted
