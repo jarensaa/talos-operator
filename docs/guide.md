@@ -92,7 +92,7 @@ The timings are in `spec.rollout`. A node takes at least `soak`, whatever the ch
 
 ### When a node doesn't come out healthy
 
-The operator doesn't confirm, Talos puts the previous config back, and the rollout halts. No other node is touched. `RolloutBlocked` is true with reason `OperationFailed`, and `status.operation.failure` says what happened and what you can do. Each option is an annotation that carries the failure's token:
+The operator doesn't confirm, Talos puts the previous config back, and the rollout halts. No other node is touched. `RolloutBlocked` is true with reason `OperationFailed`, and `status.operation.failure` says what happened (`message`, `reason`) and what you can do (`remediation`), with the failure's `token`. The `RolloutHalted` Event names the token too, but not the remediation: an Event holds 1 KiB. Each option is an annotation that carries the token:
 
 ```bash
 TOKEN=$(kubectl -n talos-operator get taloscluster my-cluster -o jsonpath='{.status.operation.failure.token}')
@@ -106,6 +106,8 @@ kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github
 # End the rollout and leave the nodes as they are:
 kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/abort=$TOKEN
 ```
+
+A node that is back on its previous config is only reported as `RolledBack` once its container runtime and kubelet run again, and etcd on a control plane. When they don't, within the step timeout, the reason is `RolledBackUnhealthy` and the message names them: the change broke the node in a way its revert did not undo, or the node was unhealthy before. It needs repair, often a reboot, before anything else.
 
 After an abort the same change isn't started again. Change the spec, or revert it, and the operator rolls out whatever it renders then.
 
@@ -191,7 +193,7 @@ spec:
       secureBoot: true
 ```
 
-A pool can set `installer.secureBoot` for its own machines, either way, if only some machines have Secure Boot on. Adoption reads the setting from the installer your nodes' configs name. The signed installer also boots on a machine without Secure Boot.
+A pool can set `installer.secureBoot` for its own machines, either way, if only some machines have Secure Boot on. Adoption reads the setting from the installer your nodes' configs name. If those name the unsigned installer while the machines boot with Secure Boot on, the `InstallerBootable` condition of the TalosCluster says so before any upgrade is asked for, and names the machines. The signed installer also boots on a machine without Secure Boot.
 
 **The firmware has to trust who signed it.** A machine that was installed from Talos's Secure Boot ISO with its firmware in setup mode has Image Factory's certificate enrolled. A machine that was booted some other way, with each image approved by hand, trusts those images by their hash and nothing else. It runs fine, and it will not boot the next image. The operator finds that out before the upgrade starts: it reads the firmware's signature database from the node, asks Image Factory for its signing certificate, and compares.
 
@@ -341,7 +343,7 @@ It reads the TalosCluster, TalosMachinePool, TalosMachine and TalosMachineConfig
 - with `--base`, the manifests as they were before the change, the step is one that can be taken: no downgrade, no jump Talos does not make;
 - the installer exists, for the cluster and for every pool with a schematic of its own, extensions included, and so do the Kubernetes images;
 - maintenance windows and gate expressions can be understood;
-- every machine's config renders, with secrets made up for the purpose. A machine whose config comes partly from a Secret is not rendered, and is named;
+- every machine's config renders, with secrets made up for the purpose. The config sources that come from a Secret, which the check does not have, are left out: the machine is rendered without them and named, and the rest of its config is checked all the same;
 - no document has a field the API does not know, which the API server would drop without a word.
 
 It exits with 1 when something is wrong, and with 2 when the files cannot be read. If a service it asks does not answer, that is a failure too; `--offline` skips the questions. On GitHub Actions every problem is an annotation, and the run's summary lists the upgrades the change means.
@@ -617,6 +619,7 @@ The metrics endpoint is HTTPS and asks the Kubernetes API whether the scraper ma
 | `TalosConfigDrift` | warning | A node no longer runs the config the operator applied, and `driftPolicy: Report` leaves it so. |
 | `TalosNodeWithoutMachine` | warning | The cluster has a node that no TalosMachine describes. |
 | `TalosVersionsUnreachable` | warning | The spec asks for versions there is no way to. |
+| `TalosInstallerNotBootable` | warning | A machine's firmware has Secure Boot on and its spec names the unsigned installer: no upgrade of it can start. |
 | `TalosClusterUnhealthy` | warning | Talos's own health check has failed for 15 minutes. |
 | `TalosMachineNotObserved` | warning | The operator has not been able to read a node for 10 minutes. |
 | `TalosMachineNotReady` | warning | A node answers and has not been ready for 15 minutes. |

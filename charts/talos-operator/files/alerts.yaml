@@ -114,6 +114,22 @@ groups:
             the ones its spec asks for. The VersionsReachable condition of the TalosCluster says
             why; nothing is upgraded until the spec changes.
 
+      - alert: TalosInstallerNotBootable
+        expr: >-
+          max by (namespace, taloscluster) (
+            talos_operator_cluster_condition{condition="InstallerBootable", status="False"}
+          ) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A machine of {{ $labels.taloscluster }} would not boot the installer its spec names."
+          description: >-
+            The firmware of a machine of {{ $labels.taloscluster }} has Secure Boot on, and its spec
+            names the installer whose boot image is not signed. No upgrade of it can start until
+            the spec names the signed one. The InstallerBootable condition of the TalosCluster
+            names the machines.
+
       - alert: TalosAPIUnreachable
         expr: >-
           max by (namespace, taloscluster, reason) (

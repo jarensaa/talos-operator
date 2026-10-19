@@ -319,7 +319,16 @@ func TestWhatIsNotCheckedIsSaid(t *testing.T) {
 
 	problems, skipped := run(t, validate.Options{Paths: []string{repo.write(t)}, Source: upstream()})
 	if len(problems) != 0 || len(skipped) != 1 || !strings.Contains(skipped[0], "TalosMachine talos-operator/node-b") ||
-		!strings.Contains(skipped[0], "Secret") {
+		!strings.Contains(skipped[0], "1 of its config sources come from a Secret") {
+		t.Fatalf("problems %q, skipped %q", problems, skipped)
+	}
+
+	// What is not in the Secret is checked all the same.
+	repo.patch += "\n- inline: |\n    apiVersion: v1alpha1\n    kind: NoSuchConfig\n    name: x"
+
+	problems, skipped = run(t, validate.Options{Paths: []string{repo.write(t)}, Source: upstream()})
+	if len(problems) != 1 || !strings.Contains(problems[0], "TalosMachine talos-operator/node-b: its config does not render") ||
+		!strings.Contains(problems[0], "rendered without its 1 config source(s) from a Secret") || len(skipped) != 1 {
 		t.Fatalf("problems %q, skipped %q", problems, skipped)
 	}
 }
@@ -353,12 +362,13 @@ func TestAClusterWithoutItsMachinesNamesItsImages(t *testing.T) {
 		t.Fatalf("problems %q", problems)
 	}
 
-	// With part of the cluster's own config in a Secret there is nothing to render, which is said.
-	secret := valid()
+	// With part of the cluster's own config in a Secret, a control plane is rendered without it, which
+	// is said, and the images are looked for all the same.
+	secret := unpublished
 	secret.extra = "config:\n  - secretKeyRef: {name: registry-credentials, key: config.yaml}"
 
 	problems, skipped = run(t, validate.Options{Paths: []string{alone(secret)}, Source: upstream()})
-	if len(problems) != 0 || len(skipped) != 1 || !strings.Contains(skipped[0], "the cluster's own config comes from a Secret") {
+	if len(problems) != 5 || len(skipped) != 1 || !strings.Contains(skipped[0], "1 of the cluster's own config sources come from a Secret") {
 		t.Fatalf("problems %q, skipped %q", problems, skipped)
 	}
 }

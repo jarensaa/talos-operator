@@ -831,7 +831,9 @@ func (r *TalosClusterReconciler) emitOperation(ctx context.Context, before, afte
 
 		switch {
 		case is.Failure != nil && (was.Failure == nil || was.Failure.Token != is.Failure.Token):
-			warning(kind+"Halted", "%s: %s %s", haltedAt(is.Failure), is.Failure.Message, is.Failure.Remediation)
+			// An Event holds at most 1 KiB: it says what halted and points at status for what to do.
+			warning(kind+"Halted", "%s: %s; the token is %s, and status.operation.failure.remediation says what can be done",
+				haltedAt(is.Failure), clip(is.Failure.Message, maxHaltedMessage), is.Failure.Token)
 		case is.Failure == nil && was.Failure != nil:
 			normal(kind+"Resumed", "%s %s continues after %s", is.Type, is.ID, was.Failure.Reason)
 		}

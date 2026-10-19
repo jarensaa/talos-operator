@@ -690,6 +690,10 @@ func remediation(reason, token string, skippable bool) string {
 	switch reason {
 	case plan.FailRolledBack:
 		first = "The node runs its previous config. Find out why it did not stay healthy under the new one, and fix the spec."
+	case plan.FailRolledBackUnhealthy:
+		first = "The node runs its previous config, but not the services it needs. The support bundle has their logs and " +
+			"the kernel's: find out what stopped them, whether the new config or something before it. " +
+			"A reboot of the node may bring them back; fix the spec if the new config is the cause."
 	case plan.FailNodeUnreachableAfterRollback:
 		first = "The state of the node is unknown: check its console."
 	case plan.FailConfigChanged:

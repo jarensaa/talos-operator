@@ -145,8 +145,11 @@ type Node struct {
 	Nodename          string
 	// InstallStatus nil means the node has no unattended install status (ErrNotFound).
 	InstallStatus *talos.InstallStatus
-	Services      []talos.ServiceStatus
-	Config        talos.MachineConfigs
+	// Services nil makes the node run what a Talos node runs: its container runtime and kubelet,
+	// and etcd when it has a member, the kubelet unhealthy while the node is. Talos lists only
+	// services that run.
+	Services []talos.ServiceStatus
+	Config   talos.MachineConfigs
 	// DryRunReportsChanges makes dry-run applies report changes whatever is sent, as when the
 	// server's diff sees something the operator's per-document comparison does not.
 	DryRunReportsChanges bool
@@ -809,7 +812,20 @@ func (r *reader) Services(ctx context.Context, node netip.Addr) ([]talos.Service
 		return nil, err
 	}
 
-	return slices.Clone(n.Services), nil
+	if n.Services != nil {
+		return slices.Clone(n.Services), nil
+	}
+
+	services := []talos.ServiceStatus{
+		{ID: talos.ServiceCRI, Running: true, Healthy: true},
+		{ID: talos.ServiceKubelet, Running: true, Healthy: !n.unhealthy()},
+	}
+
+	if n.EtcdMemberID != 0 {
+		services = append(services, talos.ServiceStatus{ID: talos.ServiceEtcd, Running: true, Healthy: true})
+	}
+
+	return services, nil
 }
 
 func (r *reader) MachineType(ctx context.Context, node netip.Addr) (string, error) {

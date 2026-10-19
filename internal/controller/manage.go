@@ -46,6 +46,7 @@ func (r *TalosClusterReconciler) manage(ctx context.Context, tc *talosv1alpha1.T
 	}
 
 	f := newFleet(tc, r.Client, obs.facts, pools, all)
+	reportInstallerBootable(tc, f)
 
 	pass := passOf(obs)
 	obs.pass = &pass
@@ -164,6 +165,8 @@ func (r *TalosClusterReconciler) operate(ctx context.Context, tc *talosv1alpha1.
 func forgetHandover(st *talosv1alpha1.TalosClusterStatus) {
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionConfigHandover)
 	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionConfigInSync)
+	// It is worked out only while the cluster is managed, and would otherwise be left looking current.
+	meta.RemoveStatusCondition(&st.Conditions, talosv1alpha1.ConditionInstallerBootable)
 
 	blocked := meta.FindStatusCondition(st.Conditions, talosv1alpha1.ConditionRolloutBlocked)
 	if blocked != nil && blocked.Reason == talosv1alpha1.ReasonHandoverUnverified {

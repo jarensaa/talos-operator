@@ -191,6 +191,60 @@ func (r *TalosClusterReconciler) planUpgrade(ctx context.Context, tc *talosv1alp
 	return started, heldUp(result.Due, "the upgrade of %s does not start", strings.Join(result.Pending, ", "))
 }
 
+// reportInstallerBootable sets InstallerBootable: whether every member's firmware would boot the
+// installer its spec names, as far as the cluster itself tells. A firmware with Secure Boot on does
+// not boot the unsigned installer, and that is known from what every pass reads, so it is said at
+// rest: a cluster whose configs name the unsigned installer is not found out at its first upgrade,
+// when every upgrade is refused (docs/scope.md §7.3). Which certificate a signed installer is
+// signed with is asked of the Image Factory only when an upgrade starts (secureBootPreflight), so
+// whether the firmware trusts it is not said here.
+func reportInstallerBootable(tc *talosv1alpha1.TalosCluster, f *fleet) {
+	st, gen := &tc.Status, tc.Generation
+
+	// One problem is usually that of a whole pool: the machines that share it are named together.
+	var problems []string
+
+	named := map[string][]string{}
+
+	var unknown []string
+
+	for i := range f.members {
+		m := f.of(&f.members[i])
+
+		switch {
+		case m.install.Image == "" || m.node == nil || m.node.secureBoot == nil:
+			unknown = append(unknown, m.tm.Name)
+		default:
+			if p := talos.SecureBootInstallerProblem(*m.node.secureBoot, m.install.SecureBoot, m.install.Image); p != "" {
+				if named[p] == nil {
+					problems = append(problems, p)
+				}
+
+				named[p] = append(named[p], m.tm.Name)
+			}
+		}
+	}
+
+	switch {
+	case len(problems) > 0:
+		said := make([]string, 0, len(problems))
+		for _, p := range problems {
+			said = append(said, strings.Join(named[p], ", ")+": "+p)
+		}
+
+		setCondition(st, gen, talosv1alpha1.ConditionInstallerBootable, metav1.ConditionFalse, talosv1alpha1.ReasonIncompatible,
+			strings.Join(said, "; ")+". No upgrade of them can start until their spec names the signed installer")
+	case len(unknown) > 0:
+		setCondition(st, gen, talosv1alpha1.ConditionInstallerBootable, metav1.ConditionUnknown, talosv1alpha1.ReasonAwaitingStatus,
+			"whether the firmware of "+strings.Join(unknown, ", ")+" boots the installer its spec names is not known: "+
+				"its Secure Boot state was not read, or its installer could not be worked out")
+	default:
+		setCondition(st, gen, talosv1alpha1.ConditionInstallerBootable, metav1.ConditionTrue, talosv1alpha1.ReasonSucceeded,
+			fmt.Sprintf("the firmware of all %d members boots the installer its spec names, as far as the cluster tells; "+
+				"whether it trusts what a signed one is signed with is asked when an upgrade starts", len(f.members)))
+	}
+}
+
 func outdated(planned []plan.UpgradeMachine) (behind, stale []string) {
 	for _, m := range planned {
 		switch {

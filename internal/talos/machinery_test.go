@@ -765,8 +765,8 @@ func TestMachineryHealthCheckTellsAFailingClusterFromACheckThatDidNotRun(t *test
 		t.Fatalf("the check must be told which nodes to expect, and for how long to wait: %+v", req)
 	}
 
-	// A check failed or timed out: Talos ends the stream with an error. That is a verdict.
-	for _, code := range []codes.Code{codes.Unknown, codes.DeadlineExceeded, codes.Internal, codes.FailedPrecondition} {
+	// A check failed: Talos ends the stream with an error. That is a verdict.
+	for _, code := range []codes.Code{codes.Unknown, codes.Internal, codes.FailedPrecondition} {
 		api.health = func(stream grpc.ServerStreamingServer[clusterapi.HealthCheckProgress]) error {
 			if err := progress("waiting for etcd to be healthy: OK")(stream); err != nil {
 				return err
@@ -783,6 +783,36 @@ func TestMachineryHealthCheckTellsAFailingClusterFromACheckThatDidNotRun(t *test
 		if last := got.Messages[len(got.Messages)-1]; last != "etcd member 10.5.0.2 is not healthy" {
 			t.Fatalf("%s: the last message must say what failed: %q", code, last)
 		}
+	}
+
+	// A check ran out of time: the error says only that, and the line Talos sent as it gave up says
+	// which check it was and what it last found.
+	api.health = func(stream grpc.ServerStreamingServer[clusterapi.HealthCheckProgress]) error {
+		if err := progress("waiting for etcd to be healthy: OK",
+			"waiting for all k8s nodes to report ready: node 10.5.0.3 is not ready")(stream); err != nil {
+			return err
+		}
+
+		return status.Error(codes.DeadlineExceeded, "context deadline exceeded")
+	}
+
+	got, err = r.HealthCheck(ctx, apiNode, info, 5*time.Minute)
+	if err != nil || got.Healthy {
+		t.Fatalf("a check that timed out is a result, not an error: %+v, %v", got, err)
+	}
+
+	if last, want := got.Messages[len(got.Messages)-1],
+		"the health check timed out after 5m0s waiting for all k8s nodes to report ready: node 10.5.0.3 is not ready"; last != want {
+		t.Fatalf("a timeout must say which check ran out of time, and after how long:\n got %q\nwant %q", last, want)
+	}
+
+	api.health = func(grpc.ServerStreamingServer[clusterapi.HealthCheckProgress]) error {
+		return status.Error(codes.DeadlineExceeded, "context deadline exceeded")
+	}
+
+	got, _ = r.HealthCheck(ctx, apiNode, info, time.Second)
+	if last := got.Messages[len(got.Messages)-1]; last != "the health check timed out after 1s before any check reported" {
+		t.Fatalf("a timeout before any progress must say so: %q", last)
 	}
 
 	// The check never ran: that is an error, and never a verdict in either direction.

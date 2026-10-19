@@ -45,8 +45,11 @@ import (
 // failure overwrites it: what it is for is the failure somebody is looking at.
 
 const (
-	// bundleLogLines is how much of each log is asked for: its end.
-	bundleLogLines = 500
+	// bundleLogLines asks for all of each log Talos keeps, a megabyte of its end
+	// (runtime/logging/circular.go:31 in Talos v1.14). What went wrong may be minutes before the
+	// failure was declared, as when a try fails at its start and rolls back at its deadline, and
+	// what is kept of it is bounded after the lines that only record a read are left out.
+	bundleLogLines = -1
 	// bundleRetry is how long collecting is tried again after a failure, for a node that does not
 	// answer yet or a Secret that cannot be written yet. After it, the failure says what was missing.
 	bundleRetry = 5 * time.Minute

@@ -108,6 +108,12 @@ var kindClasses = map[string]Class{
 
 	// Only a reinstall changes these.
 	"UnattendedInstallConfig": BootTime,
+	// A revert does not undo these, and a reboot is what would: Talos loads a kernel module and never
+	// unloads one (controllers/runtime/kernel_module_spec.go:74 in Talos v1.14), takes a PCI device
+	// from its driver for another (controllers/hardware/pci_driver_rebind.go:151-160), and puts the
+	// container plane in its own namespace or out of it only when it starts (sandboxd/enabled.go:42-55).
+	// machine.kernel, kernel modules included, is BootTime too.
+	"KernelModuleConfig": BootTime, "PCIDriverRebindConfig": BootTime, "SecurityProfileConfig": BootTime,
 
 	// Links, addresses, routes, name resolution and the host firewall.
 	"BondConfig": Connectivity, "BridgeConfig": Connectivity, "DHCPv4Config": Connectivity, "DHCPv6Config": Connectivity,
@@ -120,10 +126,15 @@ var kindClasses = map[string]Class{
 	"HostDNSConfig": Connectivity, "StaticHostConfig": Connectivity, "NodeIPConfig": Connectivity,
 	// Members find each other, and the operator finds them, through discovery.
 	"DiscoveryServiceConfig": Connectivity,
+	// How workloads reach the Talos API, this operator's own access by ServiceAccount among them, and
+	// the node's link to Omni.
+	"KubeTalosAPIAccessConfig": Connectivity, "SideroLinkConfig": Connectivity,
 
 	"VolumeConfig": Storage, "UserVolumeConfig": Storage, "RawVolumeConfig": Storage, "ExistingVolumeConfig": Storage,
 	"ExternalVolumeConfig": Storage, "SwapVolumeConfig": Storage, "LVMLogicalVolumeConfig": Storage,
 	"LVMVolumeGroupConfig": Storage, "RAIDArrayConfig": Storage,
+	// The image cache is a volume of its own (controllers/cri/image_cache_config.go:160-170).
+	"ImageCacheConfig": Storage,
 
 	"KubeAPIServerConfig": ControlPlaneRestart, "KubeControllerManagerConfig": ControlPlaneRestart,
 	"KubeSchedulerConfig": ControlPlaneRestart, "KubeAdmissionControlConfig": ControlPlaneRestart,
@@ -139,7 +150,20 @@ var kindClasses = map[string]Class{
 	"RegistryAuthConfig": LiveSafe, "RegistryTLSConfig": LiveSafe, "EnvironmentConfig": LiveSafe, "EtcFileConfig": LiveSafe,
 	"UdevRulesConfig": LiveSafe, "KmsgLogConfig": LiveSafe, "EventSinkConfig": LiveSafe, "WatchdogTimerConfig": LiveSafe,
 	"OOMConfig": LiveSafe, "TCPProbeConfig": LiveSafe, "HTTPProbeConfig": LiveSafe,
-	"FilesystemTrimConfig": LiveSafe, "FilesystemScrubConfig": LiveSafe,
+	"FilesystemTrimConfig": LiveSafe, "FilesystemScrubConfig": LiveSafe, "TrustedRootsConfig": LiveSafe,
+	"ImageVerificationConfig": LiveSafe,
+	// zswap is kernel parameters, as sysctls are (controllers/block/zswap_config.go:79-104).
+	"ZswapConfig": LiveSafe,
+	// Talos restarts containerd when its config or the base runtime spec changes
+	// (controllers/cri/service.go:96-110), as it does for registries: machine.files, which carries
+	// the legacy form of a CRI customization, is LiveSafe too. Containers, extension services and
+	// static pods are what Talos runs itself, as machine.pods says for static pods.
+	"CRICustomizationConfig": LiveSafe, "CRIBaseRuntimeSpecConfig": LiveSafe, "ContainerConfig": LiveSafe,
+	"ExtensionServiceConfig": LiveSafe, "KubeStaticPodConfig": LiveSafe,
+	// Talos applies a manifest to Kubernetes once and skips what it applied before
+	// (controllers/k8s/manifest_apply.go:322), as it does kube-proxy's (§12.20).
+	"KubeCoreDNSConfig": LiveSafe, "KubeFlannelCNIConfig": LiveSafe, "KubeInlineManifestConfig": LiveSafe,
+	"KubeExternalManifestConfig": LiveSafe,
 }
 
 // pathRule classifies a field of the legacy v1alpha1 document by path prefix.
