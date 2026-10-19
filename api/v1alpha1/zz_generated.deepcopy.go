@@ -792,6 +792,11 @@ func (in *OperationStep) DeepCopyInto(out *OperationStep) {
 		in, out := &in.Deadline, &out.Deadline
 		*out = (*in).DeepCopy()
 	}
+	if in.RebootAfter != nil {
+		in, out := &in.RebootAfter, &out.RebootAfter
+		*out = new(OperationFailure)
+		(*in).DeepCopyInto(*out)
+	}
 	in.Since.DeepCopyInto(&out.Since)
 }
 

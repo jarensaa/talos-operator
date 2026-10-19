@@ -100,6 +100,9 @@ TOKEN=$(kubectl -n talos-operator get taloscluster my-cluster -o jsonpath='{.sta
 # Run the step again, for instance after fixing what kept the node unhealthy:
 kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/retry=$TOKEN
 
+# Reboot the machine first, then decide (needs spec.management.upgrades: Enabled):
+kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/reboot=$TOKEN
+
 # Leave this machine out and go on with the others:
 kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/skip-machine=$TOKEN
 
@@ -108,6 +111,8 @@ kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github
 ```
 
 A node that is back on its previous config is only reported as `RolledBack` once its container runtime and kubelet run again, and etcd on a control plane. When they don't, within the step timeout, the reason is `RolledBackUnhealthy` and the message names them: the change broke the node in a way its revert did not undo, or the node was unhealthy before. It needs repair, often a reboot, before anything else.
+
+`reboot` has the operator do that reboot, the way an upgrade does one: it drains the node, respecting disruption budgets, reboots it once every other node is healthy (and a control plane never while etcd has two members), waits for it to come back on the system it ran, uncordons it if it cordoned it, and waits for the whole cluster to be healthy for the soak. The operation then halts again, with reason `Rebooted` and a new token, and you say what follows: `retry`, `skip-machine` or `abort`. It needs `spec.management.upgrades: Enabled`; without it the annotation does nothing.
 
 After an abort the same change isn't started again. Change the spec, or revert it, and the operator rolls out whatever it renders then.
 

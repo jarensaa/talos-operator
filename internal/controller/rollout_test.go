@@ -455,6 +455,57 @@ var _ = Describe("Config rollout", func() {
 			Expect(h.applies()).To(Equal([]string{tried(worker1)}), "nothing else is sent to the node")
 		})
 
+		It("reboots a node it halted at when a human asks, and halts again once the node is back", func() {
+			deadline := windowPasses()
+			h.expireTry(worker1)
+
+			h.scenario.UpdateNode(workerAddr, func(n *fake.Node) {
+				n.Services = []talos.ServiceStatus{{ID: talos.ServiceCRI, Running: true, Healthy: true}}
+			})
+
+			h.at(deadline.Add(plan.RollbackGrace + plan.DefaultStepTimeout))
+			Expect(h.operation().Failure.Reason).To(Equal(plan.FailRolledBackUnhealthy))
+
+			halted := h.operation().Failure
+			Expect(halted.Remediation).To(ContainSubstring(talosv1alpha1.AnnotationReboot + "=" + halted.Token))
+
+			By("not rebooting while upgrades are not enabled, whose connection reboots")
+			h.annotate(talosv1alpha1.AnnotationReboot, halted.Token)
+			h.advance(time.Minute)
+			Expect(h.operation().Failure.Token).To(Equal(halted.Token))
+			Expect(h.scenario.CallsFor(fake.MethodReboot)).To(BeEmpty())
+
+			By("rebooting it once they are")
+			h.updateCluster(func(tc *talosv1alpha1.TalosCluster) { tc.Spec.Management.Upgrades = talosv1alpha1.CapabilityEnabled })
+			h.runUntil("the node is rebooted", func() bool { return h.scenario.Down(workerAddr) })
+			Expect(h.operation().Current.RebootAfter).NotTo(BeNil())
+			Expect(h.operation().Current.RebootAfter.Token).To(Equal(halted.Token))
+
+			// The reboot brings the kubelet back.
+			h.scenario.UpdateNode(workerAddr, func(n *fake.Node) { n.Services = nil })
+			Expect(h.scenario.Boot(workerAddr)).To(BeTrue())
+
+			h.runUntil("the operation halts again", h.failed)
+
+			f := h.operation().Failure
+			Expect(f.Reason).To(Equal(plan.FailRebooted))
+			Expect(f.Machine).To(Equal(worker1))
+			Expect(f.Step).To(Equal(halted.Step))
+			Expect(f.Token).NotTo(Equal(halted.Token), "the next answer is to this halt, not the last")
+			Expect(f.Message).To(ContainSubstring("kubelet does not run"))
+			Expect(h.scenario.CallsFor(fake.MethodReboot)).To(HaveLen(1))
+			Expect(h.applies()).To(Equal([]string{tried(worker1)}), "a reboot sends no config")
+
+			kube := &corev1.Node{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: h.node(worker1).node}, kube)).To(Succeed())
+			Expect(kube.Spec.Unschedulable).To(BeFalse(), "the cordon the reboot set is undone")
+
+			By("going on as the human says next")
+			h.annotate(talosv1alpha1.AnnotationSkipMachine, f.Token)
+			h.runUntil("the rollout ends", h.idle)
+			Expect(h.scenario.CallsFor(fake.MethodReboot)).To(HaveLen(1), "a reboot is asked for once")
+		})
+
 		It("escalates when the node does not come back on its previous config", func() {
 			deadline := windowPasses()
 

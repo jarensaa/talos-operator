@@ -219,6 +219,10 @@ const (
 	AnnotationRetry       = "talos.jarensaa.github.io/retry"
 	AnnotationSkipMachine = "talos.jarensaa.github.io/skip-machine"
 	AnnotationAbort       = "talos.jarensaa.github.io/abort"
+	// AnnotationReboot, carrying the token of a failure at a machine, has that machine rebooted
+	// (drained, rebooted, verified, uncordoned) before the human says what follows. It needs
+	// spec.management.upgrades: Enabled, whose connection reboots (docs/scope.md §8.3).
+	AnnotationReboot = "talos.jarensaa.github.io/reboot"
 	// AnnotationConfirmDead, on the TalosCluster and carrying the token of a removal that halted
 	// because the machine does not answer, confirms that the machine is gone for good. The
 	// removal then goes on without it: its etcd member is removed through another control plane

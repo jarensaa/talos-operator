@@ -85,6 +85,9 @@ type kind struct {
 	nodeHooks bool
 	// skippable is false for a kind that cannot leave a machine out.
 	skippable bool
+	// rebootable is true for a kind whose failure at a member may be answered with a reboot of it
+	// (reboot.go). A machine that joins is not a member yet, and one that leaves is being reset.
+	rebootable bool
 	// remembers is false for a kind that has nothing to remember about a turn a human left out
 	// or an operation a human ended.
 	remembers bool
@@ -105,7 +108,7 @@ func init() {
 			condition: talosv1alpha1.ConditionConfigInSync, running: talosv1alpha1.ReasonRollingOut,
 			finishes: "a node whose config is being tried is still verified and confirmed, no other node is touched",
 			event:    "Rollout", done: "MachineConfigured", does: "runs its rendered config",
-			nodeHooks: true, skippable: true, remembers: true,
+			nodeHooks: true, skippable: true, rebootable: true, remembers: true,
 			turns: (*TalosClusterReconciler).rolloutTurns,
 		},
 		talosv1alpha1.OperationTalosUpgrade: {
@@ -114,7 +117,7 @@ func init() {
 			finishes: "a node that is already cordoned is still upgraded and uncordoned, no other node is touched",
 			allowed:  talosv1alpha1.Management.MayUpgrade, disabled: "upgrades were disabled",
 			event: "Upgrade", done: "MachineUpgraded", does: "runs the installed system",
-			nodeHooks: true, skippable: true, remembers: true,
+			nodeHooks: true, skippable: true, rebootable: true, remembers: true,
 			turns: (*TalosClusterReconciler).upgradeTurns,
 		},
 		talosv1alpha1.OperationKubernetesUpgrade: {
@@ -125,8 +128,8 @@ func init() {
 			allowed: talosv1alpha1.Management.MayUpgrade, disabled: "upgrades were disabled",
 			event: "KubernetesUpgrade", done: "ComponentUpgraded", does: "runs the new version",
 			// A Kubernetes upgrade cannot leave a node out: what follows would be newer than it.
-			remembers: true,
-			turns:     (*TalosClusterReconciler).kubernetesTurns,
+			rebootable: true, remembers: true,
+			turns: (*TalosClusterReconciler).kubernetesTurns,
 		},
 		talosv1alpha1.OperationAddMachine: {
 			name:      "adding machines",
@@ -154,8 +157,8 @@ func init() {
 			event: "Defragmentation", done: "MemberDefragmented", does: "has a defragmented etcd database",
 			// Nothing has to be remembered about a member that was left out, or about an operation
 			// that was ended: the interval keeps the next one away.
-			skippable: true,
-			turns:     (*TalosClusterReconciler).defragTurns,
+			skippable: true, rebootable: true,
+			turns: (*TalosClusterReconciler).defragTurns,
 		},
 	}
 }
@@ -204,6 +207,14 @@ func (r *TalosClusterReconciler) carryOn(ctx context.Context, tc *talosv1alpha1.
 	}
 
 	timing := plan.TimingOf(tc.Spec.Rollout)
+
+	if rebooting(op) {
+		note, err := r.rebootStep(ctx, tc, obs, f, timing)
+
+		reportInFlight(tc, obs, k, note)
+
+		return err
+	}
 	note, err := r.drive(ctx, tc, obs, timing, k, k.turns(r, ctx, tc, obs, f, timing))
 
 	reportInFlight(tc, obs, k, note)
@@ -676,15 +687,15 @@ func failOperation(op *talosv1alpha1.Operation, reason, message string, now time
 		Step:        cur.Step,
 		Reason:      reason,
 		Message:     message,
-		Remediation: remediation(reason, token, kinds[op.Type].skippable),
+		Remediation: remediation(reason, token, kinds[op.Type].skippable, kinds[op.Type].rebootable && cur.Machine != ""),
 		Token:       token,
 		At:          &at,
 	}
 }
 
 // remediation says what a human can do about a failed step. A kind that cannot leave a machine
-// out offers no skip (docs/scope.md §7.4).
-func remediation(reason, token string, skippable bool) string {
+// out offers no skip (docs/scope.md §7.4), and only a failure at a member offers a reboot.
+func remediation(reason, token string, skippable, rebootable bool) string {
 	var first string
 
 	switch reason {
@@ -692,8 +703,12 @@ func remediation(reason, token string, skippable bool) string {
 		first = "The node runs its previous config. Find out why it did not stay healthy under the new one, and fix the spec."
 	case plan.FailRolledBackUnhealthy:
 		first = "The node runs its previous config, but not the services it needs. The support bundle has their logs and " +
-			"the kernel's: find out what stopped them, whether the new config or something before it. " +
-			"A reboot of the node may bring them back; fix the spec if the new config is the cause."
+			"the kernel's: find out what stopped them, whether the new config or something before it, and fix the spec if " +
+			"the new config is the cause. A reboot of the node may bring them back."
+	case plan.FailRebootNotAllowed:
+		first = "Nothing more was sent to the node."
+	case plan.FailRebooted:
+		first = "The node was rebooted as asked, and is healthy again. Say what follows for the step it had failed at."
 	case plan.FailNodeUnreachableAfterRollback:
 		first = "The state of the node is unknown: check its console."
 	case plan.FailConfigChanged:
@@ -732,8 +747,14 @@ func remediation(reason, token string, skippable bool) string {
 		skip = fmt.Sprintf(" %s=%s to leave this machine out,", talosv1alpha1.AnnotationSkipMachine, token)
 	}
 
-	return fmt.Sprintf("%s Then annotate the TalosCluster with %s=%s to run the step again,%s or %s=%s to end the operation.",
-		first, talosv1alpha1.AnnotationRetry, token, skip, talosv1alpha1.AnnotationAbort, token)
+	reboot := ""
+	if rebootable {
+		reboot = fmt.Sprintf(" %s=%s to reboot the machine and then decide (with spec.management.upgrades: Enabled),",
+			talosv1alpha1.AnnotationReboot, token)
+	}
+
+	return fmt.Sprintf("%s Then annotate the TalosCluster with %s=%s to run the step again,%s%s or %s=%s to end the operation.",
+		first, talosv1alpha1.AnnotationRetry, token, reboot, skip, talosv1alpha1.AnnotationAbort, token)
 }
 
 // tokened returns how to tell whether an annotation of the TalosCluster carries the token of the
@@ -759,6 +780,8 @@ func (r *TalosClusterReconciler) actOnFailure(tc *talosv1alpha1.TalosCluster, k 
 	case k.skippable && asked(talosv1alpha1.AnnotationSkipMachine):
 		leaveOut(tc, k, f.Machine)
 	case t.also != nil && t.also(asked):
+	case k.rebootable && f.Machine != "" && tc.Spec.Management.MayUpgrade() && asked(talosv1alpha1.AnnotationReboot):
+		rebootAfter(op, r.stamp())
 	case asked(talosv1alpha1.AnnotationRetry):
 		key, attempt, cordoned := f.Machine, int32(1), false
 		if cur := op.Current; cur != nil {
@@ -852,6 +875,9 @@ func progressOf(op *talosv1alpha1.Operation, note string) string {
 		}
 	case op.Ending != nil:
 		progress += "; ending"
+	case op.Current != nil && op.Current.RebootAfter != nil:
+		progress += fmt.Sprintf("; %s is being rebooted as a human asked after it halted (%s), and is %s",
+			op.Current.Machine, op.Current.RebootAfter.Reason, op.Current.Step)
 	case op.Current != nil:
 		progress += fmt.Sprintf("; %s is %s", turnOf(op.Current), op.Current.Step)
 	}

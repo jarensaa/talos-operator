@@ -191,6 +191,15 @@ func (m boundMachine) running() bool {
 	return m.node != nil && m.node.status != nil && m.node.status.Stage == talos.StageRunning && m.node.status.Ready
 }
 
+// system is what the node runs, as "<version> <schematic>", and whether that was read.
+func (m boundMachine) system() (string, bool) {
+	if m.node == nil || m.node.version == "" || m.node.schematicID == nil {
+		return "", false
+	}
+
+	return m.node.version + " " + *m.node.schematicID, true
+}
+
 // installed reports whether the node's version and schematic were read, and whether they are the
 // ones the spec asks for. A node whose firmware was not asked about Secure Boot is not known
 // either: what it would boot decides whether it may be upgraded at all.
