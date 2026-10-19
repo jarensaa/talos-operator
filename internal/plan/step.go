@@ -43,8 +43,12 @@ const (
 	// FailConfigChanged: the node's config is neither the one the step started from nor the one
 	// it applies, so something else changed it.
 	FailConfigChanged = "ConfigChangedUnderneath"
-	// FailRolledBack: the try was not confirmed and the node is back on its previous config.
+	// FailRolledBack: the try was not confirmed and the node is back on its previous config, with
+	// the services it needs running.
 	FailRolledBack = "RolledBack"
+	// FailRolledBackUnhealthy: the try was not confirmed and the node is back on its previous
+	// config, but the services it needs do not run there, or could not be read.
+	FailRolledBackUnhealthy = "RolledBackUnhealthy"
 	// FailNodeUnreachableAfterRollback: the try was not confirmed and the node did not come back on
 	// its previous config. This needs a human: Talos only logs a revert that fails.
 	FailNodeUnreachableAfterRollback = "NodeUnreachableAfterRollback"
@@ -68,6 +72,11 @@ type Node struct {
 	// ActiveHash and PersistentHash are hashes of the node's normalized configs. PersistentHash is
 	// empty when the node has no persistent config resource, as after booting from disk.
 	ActiveHash, PersistentHash string
+	// ServicesRead is whether the services the node needs were read, which they are only while a
+	// try is rolled back. ServicesDown then says which of them do not run or are not healthy,
+	// and ServicesUnread why they were not read. Services that were not read are not known to run.
+	ServicesRead                 bool
+	ServicesDown, ServicesUnread string
 }
 
 // NextStep decides what to do for the node step in flight.
@@ -214,8 +223,7 @@ func nextRollingBack(step Step, node Node, t Timing, now time.Time) Action {
 	case now.Before(settled):
 		return wait("waiting for Talos to revert the unconfirmed config")
 	case node.Reachable && node.ActiveHash == step.PreviousHash:
-		return fail(FailRolledBack, "the config was not confirmed, and the node is back on its previous config: "+
-			"Talos reverted it, or it was never applied")
+		return backOnPrevious(node, settled, t, now)
 	case !now.Before(settled.Add(t.StepTimeout)):
 		if !node.Reachable {
 			return fail(FailNodeUnreachableAfterRollback, "the config was not confirmed and the node has not been reachable for %s after the "+
@@ -227,6 +235,28 @@ func nextRollingBack(step Step, node Node, t Timing, now time.Time) Action {
 				"after the try window ended", t.StepTimeout)
 	default:
 		return wait("waiting for the node to come back on its previous config")
+	}
+}
+
+// backOnPrevious decides about a node that is back on the config a try started from. That is not
+// yet a node that is fine: a revert restarts what the try restarted, one that went wrong leaves
+// the node on its old config without its kubelet or its container runtime, and a node that was
+// unhealthy before the try still is. So the node is only reported as back once the services it
+// needs run, and the step's timeout is given for them to come up again.
+func backOnPrevious(node Node, settled time.Time, t Timing, now time.Time) Action {
+	switch {
+	case node.ServicesRead && node.ServicesDown == "":
+		return fail(FailRolledBack, "the config was not confirmed, and the node is back on its previous config: "+
+			"Talos reverted it, or it was never applied")
+	case now.Before(settled.Add(t.StepTimeout)):
+		return wait("the node is back on its previous config; waiting for the services it needs to run again")
+	case !node.ServicesRead:
+		return fail(FailRolledBackUnhealthy, "the config was not confirmed and the node is back on its previous config, but "+
+			"whether the services it needs run could not be read for %s after the try window ended: %s", t.StepTimeout,
+			node.ServicesUnread)
+	default:
+		return fail(FailRolledBackUnhealthy, "the config was not confirmed and the node is back on its previous config, but "+
+			"%s, %s after the try window ended", node.ServicesDown, t.StepTimeout)
 	}
 }
 

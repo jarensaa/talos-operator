@@ -137,6 +137,19 @@ func TestMachineryReadsTheEndOfLogs(t *testing.T) {
 		t.Fatalf("got %d bytes ending %q, %v", len(got), got[max(0, len(got)-20):], err)
 	}
 
+	// Talos records every call it answers. The reads that succeeded, every observation of every
+	// node, take no room: what happened at the failure stays, however many came after it.
+	read := "2026/10/18 18:51:00 OK [/cosi.resource.State/List] 2.1ms stream Success (:authority=10.5.0.2:50000)\n"
+	apply := "2026/10/18 18:46:26 OK [/machine.MachineService/ApplyConfiguration] 120ms unary Success (:authority=10.5.0.2:50000)\n"
+	refused := "2026/10/18 18:52:00 PermissionDenied [/cosi.resource.State/Get] 1ms unary not allowed (:authority=10.5.0.2:50000)\n"
+	failure := "2026/10/18 18:46:27 service[kubelet](Failed): Failed running service\n"
+	api.logs["machined"] = []string{apply, failure, strings.Repeat(read, 2*maxLog/len(read)), refused}
+
+	got, err = r.Logs(ctx, apiNode, "machined", -1)
+	if err != nil || string(got) != apply+failure+refused {
+		t.Fatalf("the answered reads must be left out and everything else kept, got %d bytes: %q, %v", len(got), got[:min(len(got), 300)], err)
+	}
+
 	// Reading is all a Reader's connection does about etcd.
 	if _, err := c.EtcdDefragment(client.WithNode(ctx, apiNode.String())); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("a read-only connection must refuse to defragment, got %v", err)

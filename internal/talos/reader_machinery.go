@@ -420,8 +420,12 @@ func (r *machineryReader) HealthCheck(ctx context.Context, node netip.Addr, info
 			switch status.Code(err) {
 			case codes.Unavailable, codes.Canceled, codes.PermissionDenied, codes.Unauthenticated:
 				return HealthResult{}, fmt.Errorf("health check on %s: %w", node, err)
+			case codes.DeadlineExceeded:
+				result.Messages = append(result.Messages, timedOut(result.Messages, timeout))
+
+				return result, nil
 			default:
-				// The server ends the stream with an error when a check fails or times out.
+				// The server ends the stream with an error when a check fails.
 				result.Messages = append(result.Messages, status.Convert(err).Message())
 
 				return result, nil
@@ -430,6 +434,19 @@ func (r *machineryReader) HealthCheck(ctx context.Context, node netip.Addr, info
 
 		result.Messages = append(result.Messages, msg.GetMessage())
 	}
+}
+
+// timedOut says what a health check that ran out of time was waiting for. The error it ends with
+// says only that time ran out; Talos reports the check in progress once more as it gives up, as
+// "waiting for <check>: <what it last found>", and that line names the check, and the nodes when
+// the check found something wrong with one (check.Wait, pkg/cluster/check/check.go:42-82, and
+// healthReporter, v1alpha1_cluster.go:90-100 in Talos v1.14).
+func timedOut(progress []string, timeout time.Duration) string {
+	if len(progress) == 0 {
+		return fmt.Sprintf("the health check timed out after %s before any check reported", timeout)
+	}
+
+	return fmt.Sprintf("the health check timed out after %s %s", timeout, progress[len(progress)-1])
 }
 
 func addrStrings(addrs []netip.Addr) []string {

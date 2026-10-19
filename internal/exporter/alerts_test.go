@@ -241,6 +241,19 @@ func scenarios() []scenario {
 			}},
 		},
 		{
+			name: "a firmware with Secure Boot on and the unsigned installer",
+			change: func(f *fixture) {
+				f.is(talosv1alpha1.ConditionInstallerBootable, metav1.ConditionFalse, talosv1alpha1.ReasonIncompatible)
+			},
+			fires: []fired{{
+				alert: "TalosInstallerNotBootable", severity: "warning",
+				summary: "A machine of my-cluster would not boot the installer its spec names.",
+				description: "The firmware of a machine of my-cluster has Secure Boot on, and its spec names the installer whose " +
+					"boot image is not signed. No upgrade of it can start until the spec names the signed one. " +
+					"The InstallerBootable condition of the TalosCluster names the machines.",
+			}},
+		},
+		{
 			name: "a Talos API that cannot be reached",
 			change: func(f *fixture) {
 				f.is(talosv1alpha1.ConditionTalosAPIReachable, metav1.ConditionFalse, talosv1alpha1.ReasonUnreachable)

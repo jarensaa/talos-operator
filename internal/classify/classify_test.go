@@ -90,7 +90,8 @@ func TestClassify(t *testing.T) {
 		{"host firewall", rendered(t, bundle, firewall), classify.Connectivity, "v1alpha1/NetworkDefaultActionConfig"},
 		{"resolvers", rendered(t, bundle, resolver), classify.Connectivity, "v1alpha1/ResolverConfig"},
 		{"user volume", rendered(t, bundle, volume), classify.Storage, "v1alpha1/UserVolumeConfig/data"},
-		{"a kind without a rule", rendered(t, bundle, coreDNS), classify.Unknown, "v1alpha1/KubeCoreDNSConfig"},
+		// Talos applies the CoreDNS manifest once, like kube-proxy's.
+		{"CoreDNS", rendered(t, bundle, coreDNS), classify.LiveSafe, "v1alpha1/KubeCoreDNSConfig"},
 		// Talos applies the kube-proxy manifest once; what the config says later changes nothing.
 		{"kube-proxy", rendered(t, bundle, proxy), classify.LiveSafe, "v1alpha1/KubeProxyConfig"},
 		{"a field without a rule", rendered(t, bundle, "machine:\n  features:\n    diskQuotaSupport: false\n"),

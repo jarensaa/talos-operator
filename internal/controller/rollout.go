@@ -280,7 +280,7 @@ func (r *TalosClusterReconciler) step(ctx context.Context, tc *talosv1alpha1.Tal
 	op := tc.Status.Operation
 	cur := op.Current
 	now := r.now()
-	s, node := stepOf(cur), stepNode(v)
+	s, node := stepOf(cur), withServices(ctx, obs, v, cur, stepNode(v))
 
 	// A node nothing was sent to is left alone while the rollout is paused or outside its
 	// maintenance windows, or when its spec renders something else by now. The step is dropped;
@@ -374,6 +374,39 @@ func stepNode(v machineView) plan.Node {
 	}
 
 	return n
+}
+
+// withServices reads, of a node back on the config its try started from, whether the services it
+// needs run (plan.Node). They are asked about then and only then: a rolled-back node is not
+// reported as recovered without them, and nothing else depends on them.
+func withServices(ctx context.Context, obs observation, v machineView, cur *talosv1alpha1.OperationStep, node plan.Node) plan.Node {
+	if cur.Step != plan.StepRollingBack || !node.Reachable || node.ActiveHash != cur.PreviousHash {
+		return node
+	}
+
+	if obs.reader == nil {
+		node.ServicesUnread = "the cluster's Talos API was not reached"
+
+		return node
+	}
+
+	var services []talos.ServiceStatus
+
+	reads := newNodeReads(ctx, v.node.address)
+	if !reads.read("services", func(ctx context.Context) (err error) {
+		services, err = obs.reader.Services(ctx, v.node.address)
+
+		return err
+	}) {
+		node.ServicesUnread = reads.reason()
+
+		return node
+	}
+
+	node.ServicesRead = true
+	node.ServicesDown = strings.Join(talos.ServicesDown(v.node.machineType, services), ", ")
+
+	return node
 }
 
 // preGate is what must hold before a config is sent to the node: nothing holds the rollout back,

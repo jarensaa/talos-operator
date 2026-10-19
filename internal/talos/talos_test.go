@@ -469,3 +469,38 @@ func TestParseDryRunReadsOnlyTheVerdict(t *testing.T) {
 		t.Fatal("an empty response must fail closed")
 	}
 }
+
+func TestServicesDownNamesWhatANodeNeedsAndDoesNotRun(t *testing.T) {
+	running := func(id string) ServiceStatus { return ServiceStatus{ID: id, Running: true, Healthy: true} }
+
+	all := []ServiceStatus{running(ServiceCRI), running(ServiceKubelet), running(ServiceEtcd), running("apid")}
+	if down := ServicesDown(MachineTypeControlPlane, all); len(down) != 0 {
+		t.Fatalf("a control plane running everything has nothing down: %v", down)
+	}
+
+	// Talos lists only services that run: a kubelet it lost is missing.
+	if down := ServicesDown(MachineTypeWorker, []ServiceStatus{running(ServiceCRI)}); !slices.Equal(down, []string{"kubelet does not run"}) {
+		t.Fatalf("a missing kubelet does not run: %v", down)
+	}
+
+	// etcd is needed on a control plane only.
+	if down := ServicesDown(MachineTypeWorker, []ServiceStatus{running(ServiceCRI), running(ServiceKubelet)}); len(down) != 0 {
+		t.Fatalf("a worker needs no etcd: %v", down)
+	}
+
+	withoutEtcd := []ServiceStatus{running(ServiceCRI), running(ServiceKubelet)}
+	if down := ServicesDown(MachineTypeControlPlane, withoutEtcd); !slices.Equal(down, []string{"etcd does not run"}) {
+		t.Fatalf("a control plane needs etcd: %v", down)
+	}
+
+	unhealthy := []ServiceStatus{running(ServiceCRI), {ID: ServiceKubelet, Running: true}}
+	if down := ServicesDown(MachineTypeWorker, unhealthy); !slices.Equal(down, []string{"kubelet is not healthy"}) {
+		t.Fatalf("a kubelet that fails its health check is down: %v", down)
+	}
+
+	// A service without a health check is as healthy as running makes it.
+	unchecked := []ServiceStatus{{ID: ServiceCRI, Running: true, Unknown: true}, running(ServiceKubelet)}
+	if down := ServicesDown(MachineTypeWorker, unchecked); len(down) != 0 {
+		t.Fatalf("a running service without a health check is not down: %v", down)
+	}
+}

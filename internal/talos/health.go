@@ -17,12 +17,14 @@ limitations under the License.
 package talos
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/netip"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -35,6 +37,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	timeres "github.com/siderolabs/talos/pkg/machinery/resources/time"
+	"google.golang.org/grpc/codes"
 )
 
 // What Talos says about a node besides whether it is ready (docs/scope.md §14.2), and the last
@@ -157,7 +160,8 @@ func (r *machineryReader) Volumes(ctx context.Context, node netip.Addr) ([]Volum
 	return out, nil
 }
 
-// Logs implements Reader: the end of the log of one of the node's services.
+// Logs implements Reader: the end of the log of one of the node's services, without the lines
+// that only say a read was answered.
 func (r *machineryReader) Logs(ctx context.Context, node netip.Addr, service string, lines int32) ([]byte, error) {
 	ctx, cancel := r.callContext(ctx, node)
 	defer cancel()
@@ -167,7 +171,21 @@ func (r *machineryReader) Logs(ctx context.Context, node netip.Addr, service str
 		return nil, fmt.Errorf("logs of %s on %s: %w", service, node, err)
 	}
 
-	return theEnd(stream, "logs of "+service, node)
+	return theEnd(stream, "logs of "+service, node, func(line []byte) bool { return !answeredRead(line) })
+}
+
+// accessLine is how Talos logs an API call it answered: the status code, the method in brackets,
+// how long it took, and whether it was unary or a stream (pkg/grpc/middleware/log/log.go:92,118 in
+// Talos v1.14), after the logger's own prefix.
+var accessLine = regexp.MustCompile(`(?:^|\s)(\w+) \[(/[\w.]+/\w+)\] \S+ (?:unary|stream) `)
+
+// answeredRead reports whether line is Talos's record of a read that succeeded. Every observation
+// of every node is one, this operator's included: they are most of machined's and apid's logs, and
+// the end of a log that is kept would hold nothing else. A write, and a call that failed, are kept.
+func answeredRead(line []byte) bool {
+	m := accessLine.FindSubmatch(line)
+
+	return m != nil && string(m[1]) == codes.OK.String() && readOnlyMethods[string(m[2])]
 }
 
 // Dmesg implements Reader: the end of the node's kernel log.
@@ -180,12 +198,12 @@ func (r *machineryReader) Dmesg(ctx context.Context, node netip.Addr) ([]byte, e
 		return nil, fmt.Errorf("kernel log of %s: %w", node, err)
 	}
 
-	return theEnd(stream, "kernel log", node)
+	return theEnd(stream, "kernel log", node, nil)
 }
 
 // theEnd reads a log stream to its end and keeps the last maxLog bytes of it, from the start of a
-// line.
-func theEnd(stream client.MachineStream, what string, node netip.Addr) ([]byte, error) {
+// line. keep, when set, says which lines are kept at all: those it leaves out take no room.
+func theEnd(stream client.MachineStream, what string, node netip.Addr, keep func(line []byte) bool) ([]byte, error) {
 	reader, err := client.ReadStream(stream)
 	if err != nil {
 		return nil, fmt.Errorf("%s on %s: %w", what, node, err)
@@ -195,14 +213,16 @@ func theEnd(stream client.MachineStream, what string, node netip.Addr) ([]byte, 
 
 	var kept []byte
 
-	buf := make([]byte, 32<<10)
+	lines := bufio.NewReaderSize(reader, 32<<10)
 
 	for {
-		n, err := reader.Read(buf)
+		line, err := lines.ReadBytes('\n')
 
-		kept = append(kept, buf[:n]...)
-		if len(kept) > 2*maxLog {
-			kept = slices.Clone(kept[len(kept)-maxLog:])
+		if len(line) > 0 && (keep == nil || keep(line)) {
+			kept = append(kept, line...)
+			if len(kept) > 2*maxLog {
+				kept = slices.Clone(kept[len(kept)-maxLog:])
+			}
 		}
 
 		if errors.Is(err, io.EOF) {

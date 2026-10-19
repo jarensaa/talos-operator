@@ -1052,8 +1052,8 @@ spec:
                         description: Message describes the failure.
                         type: string
                       reason:
-                        description: Reason is a machine-readable cause, e.g. RolledBack
-                          or NodeUnreachableAfterRollback.
+                        description: Reason is a machine-readable cause, e.g. RolledBack,
+                          RolledBackUnhealthy or NodeUnreachableAfterRollback.
                         type: string
                       remediation:
                         description: Remediation suggests the next human action.
