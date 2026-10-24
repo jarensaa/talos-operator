@@ -20,6 +20,11 @@ limitations under the License.
 // It reads the resources when it is scraped and keeps nothing itself. Every replica therefore
 // exports the same, the leader or not, a resource that is deleted takes its series with it, and
 // nothing here can disagree with the status a person reads. It asks no node anything.
+//
+// One thing is not in status: when the operator last finished observing a cluster. A cluster at
+// rest is not written to, so status says only when what was observed last changed. The replica
+// that observes, the leader, knows it, and exports it (Observations); every other replica exports
+// what status says, which is never later.
 package exporter
 
 import (
@@ -158,18 +163,26 @@ const (
 	learner = "learner"
 )
 
+// Observations says when this replica last finished observing a cluster, if it did.
+type Observations interface {
+	LastObserved(cluster types.NamespacedName) (time.Time, bool)
+}
+
 // Collector exports the state of every TalosCluster and TalosMachine a reader has.
 type Collector struct {
-	reader     client.Reader
-	readErrors prometheus.Counter
+	reader       client.Reader
+	observations Observations
+	readErrors   prometheus.Counter
 }
 
 var _ prometheus.Collector = (*Collector)(nil)
 
-// New returns a collector that reads from reader at every scrape: the manager's cache.
-func New(reader client.Reader) *Collector {
+// New returns a collector that reads from reader at every scrape: the manager's cache. It asks
+// observations when a cluster was last observed; nil means this replica never observes one.
+func New(reader client.Reader, observations Observations) *Collector {
 	return &Collector{
-		reader: reader,
+		reader:       reader,
+		observations: observations,
 		readErrors: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "talos_operator_state_read_errors_total",
 			Help: "Scrapes at which the operator could not read its resources, and so exported nothing about them.",
@@ -229,7 +242,7 @@ func (c *Collector) state(ctx context.Context) ([]prometheus.Metric, error) {
 	var out []prometheus.Metric
 
 	for i := range clusters.Items {
-		out = append(out, clusterMetrics(&clusters.Items[i])...)
+		out = append(out, c.clusterMetrics(&clusters.Items[i])...)
 	}
 
 	byName := map[types.NamespacedName]*talosv1alpha1.TalosMachinePool{}
@@ -252,7 +265,7 @@ func (c *Collector) state(ctx context.Context) ([]prometheus.Metric, error) {
 	return out, nil
 }
 
-func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
+func (c *Collector) clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 	st := &tc.Status
 	base := labels{tc.Namespace, tc.Name}
 
@@ -297,10 +310,10 @@ func clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.Metric {
 			gauge(clusterEtcdDesc, float64(len(obs.EtcdMembers)-learners), base.with(voter)...),
 			gauge(clusterEtcdDesc, float64(learners), base.with(learner)...),
 		)
+	}
 
-		if obs.ObservedAt != nil {
-			out = append(out, gauge(clusterObservedDesc, seconds(*obs.ObservedAt), base...))
-		}
+	if at, ok := c.lastObserved(tc); ok {
+		out = append(out, gauge(clusterObservedDesc, float64(at.Unix()), base...))
 	}
 
 	for _, cert := range st.Certificates {
@@ -458,6 +471,26 @@ func truth(b bool) float64 {
 }
 
 func seconds(t metav1.Time) float64 { return float64(t.Unix()) }
+
+// lastObserved is when the cluster was last observed: when this replica last finished observing
+// it, and never before status last recorded an observation. A replica that does not observe
+// exports what status says, so the alert has an age to judge whatever replica is scraped, and
+// one that grows while nobody observes.
+func (c *Collector) lastObserved(tc *talosv1alpha1.TalosCluster) (time.Time, bool) {
+	var at time.Time
+
+	if obs := tc.Status.Observed; obs != nil && obs.ObservedAt != nil {
+		at = obs.ObservedAt.Time
+	}
+
+	if c.observations != nil {
+		if mine, ok := c.observations.LastObserved(client.ObjectKeyFromObject(tc)); ok && mine.After(at) {
+			at = mine
+		}
+	}
+
+	return at, !at.IsZero()
+}
 
 // build is the version and the commit the binary was built from, as far as the build recorded
 // them.

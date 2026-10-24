@@ -489,7 +489,9 @@ type ObservedState struct {
 	// +optional
 	EtcdMembers []EtcdMember `json:"etcdMembers,omitempty"`
 
-	// ObservedAt is when this observation completed.
+	// ObservedAt is when what is observed last changed. A cluster at rest is not written to, so
+	// it does not move while the cluster stays as it is; the operator's metrics say when it last
+	// finished an observation.
 	// +optional
 	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
 }

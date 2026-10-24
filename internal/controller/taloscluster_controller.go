@@ -91,6 +91,9 @@ type TalosClusterReconciler struct {
 	// NodeName is the Kubernetes node this replica runs on, if it knows. An upgrade takes that
 	// node last in its group, so the operator moves house as rarely as it can.
 	NodeName string
+	// Observations is told when an observation of a cluster finished, which status does not say
+	// of a cluster at rest. Nil means nobody is told.
+	Observations *Observations
 }
 
 // +kubebuilder:rbac:groups=talos.jarensaa.github.io,resources=talosclusters,verbs=get;list;watch;update;patch
@@ -106,6 +109,10 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	tc := &talosv1alpha1.TalosCluster{}
 	if err := r.Get(ctx, req.NamespacedName, tc); err != nil {
+		if apierrors.IsNotFound(err) && r.Observations != nil {
+			r.Observations.forget(req.NamespacedName)
+		}
+
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -179,6 +186,12 @@ func (r *TalosClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 		logTransitions(ctx, original.Status.Conditions, tc.Status.Conditions)
 		r.emitTransitions(ctx, original, tc)
+	}
+
+	// The cluster was read and status says what was found, whether it was written now or already
+	// said so: that is an observation finished, even when nothing in status moved.
+	if obs.reachable && r.Observations != nil {
+		r.Observations.observed(req.NamespacedName, r.now())
 	}
 
 	if obs.err != nil {
@@ -714,7 +727,7 @@ func (r *TalosClusterReconciler) applyObservation(tc *talosv1alpha1.TalosCluster
 	}
 
 	// ObservedAt marks when the observation last changed, so an unchanged cluster produces no
-	// status writes at all.
+	// status writes at all. When an observation last finished is Observations' to say.
 	if st.Observed != nil {
 		observed.ObservedAt = st.Observed.ObservedAt
 

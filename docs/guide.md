@@ -648,7 +648,7 @@ Every alert names the cluster in the labels `namespace` and `taloscluster`, and 
 
 ### Metrics
 
-All of them start with `talos_operator_`, and all of them are what the status of your resources says, read when the operator is scraped. Both replicas export the same, so take the maximum, as the alerts do:
+All of them start with `talos_operator_`, and all of them are what the status of your resources says, read when the operator is scraped. Both replicas export the same, so take the maximum, as the alerts do. One is not in status: when the operator last finished observing the cluster. The leader, which observes, exports it as it goes; the other replica exports `status.observed.observedAt`, which says when what was observed last changed and so stands still while the cluster does:
 
 ```promql
 max by (taloscluster) (talos_operator_cluster_operation_halted)
@@ -658,7 +658,7 @@ max by (taloscluster) (talos_operator_cluster_operation_halted)
 |---|---|
 | `info` | An operator is running, and which build. |
 | `cluster_phase`, `cluster_condition` | The cluster's phase, and each of its conditions with the status and reason it has now. |
-| `cluster_observed_timestamp_seconds` | When the operator last finished observing the cluster. |
+| `cluster_observed_timestamp_seconds` | When the operator last finished observing the cluster. Only the leader's moves while the cluster is at rest. |
 | `cluster_operation_in_progress`, `cluster_operation_halted`, `cluster_approval_pending` | 0 or 1. |
 | `operation_info`, `operation_start_timestamp_seconds`, `operation_turns` | The rollout or upgrade in flight, and how far it is. |
 | `operation_failure_info`, `operation_failure_timestamp_seconds` | Where a halted operation waits: the machine, the step, the reason. |

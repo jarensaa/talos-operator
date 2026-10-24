@@ -912,7 +912,10 @@ spec:
                       the middle of an upgrade's step reports the version it tries.
                     type: string
                   observedAt:
-                    description: ObservedAt is when this observation completed.
+                    description: |-
+                      ObservedAt is when what is observed last changed. A cluster at rest is not written to, so
+                      it does not move while the cluster stays as it is; the operator's metrics say when it last
+                      finished an observation.
                     format: date-time
                     type: string
                   talosVersions:

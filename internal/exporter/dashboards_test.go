@@ -46,7 +46,7 @@ func exported(t *testing.T) map[string][]string {
 	t.Helper()
 
 	descs := make(chan *prometheus.Desc, 256)
-	New(fake.NewClientBuilder().WithScheme(scheme(t)).Build()).Describe(descs)
+	New(fake.NewClientBuilder().WithScheme(scheme(t)).Build(), nil).Describe(descs)
 	close(descs)
 
 	out := map[string][]string{

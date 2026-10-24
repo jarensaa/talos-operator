@@ -65,7 +65,9 @@ type scenario struct {
 	// noOperator: nothing is scraped. cannotRead: the operator's reads fail. notObserving: the
 	// last observation stays where it was, where otherwise the operator keeps observing.
 	noOperator, cannotRead, notObserving bool
-	// replicas is how many replicas are scraped, each exporting the same; one if not set.
+	// replicas is how many replicas are scraped; one if not set. The first is the leader, which
+	// observes; the others export the same state, and of the last observation what status says,
+	// which stays where it was while the cluster is at rest.
 	replicas int
 	fires    []fired
 }
@@ -151,9 +153,24 @@ func scenarios() []scenario {
 					"every metric and alert that comes from it, is that old.",
 			}},
 		},
+		{
+			// The leader finishes an observation every minute and writes nothing: status keeps
+			// the time of the last change, which a standby exports. That is no alert.
+			name: "a cluster at rest, seen through a leader and a standby", replicas: 2,
+		},
+		{
+			name: "an operator that has stopped observing, seen through two replicas", notObserving: true, replicas: 2,
+			fires: []fired{{
+				alert: "TalosClusterNotObserved", severity: "warning",
+				summary: "talos-operator has stopped observing my-cluster.",
+				description: "The last observation of my-cluster that the operator finished is 2h 0m 0s old. Its status, and " +
+					"every metric and alert that comes from it, is that old.",
+			}},
+		},
 		{name: "a config rollout halted at a node that rolled back", change: halted, fires: []fired{haltedAlert}},
 		{
-			// Every replica exports the same state, and it is one alert all the same.
+			// Every replica exports the same state, and it is one alert all the same. Only the
+			// leader observes, and the standby's older observation raises nothing.
 			name: "a halted rollout, seen through two replicas", change: halted, replicas: 2, fires: []fired{haltedAlert},
 		},
 		{
@@ -599,20 +616,24 @@ func (s scenario) series(t *testing.T) []inputSeries {
 
 	var out []inputSeries
 
-	for _, sample := range scrape(t, New(reader)) {
+	for _, sample := range scrape(t, New(reader, nil)) {
 		values := fmt.Sprintf("%gx%d", sample.value, samples)
+		leader := values
 
 		switch sample.name {
 		case "talos_operator_info":
 			// The build is the test binary's.
 			sample.labels = map[string]string{"version": "v0.0.0", "revision": "000000000000"}
 		case "talos_operator_cluster_observed_timestamp_seconds":
+			// The cluster is at rest, so status keeps its time; the leader finishes an
+			// observation every minute.
 			if !s.notObserving {
-				values = fmt.Sprintf("0+60x%d", samples)
+				leader = fmt.Sprintf("%g+60x%d", sample.value, samples)
 			}
 		case "talos_operator_state_read_errors_total":
 			if s.cannotRead {
 				values = fmt.Sprintf("0+1x%d", samples)
+				leader = values
 			}
 		}
 
@@ -621,7 +642,12 @@ func (s scenario) series(t *testing.T) []inputSeries {
 				sample.labels["pod"] = fmt.Sprintf("talos-operator-%d", replica)
 			}
 
-			out = append(out, inputSeries{Series: sample.String(), Values: values})
+			exported := values
+			if replica == 0 {
+				exported = leader
+			}
+
+			out = append(out, inputSeries{Series: sample.String(), Values: exported})
 		}
 	}
 
