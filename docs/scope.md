@@ -1256,7 +1256,7 @@ This section scopes those. Findings are verified against the Talos 1.14.0 source
 - The matching values of kube-prometheus-stack (its controller-manager and scheduler endpoints, `kubeProxy` where there is none) stay with whoever deploys it.
 
 **What is exported (M10a and M10b, built).** `internal/exporter` exports what the operator has written into the status of its resources, and that includes what it read from Talos about each node (below). It is a collector that reads TalosClusters, TalosMachinePools and TalosMachines from the manager's cache when it is scraped, and keeps nothing itself:
-- every replica exports the same, the leader or not, so a rule takes the maximum over them and an alert does not depend on which replica is scraped;
+- every replica exports the same, the leader or not, so a rule takes the maximum over them and an alert does not depend on which replica is scraped. One thing is the exception, because status cannot hold it: when the last observation of a cluster finished. A cluster at rest is not written to, so `status.observed.observedAt` moves only when what is observed changes, and stands still for days on a quiet cluster while the operator reads it every minute. The TalosCluster controller tells `controller.Observations` of every pass that reached the cluster and left status saying what it found, written or not; the exporter exports the later of that and `observedAt`. Only the leader observes, so only its series moves; a standby exports `observedAt`, and `TalosClusterNotObserved`, over the maximum, fires when the leader stops observing or is not scraped. The other way, writing `observedAt` on a timer, was not taken: it would write to a cluster at rest;
 - a resource that is deleted takes its series with it;
 - no metric can say anything else than the status a person reads, and no node is asked anything for a scrape;
 - a scrape that cannot read everything exports nothing about the resources and counts it (`talos_operator_state_read_errors_total`): half of a state would look like a state.
@@ -1267,7 +1267,7 @@ Every series of a cluster carries `namespace` and `taloscluster`, and of a machi
 |---|---|
 | `info{version,revision}` | An operator is running. No series means none is scraped. |
 | `cluster_phase{phase}`, `cluster_condition{condition,status,reason}` | The phase, and every condition as it is now. Messages are not exported: they are prose, and can quote a node. |
-| `cluster_observed_timestamp_seconds` | When the last observation finished: how old everything else is. |
+| `cluster_observed_timestamp_seconds` | When the last observation finished: how old everything else is. The leader's own record, never before `status.observed.observedAt` (above). |
 | `cluster_operation_in_progress`, `cluster_operation_halted`, `cluster_approval_pending` | 0 or 1, always there. |
 | `operation_info{type,target}`, `operation_start_timestamp_seconds`, `operation_turns{state}` | The operation that holds the cluster, and how far it is. |
 | `operation_failure_info{type,machine,step,reason,hook}`, `operation_failure_timestamp_seconds` | Where a halted operation waits. There only while it is halted. |

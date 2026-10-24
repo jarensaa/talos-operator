@@ -167,8 +167,9 @@ func metricsOptions(o *options) (metricsserver.Options, *certwatcher.CertWatcher
 	return opts, watcher, nil
 }
 
-// setupControllers registers every controller with the manager.
-func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) error {
+// setupControllers registers every controller with the manager. The TalosCluster controller tells
+// observations when it finished observing a cluster.
+func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, observations *controller.Observations, o *options) error {
 	evictor, err := controller.NewPodEvictor(mgr.GetConfig())
 	if err != nil {
 		return err
@@ -197,9 +198,10 @@ func setupControllers(mgr ctrl.Manager, resolver *target.Resolver, o *options) e
 		Evictor:         evictor,
 		// The chart passes the node's name down; without it the operator simply does not know
 		// which node an upgrade should leave for last.
-		NodeName: os.Getenv("NODE_NAME"),
-		Catalog:  upstream,
-		Signers:  source,
+		NodeName:     os.Getenv("NODE_NAME"),
+		Catalog:      upstream,
+		Signers:      source,
+		Observations: observations,
 		// The cluster the operator runs in is the cluster it manages (docs/scope.md §4.2).
 		KubernetesChecks: controller.KubernetesCheckerFunc(func(ctx context.Context, from, to string) ([]string, error) {
 			return talos.RemovedAPIObjects(ctx, mgr.GetConfig(), from, to)
@@ -268,13 +270,16 @@ func run(o *options) error {
 	talosFactory := talos.NewFactory()
 	defer talosFactory.Close()
 
-	if err := setupControllers(mgr, &target.Resolver{Client: mgr.GetClient(), Factory: talosFactory}, o); err != nil {
+	observations := &controller.Observations{}
+
+	if err := setupControllers(mgr, &target.Resolver{Client: mgr.GetClient(), Factory: talosFactory}, observations, o); err != nil {
 		return err
 	}
 
 	// What the resources' status says, as metrics. Read from the cache at every scrape, so every
-	// replica exports it, the leader or not (docs/scope.md §14.2).
-	metrics.Registry.MustRegister(exporter.New(mgr.GetClient()))
+	// replica exports it, the leader or not (docs/scope.md §14.2). When a cluster was last
+	// observed is not in status: the leader, which observes, says it from observations.
+	metrics.Registry.MustRegister(exporter.New(mgr.GetClient(), observations))
 
 	if metricsCertWatcher != nil {
 		if err := mgr.Add(metricsCertWatcher); err != nil {
