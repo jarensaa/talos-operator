@@ -39,6 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	talosv1alpha1 "github.com/jarensaa/talos-operator/api/v1alpha1"
+	"github.com/jarensaa/talos-operator/internal/plan"
 )
 
 // readTimeout bounds the read behind one scrape. The reads are of a cache, so it only matters
@@ -106,6 +107,9 @@ var (
 	operationTurnsDesc = desc("operation_turns",
 		"Turns of the operation: all that are planned, and those completed or skipped so far.",
 		clusterLabels, "type", "state")
+	operationMachineDesc = desc("operation_machine_info",
+		"The machine whose turn of the operation is in flight, from its preNode hooks to its postNode hooks. Always 1, and "+
+			"there only while a turn is.", clusterLabels, "type", "machine")
 	operationFailureDesc = desc("operation_failure_info",
 		"The failure an operation is halted at. Always 1, and there only while it is halted.",
 		clusterLabels, "type", "machine", "step", "reason", "hook")
@@ -338,6 +342,10 @@ func (c *Collector) clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.
 			gauge(operationTurnsDesc, float64(len(op.Skipped)), base.with(kind, "skipped")...),
 		)
 
+		if machine := inTurn(op); machine != "" {
+			out = append(out, gauge(operationMachineDesc, 1, base.with(kind, machine)...))
+		}
+
 		if failure := op.Failure; failure != nil {
 			out = append(out, gauge(operationFailureDesc, 1, base.with(kind, failure.Machine, failure.Step, failure.Reason, failure.Hook)...))
 
@@ -348,6 +356,27 @@ func (c *Collector) clusterMetrics(tc *talosv1alpha1.TalosCluster) []prometheus.
 	}
 
 	return out
+}
+
+// inTurn is the machine whose turn is in flight: from its preNode hooks, through its step, to
+// its postNode hooks. Empty between turns.
+func inTurn(op *talosv1alpha1.Operation) string {
+	if op.Current != nil {
+		return op.Current.Machine
+	}
+
+	turn := op.Prepared
+
+	switch {
+	case op.Hook != nil && op.Hook.Machine != "":
+		turn = op.Hook.Machine
+	case op.Finishing != "":
+		turn = op.Finishing
+	}
+
+	_, machine := plan.SplitTurn(turn)
+
+	return machine
 }
 
 func machineMetrics(tm *talosv1alpha1.TalosMachine, pool *talosv1alpha1.TalosMachinePool) []prometheus.Metric {

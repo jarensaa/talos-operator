@@ -1207,6 +1207,12 @@ Decided 2026-10-08:
    - **Not built: waiting some days after a release.** The Renovate example does. Neither Image Factory nor the Kubernetes release site says when a release came out, and asking a third service for dates is a decision of its own (22).
    - **Not built: asking the cluster.** A bump on top of one that is still being rolled out is taken by the operator in one plan (§7.5). A script that would rather wait can read `status.versions.plan` before it runs the command.
 
+30. **Alerts an operation is expected to raise are muted by Alertmanager, against an alert of the operator's** (decided 2026-10-27). A rolling upgrade reboots every node in turn, and every reboot raises what it should: a storage cluster that rebalances, a Node that is not ready, pods that are rescheduled. The operator could have created a silence in Alertmanager around each operation, and does not: that is a write to a service outside its resources, with an address and credentials of its own, and a silence lasts as long as it was made for, through a halt and through the operator going down. What it does is export the machine in its turn (`operation_machine_info`) and ship two alerts of severity `none`, `TalosOperationInProgress` and `TalosMachineInOperation`, which an inhibit rule of the owner's names as its source. They come from status like every other alert, so muting ends with what started it:
+   - **A halt ends it at once.** What the operation broke is everybody's to see, next to `TalosOperationHalted`.
+   - **Waiting ends it.** An operation that is paused or outside its window between nodes changes nothing, and mutes nothing. A node that is being finished meanwhile still mutes, through its turn.
+   - **It outlasts the operation by five minutes**, the time an alert that was muted takes to be resolved once its cause is gone. The gates are what make that enough: a node is not done until every gate has been true for the soak (§6.4), so a gate on storage health keeps the operation going until the storage has recovered.
+   - **Which alerts are muted is the owner's.** The operator knows nothing of a storage cluster's alerts and names none of them. An alert about a whole storage cluster carries no node, and is muted for the whole operation; one that names the Node can be muted only while that node is in its turn.
+
 ## 13. Prior art summary
 
 | Project | License | Take | Avoid |
@@ -1270,6 +1276,7 @@ Every series of a cluster carries `namespace` and `taloscluster`, and of a machi
 | `cluster_observed_timestamp_seconds` | When the last observation finished: how old everything else is. The leader's own record, never before `status.observed.observedAt` (above). |
 | `cluster_operation_in_progress`, `cluster_operation_halted`, `cluster_approval_pending` | 0 or 1, always there. |
 | `operation_info{type,target}`, `operation_start_timestamp_seconds`, `operation_turns{state}` | The operation that holds the cluster, and how far it is. |
+| `operation_machine_info{type,machine}` | The machine whose turn is in flight, from its `preNode` hooks to its `postNode` hooks (§6.4). There only while a turn is. |
 | `operation_failure_info{type,machine,step,reason,hook}`, `operation_failure_timestamp_seconds` | Where a halted operation waits. There only while it is halted. |
 | `cluster_version_info{component,desired,running}`, `cluster_version_plan_steps` | Versions asked for and run, and the upgrades between them (§7.5). |
 | `cluster_etcd_members{role}`, `machine_etcd_member{role}` | Voters and learners, as last observed; for each control plane, whether it is one. |
@@ -1313,6 +1320,7 @@ Beside them are `talos_operator_rejected_rpcs_total`, the Talos calls the operat
 | `TalosEtcdDatabaseLarge` | critical | An etcd database is over four fifths of etcd's default quota of 2 GiB. A quota set through `extraArgs` is not known to the rule. |
 | `TalosEtcdFragmented` | warning | A database has been due for defragmenting for an hour, and what holds it back is not a pause, a window or the interval. |
 | `TalosCertificateExpiring`, `TalosCertificateExpired` | warning, critical | Less than a tenth of a certificate's validity is left; none is. A tenth is half an hour of the six hours Talos issues the operator's certificate for, and a year of an authority's ten. |
+| `TalosOperationInProgress`, `TalosMachineInOperation` | none | Not to be told anybody: there to inhibit what an operation is expected to raise elsewhere (§12.30). An operation that is changing nodes, and is neither halted nor held between nodes by a pause or a window; the machine in its turn, with its Node. Both go on for five minutes after it ended. |
 
 A rule that names a series or a label wrongly is silent for good, so the rules are tested on what the exporter exports: `internal/exporter` holds scenarios, each a state of the resources and the alerts it has to raise, and writes from them a test for promtool whose input is the collector's own output (`make alerts`, `make alerts-test`). Every alert is asked about in every scenario, the ones that must stay quiet included, and an alert that no scenario raises fails the unit tests.
 

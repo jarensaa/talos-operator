@@ -499,6 +499,79 @@ func TestCollectorExportsTheOperation(t *testing.T) {
 	}
 }
 
+// A machine is in its turn from its preNode hooks to its postNode hooks, and nobody is between
+// turns.
+func TestCollectorExportsTheMachineInItsTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   talosv1alpha1.Operation
+		want string
+	}{
+		{name: "before the first turn", op: talosv1alpha1.Operation{Announced: true}},
+		{
+			name: "its preNode hooks run",
+			op: talosv1alpha1.Operation{Announced: true, Hook: &talosv1alpha1.HookRun{
+				Stage: talosv1alpha1.HookPreNode, Machine: "node-a", Job: "hook-1", Attempt: 1, Since: epoch,
+			}},
+			want: "node-a",
+		},
+		{name: "its preNode hooks ran", op: talosv1alpha1.Operation{Announced: true, Prepared: "node-a"}, want: "node-a"},
+		{
+			name: "its step",
+			op: talosv1alpha1.Operation{
+				Announced: true, Prepared: "node-a", Current: &talosv1alpha1.OperationStep{Machine: "node-a", Step: "Rebooting"},
+			},
+			want: "node-a",
+		},
+		{
+			name: "a component of it",
+			op: talosv1alpha1.Operation{Type: talosv1alpha1.OperationKubernetesUpgrade, Announced: true, Current: &talosv1alpha1.OperationStep{
+				Machine: "node-b", Component: "kubelet", Step: "Verifying",
+			}},
+			want: "node-b",
+		},
+		{
+			name: "its postNode hooks are due",
+			op:   talosv1alpha1.Operation{Announced: true, Prepared: "node-c", Finishing: "node-c"}, want: "node-c",
+		},
+		{
+			name: "a preRollout hook runs",
+			op: talosv1alpha1.Operation{Hook: &talosv1alpha1.HookRun{
+				Stage: talosv1alpha1.HookPreRollout, Job: "hook-0", Attempt: 1, Since: epoch,
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := healthy()
+			op := tc.op
+			op.ID, op.StartedAt = "op-1", epoch
+
+			if op.Type == "" {
+				op.Type = talosv1alpha1.OperationTalosUpgrade
+			}
+
+			f.cluster.Status.Operation = &op
+
+			var got []string
+
+			for series := range collect(t, f.objects()...) {
+				if strings.HasPrefix(series, "talos_operator_operation_machine_info") {
+					got = append(got, series)
+				}
+			}
+
+			want := of("talos_operator_operation_machine_info", "type", string(op.Type), "machine", tc.want)
+
+			switch {
+			case tc.want == "" && len(got) > 0:
+				t.Errorf("got %v, want none", got)
+			case tc.want != "" && (len(got) != 1 || got[0] != want):
+				t.Errorf("got %v, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // observedAt is what a replica remembers of its own observations.
 type observedAt map[types.NamespacedName]time.Time
 

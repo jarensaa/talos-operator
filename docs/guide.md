@@ -639,12 +639,54 @@ The metrics endpoint is HTTPS and asks the Kubernetes API whether the scraper ma
 | `TalosNodeClockNotSynced` | warning | A node's clock has not been synchronised for 10 minutes. |
 | `TalosBondMemberDown` | warning | A link that is a member of a bond has been down for 5 minutes. |
 | `TalosVolumeNotReady` | warning | One of Talos's volumes on a node, such as `STATE` or `EPHEMERAL`, has not been ready for 15 minutes. |
+| `TalosOperationInProgress` | none | An operation is changing the cluster's nodes. Tells nobody anything: it is there to mute other alerts ([Muting alerts while an operation runs](#muting-alerts-while-an-operation-runs)). |
+| `TalosMachineInOperation` | none | A machine is in its turn of an operation. The same, for the alerts about one node. |
 
 Waiting as you told it to raises nothing: a paused cluster, a change outside its maintenance window, an etcd that waits for its interval.
 
 The alerts about a node are about nodes that answer. A node that cannot be read exports nothing of what Talos said about it before, and raises `TalosMachineNotObserved` instead. A link that is down and in no bond raises nothing either: it may be a port nothing is plugged into. The dashboard shows it.
 
 Every alert names the cluster in the labels `namespace` and `taloscluster`, and where it is about one, the `machine`. Its description says where in the TalosCluster's status to read on.
+
+### Muting alerts while an operation runs
+
+A rolling upgrade reboots every node in turn, and the rest of your monitoring sees each reboot: Ceph rebalances and raises its health warnings, a Node is not ready, pods are rescheduled. The chart has two alerts for muting those with an inhibit rule of Alertmanager. They notify nobody themselves:
+
+- **`TalosOperationInProgress`** fires while an operation is changing the cluster's nodes. Its labels are `namespace`, `taloscluster` and `type`: `ConfigRollout`, `TalosUpgrade`, `KubernetesUpgrade`, `AddMachine`, `RemoveMachine` or `EtcdDefragment`.
+- **`TalosMachineInOperation`** fires while one machine is in its turn, from its `preNode` hooks to its `postNode` hooks. It has the labels above, the `machine`, and the `node`: the name of its Kubernetes Node, as kube-state-metrics' alerts call it.
+
+Neither fires while the operation is halted: muting ends at once, and what the operation broke reaches you along with `TalosOperationHalted`. An operation that is paused, or outside its maintenance window between nodes, changes nothing and mutes nothing; a node that is being finished meanwhile is still in its turn. Both go on firing for five minutes after the turn or the operation ended, because an alert that was muted takes a few evaluations to be resolved once its cause is gone.
+
+In Alertmanager's config, route the two to a receiver that sends nothing, and name them as the source of an inhibit rule. With kube-prometheus-stack, in its values:
+
+```yaml
+alertmanager:
+  config:
+    route:
+      routes:
+        - receiver: "null"
+          matchers: [alertname=~"TalosOperationInProgress|TalosMachineInOperation"]
+    receivers:
+      - name: "null"
+    inhibit_rules:
+      # Ceph's alerts are about the whole storage cluster, and carry no node: mute them while
+      # an operation takes nodes down. A Kubernetes upgrade or a defragmentation of etcd does not.
+      - source_matchers:
+          - alertname="TalosOperationInProgress"
+          - type=~"TalosUpgrade|ConfigRollout|RemoveMachine"
+        target_matchers: [namespace="rook-ceph"]
+      # The alerts about one Node, while that node is in its turn and no other.
+      - source_matchers: [alertname="TalosMachineInOperation"]
+        target_matchers: [alertname=~"KubeNodeNotReady|KubeNodeUnreachable|KubeNodeReadinessFlapping"]
+        equal: [node]
+```
+
+Merge it into the config you have. Helm replaces a list in values as a whole, so these lists take the place of kube-prometheus-stack's own: keep its route of `Watchdog`, its receivers and its inhibit rules in yours. Which alerts to mute is yours to choose, and so is the namespace your storage runs in. What a rule mutes, you do not hear about during the operation, so keep it to what an operation is expected to raise. Two things hold up the operation itself whatever is muted:
+
+- **A gate on storage health** (`spec.rollout.gates`) is asked before a node is touched and while a changed node is verified. A node is not done until it has been true for the soak, so the operation does not end, and muting does not stop, while the storage is still recovering; and storage that does not recover halts the operation, which ends the muting.
+- **The operator's own alerts are not muted** by these rules, as long as yours do not name them.
+
+If one Prometheus watches several clusters, add the label it tells them apart by, `cluster` for instance, to `equal` in both rules.
 
 ### Metrics
 
@@ -661,6 +703,7 @@ max by (taloscluster) (talos_operator_cluster_operation_halted)
 | `cluster_observed_timestamp_seconds` | When the operator last finished observing the cluster. Only the leader's moves while the cluster is at rest. |
 | `cluster_operation_in_progress`, `cluster_operation_halted`, `cluster_approval_pending` | 0 or 1. |
 | `operation_info`, `operation_start_timestamp_seconds`, `operation_turns` | The rollout or upgrade in flight, and how far it is. |
+| `operation_machine_info` | The machine whose turn is in flight, from its `preNode` hooks to its `postNode` hooks. |
 | `operation_failure_info`, `operation_failure_timestamp_seconds` | Where a halted operation waits: the machine, the step, the reason. |
 | `cluster_version_info`, `cluster_version_plan_steps` | The versions asked for and run, and how many upgrades lie between them. |
 | `cluster_etcd_members`, `machine_etcd_member` | Voters and learners; for each control plane, whether it is one. |
