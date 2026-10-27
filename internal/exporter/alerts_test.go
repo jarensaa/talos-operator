@@ -19,6 +19,7 @@ package exporter
 import (
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -65,6 +66,9 @@ type scenario struct {
 	// noOperator: nothing is scraped. cannotRead: the operator's reads fail. notObserving: the
 	// last observation stays where it was, where otherwise the operator keeps observing.
 	noOperator, cannotRead, notObserving bool
+	// was is the state the scenario was in until ago minutes before the end, if it was in another.
+	was func(f *fixture)
+	ago int
 	// replicas is how many replicas are scraped; one if not set. The first is the leader, which
 	// observes; the others export the same state, and of the last observation what status says,
 	// which stays where it was while the cluster is at rest.
@@ -116,6 +120,37 @@ func scenarios() []scenario {
 			description: "The operator has not been able to read the node of " + machine + " in my-cluster for 10 minutes. " +
 				"What is not read is not known: no other node is touched while it lasts.",
 		}
+	}
+
+	inProgress := func(kind string) fired {
+		return fired{
+			alert: "TalosOperationInProgress", severity: "none", labels: []string{"type", kind},
+			summary: "A " + kind + " of my-cluster is in progress.",
+			description: "The " + kind + " of my-cluster is changing its nodes. This alert is there to inhibit the alerts the " +
+				"operation is expected to raise; it does not fire while the operation is paused or outside its maintenance " +
+				"window between nodes, or halted.",
+		}
+	}
+
+	// node-b's Kubernetes Node is called otherwise, as a machine's may be.
+	renamed := func(f *fixture) { f.machine("node-b").Status.Identity.KubernetesNodeName = "host-b" }
+
+	rebooting := func(f *fixture) {
+		renamed(f)
+		f.cluster.Status.Operation = &talosv1alpha1.Operation{
+			ID: "op-5", Type: talosv1alpha1.OperationTalosUpgrade, Target: "v1.14.3", StartedAt: epoch, Announced: true,
+			Plan: []string{"node-d", "node-b", "node-c", "node-a"}, Completed: []string{"node-d"}, Prepared: "node-b",
+			Current: &talosv1alpha1.OperationStep{Machine: "node-b", Step: "Rebooting"},
+		}
+	}
+
+	inOperation := fired{
+		alert: "TalosMachineInOperation", severity: "none",
+		labels:  []string{"type", "TalosUpgrade", "machine", "node-b", "node", "host-b"},
+		summary: "node-b is being changed by a TalosUpgrade.",
+		description: "The TalosUpgrade of my-cluster is changing node-b, the node host-b: from its preNode hooks to its " +
+			"postNode hooks. This alert is there to inhibit the alerts about that node the operation is expected to raise; it " +
+			"does not fire while the operation is halted.",
 	}
 
 	unobserved := func(tm *talosv1alpha1.TalosMachine) {
@@ -195,7 +230,7 @@ func scenarios() []scenario {
 			}},
 		},
 		{
-			// Running is not a reason to wake anybody.
+			// Running is not a reason to wake anybody: it only mutes what it is expected to raise.
 			name: "an upgrade that is running",
 			change: func(f *fixture) {
 				f.cluster.Status.Operation = &talosv1alpha1.Operation{
@@ -203,6 +238,52 @@ func scenarios() []scenario {
 					Plan: []string{"kube-apiserver/node-a", "kubelet/node-a"}, Completed: []string{"kube-apiserver/node-a"},
 				}
 			},
+			fires: []fired{inProgress("KubernetesUpgrade")},
+		},
+		{name: "a Talos upgrade that reboots a node", change: rebooting, fires: []fired{inProgress("TalosUpgrade"), inOperation}},
+		{
+			// The node that is being changed is finished, and its turn mutes what it raises.
+			name: "a Talos upgrade that is paused while it reboots a node",
+			change: func(f *fixture) {
+				rebooting(f)
+				f.is(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonPaused)
+			},
+			fires: []fired{inProgress("TalosUpgrade"), inOperation},
+		},
+		{
+			// Between nodes, nothing is being changed: nothing is muted.
+			name: "a Talos upgrade that waits for its maintenance window between nodes",
+			change: func(f *fixture) {
+				rebooting(f)
+				op := f.cluster.Status.Operation
+				op.Current, op.Prepared, op.Completed = nil, "", append(op.Completed, "node-b")
+				f.is(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOutsideWindow)
+			},
+		},
+		{
+			// What it muted takes a few evaluations to be resolved.
+			name: "a Talos upgrade that ended three minutes ago", was: rebooting, ago: 3, change: renamed,
+			fires: []fired{inProgress("TalosUpgrade"), inOperation},
+		},
+		{name: "a Talos upgrade that ended ten minutes ago", was: rebooting, ago: 10, change: renamed},
+		{
+			// A halt is everybody's to see at once.
+			name: "a Talos upgrade that halted three minutes ago at the node it rebooted", was: rebooting, ago: 3,
+			change: func(f *fixture) {
+				rebooting(f)
+				f.cluster.Status.Operation.Failure = &talosv1alpha1.OperationFailure{
+					Machine: "node-b", Step: "Booting", Reason: "NodeUnreachable", At: &epoch,
+				}
+				f.is(talosv1alpha1.ConditionRolloutBlocked, metav1.ConditionTrue, talosv1alpha1.ReasonOperationFailed)
+			},
+			fires: []fired{{
+				alert: "TalosOperationHalted", severity: "critical",
+				labels:  []string{"type", "TalosUpgrade", "machine", "node-b", "step", "Booting", "reason", "NodeUnreachable"},
+				summary: "A TalosUpgrade of my-cluster has failed and waits for a person.",
+				description: "The TalosUpgrade of my-cluster is halted at Booting on node-b (NodeUnreachable). It holds the cluster " +
+					"until someone retries it, skips the machine or aborts it: status.operation.failure of the TalosCluster says " +
+					"what happened and what to do.",
+			}},
 		},
 		// Waiting as it was told to is not a reason either.
 		{name: "a rollout that waits for its maintenance window", change: blocked(talosv1alpha1.ReasonOutsideWindow)},
@@ -478,6 +559,7 @@ func scenarios() []scenario {
 					Plan: []string{"node-b", "node-c", "node-a"}, Completed: []string{"node-b"},
 				}
 			},
+			fires: []fired{inProgress("EtcdDefragment")},
 		},
 		{
 			name: "a certificate authority in the last tenth of its ten years",
@@ -594,7 +676,8 @@ func alertNames(t *testing.T) []string {
 	return names
 }
 
-// series is what a Prometheus would have of the scenario after two hours.
+// series is what a Prometheus would have of the scenario after two hours: of the state it was in
+// until ago minutes before, if it was in another, and of the one it is in since.
 func (s scenario) series(t *testing.T) []inputSeries {
 	t.Helper()
 
@@ -602,9 +685,70 @@ func (s scenario) series(t *testing.T) []inputSeries {
 		return []inputSeries{}
 	}
 
+	// A sample every minute, both ends included.
+	total := samples + 1
+	parts := []part{{change: s.change, n: total}}
+
+	if s.was != nil {
+		parts = []part{{change: s.was, n: total - s.ago}, {change: s.change, from: total - s.ago, n: s.ago}}
+	}
+
+	values := map[string][]string{}
+
+	for i, p := range parts {
+		for _, got := range s.scrape(t, p.change) {
+			for replica := range max(s.replicas, 1) {
+				labels := maps.Clone(got.labels)
+				if s.replicas > 1 {
+					labels["pod"] = fmt.Sprintf("talos-operator-%d", replica)
+				}
+
+				key := sample{name: got.name, labels: labels}.String()
+				if values[key] == nil {
+					values[key] = make([]string, len(parts))
+				}
+
+				values[key][i] = s.values(got, replica == 0, p.from, p.n)
+			}
+		}
+	}
+
+	out := make([]inputSeries, 0, len(values))
+
+	for key, list := range values {
+		// A series that is not there yet is missing; one that went away is marked stale, as a
+		// Prometheus marks what a scrape no longer has.
+		for i := range list {
+			switch {
+			case list[i] != "":
+			case i > 0 && list[i-1] != "" && !strings.HasPrefix(list[i-1], "_"):
+				list[i] = strings.TrimSpace("stale " + missing(parts[i].n-1))
+			default:
+				list[i] = missing(parts[i].n)
+			}
+		}
+
+		out = append(out, inputSeries{Series: key, Values: strings.Join(list, " ")})
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Series < out[j].Series })
+
+	return out
+}
+
+// part is a state of the cluster for n samples, from the sample from.
+type part struct {
+	change  func(f *fixture)
+	from, n int
+}
+
+// scrape is what the collector exports of a healthy cluster that change made into the scenario.
+func (s scenario) scrape(t *testing.T, change func(f *fixture)) []sample {
+	t.Helper()
+
 	f := healthy()
-	if s.change != nil {
-		s.change(f)
+	if change != nil {
+		change(f)
 	}
 
 	var reader client.Reader = fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(f.objects()...).Build()
@@ -612,48 +756,43 @@ func (s scenario) series(t *testing.T) []inputSeries {
 		reader = failing{Reader: reader, kind: "*v1alpha1.TalosClusterList"}
 	}
 
-	replicas := max(s.replicas, 1)
+	out := scrape(t, New(reader, nil))
 
-	var out []inputSeries
-
-	for _, sample := range scrape(t, New(reader, nil)) {
-		values := fmt.Sprintf("%gx%d", sample.value, samples)
-		leader := values
-
-		switch sample.name {
-		case "talos_operator_info":
-			// The build is the test binary's.
-			sample.labels = map[string]string{"version": "v0.0.0", "revision": "000000000000"}
-		case "talos_operator_cluster_observed_timestamp_seconds":
-			// The cluster is at rest, so status keeps its time; the leader finishes an
-			// observation every minute.
-			if !s.notObserving {
-				leader = fmt.Sprintf("%g+60x%d", sample.value, samples)
-			}
-		case "talos_operator_state_read_errors_total":
-			if s.cannotRead {
-				values = fmt.Sprintf("0+1x%d", samples)
-				leader = values
-			}
-		}
-
-		for replica := range replicas {
-			if replicas > 1 {
-				sample.labels["pod"] = fmt.Sprintf("talos-operator-%d", replica)
-			}
-
-			exported := values
-			if replica == 0 {
-				exported = leader
-			}
-
-			out = append(out, inputSeries{Series: sample.String(), Values: exported})
+	for i := range out {
+		// The build is the test binary's.
+		if out[i].name == "talos_operator_info" {
+			out[i].labels = map[string]string{"version": "v0.0.0", "revision": "000000000000"}
 		}
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].Series < out[j].Series })
-
 	return out
+}
+
+// values is what a replica exports of a sample for n samples, from the sample from.
+func (s scenario) values(got sample, leader bool, from, n int) string {
+	switch got.name {
+	case "talos_operator_cluster_observed_timestamp_seconds":
+		// The cluster is at rest, so status keeps its time; the leader finishes an observation
+		// every minute.
+		if leader && !s.notObserving {
+			return fmt.Sprintf("%g+60x%d", got.value+float64(60*from), n-1)
+		}
+	case "talos_operator_state_read_errors_total":
+		if s.cannotRead {
+			return fmt.Sprintf("%d+1x%d", from, n-1)
+		}
+	}
+
+	return fmt.Sprintf("%gx%d", got.value, n-1)
+}
+
+// missing is n samples that a scrape did not have.
+func missing(n int) string {
+	if n <= 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("_x%d", n)
 }
 
 func TestAlertScenarios(t *testing.T) {

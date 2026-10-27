@@ -331,3 +331,54 @@ groups:
             The {{ $labels.certificate }} certificate of {{ $labels.taloscluster }} has reached the
             end of its validity. Without its own certificate the operator reaches no node; without
             an authority nothing in the cluster trusts anything.
+
+  # Alerts that tell nobody anything and are there to be inhibited by: what an operation is
+  # expected to raise elsewhere, a storage cluster that rebalances or a node that reboots, is
+  # muted by an inhibit rule of Alertmanager while they fire (docs/guide.md, "Muting alerts while
+  # an operation runs"). They are severity none, and a route sends them to a receiver that sends
+  # nothing. Neither fires while the operation is halted: what it broke is then everybody's to
+  # see. Both go on firing for five minutes after the turn or the operation ended, because the
+  # alerts they muted take a few evaluations to be resolved.
+  - name: talos-operator-inhibitors
+    rules:
+      - alert: TalosOperationInProgress
+        expr: >-
+          (
+            max by (namespace, taloscluster, type) (max_over_time(talos_operator_operation_info[5m]))
+            unless on (namespace, taloscluster)
+            max by (namespace, taloscluster) (
+              talos_operator_cluster_condition{condition="RolloutBlocked", status="True", reason=~"Paused|OutsideWindow|InvalidRollout"}
+            )
+            or
+            max by (namespace, taloscluster, type) (max_over_time(talos_operator_operation_machine_info[5m]))
+          )
+          unless on (namespace, taloscluster)
+          max by (namespace, taloscluster) (talos_operator_cluster_operation_halted) == 1
+        labels:
+          severity: none
+        annotations:
+          summary: A {{ $labels.type }} of {{ $labels.taloscluster }} is in progress.
+          description: >-
+            The {{ $labels.type }} of {{ $labels.taloscluster }} is changing its nodes. This alert
+            is there to inhibit the alerts the operation is expected to raise; it does not fire
+            while the operation is paused or outside its maintenance window between nodes, or
+            halted.
+
+      - alert: TalosMachineInOperation
+        expr: >-
+          (
+            max by (namespace, taloscluster, type, machine) (max_over_time(talos_operator_operation_machine_info[5m]))
+            * on (namespace, taloscluster, machine) group_left (node)
+            max by (namespace, taloscluster, machine, node) (talos_operator_machine_info{node!=""})
+          )
+          unless on (namespace, taloscluster)
+          max by (namespace, taloscluster) (talos_operator_cluster_operation_halted) == 1
+        labels:
+          severity: none
+        annotations:
+          summary: "{{ $labels.machine }} is being changed by a {{ $labels.type }}."
+          description: >-
+            The {{ $labels.type }} of {{ $labels.taloscluster }} is changing {{ $labels.machine }},
+            the node {{ $labels.node }}: from its preNode hooks to its postNode hooks. This alert is
+            there to inhibit the alerts about that node the operation is expected to raise; it
+            does not fire while the operation is halted.
