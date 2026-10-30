@@ -912,7 +912,10 @@ spec:
                       the middle of an upgrade's step reports the version it tries.
                     type: string
                   observedAt:
-                    description: ObservedAt is when this observation completed.
+                    description: |-
+                      ObservedAt is when what is observed last changed. A cluster at rest is not written to, so
+                      it does not move while the cluster stays as it is; the operator's metrics say when it last
+                      finished an observation.
                     format: date-time
                     type: string
                   talosVersions:
@@ -1004,12 +1007,62 @@ spec:
                         description: PreviousHash is the node's config hash before
                           the step; a reverted try returns to it.
                         type: string
+                      rebootAfter:
+                        description: |-
+                          RebootAfter is set on the steps of a reboot a human asked for after the operation halted at
+                          the machine: the failure the reboot answers. The operation halts again once the node is
+                          back (docs/scope.md §8.3).
+                        properties:
+                          at:
+                            description: At is when the failure was recorded.
+                            format: date-time
+                            type: string
+                          bundle:
+                            description: |-
+                              Bundle names the Secret that holds what was collected from the machine when the operation
+                              failed: the state of its services, and the last of their logs and of the kernel's. It is
+                              empty until that was tried, and says so when nothing could be collected.
+                            type: string
+                          hook:
+                            description: Hook is the stage of the hook that failed,
+                              if a hook did.
+                            type: string
+                          machine:
+                            description: Machine where the failure happened.
+                            type: string
+                          message:
+                            description: Message describes the failure.
+                            type: string
+                          reason:
+                            description: Reason is a machine-readable cause, e.g.
+                              RolledBack, RolledBackUnhealthy or NodeUnreachableAfterRollback.
+                            type: string
+                          remediation:
+                            description: Remediation suggests the next human action.
+                            type: string
+                          step:
+                            description: Step that failed.
+                            type: string
+                          token:
+                            description: |-
+                              Token identifies this failure. The retry, skip-machine and abort annotations must carry it,
+                              so an annotation left behind never acts on a later failure.
+                            type: string
+                        required:
+                        - message
+                        - step
+                        type: object
                       since:
                         description: Since is when the step started.
                         format: date-time
                         type: string
                       step:
                         description: Step is the step name, e.g. Trying or Verifying.
+                        type: string
+                      system:
+                        description: |-
+                          System is what the node of a reboot ran when the reboot was asked of it, as
+                          "<version> <schematic>": it is to come back on the same.
                         type: string
                     required:
                     - machine

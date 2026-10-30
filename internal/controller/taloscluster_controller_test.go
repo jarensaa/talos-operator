@@ -423,6 +423,42 @@ var _ = Describe("TalosCluster observe loop", func() {
 		Expect(tc.Status.Observed.TalosVersions).To(Equal(map[string]int32{talosVersion: 1, newerTalosVersion: 1}))
 	})
 
+	It("tells Observations of every finished observation, while status stays as it was", func() {
+		reconciler.Observations = &Observations{}
+		key := client.ObjectKeyFromObject(tc)
+		start := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+
+		reconciler.Now = func() time.Time { return start }
+		reconcileOnce()
+		written := tc.Status.Observed.ObservedAt.Time
+
+		reconciler.Now = func() time.Time { return start.Add(time.Hour) }
+		reconcileOnce()
+		Expect(tc.Status.Observed.ObservedAt.Time).To(BeTemporally("==", written))
+
+		at, ok := reconciler.Observations.LastObserved(key)
+		Expect(ok).To(BeTrue())
+		Expect(at).To(BeTemporally("==", start.Add(time.Hour)))
+
+		// A pass that does not reach the cluster has finished no observation.
+		reconciler.Now = func() time.Time { return start.Add(2 * time.Hour) }
+		scenario.FailNext(fake.MethodMembers, cpAddr, status.Error(codes.Unavailable, "connection refused"))
+		reconcileOnce()
+		Expect(condition(tc, talosv1alpha1.ConditionTalosAPIReachable).Status).To(Equal(metav1.ConditionFalse))
+
+		at, _ = reconciler.Observations.LastObserved(key)
+		Expect(at).To(BeTemporally("==", start.Add(time.Hour)))
+
+		// A cluster that is gone is forgotten.
+		gone := client.ObjectKey{Namespace: ns, Name: "gone"}
+		reconciler.Observations.observed(gone, start)
+		_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: gone})
+		Expect(err).NotTo(HaveOccurred())
+
+		_, ok = reconciler.Observations.LastObserved(gone)
+		Expect(ok).To(BeFalse())
+	})
+
 	Context("Talos-issued credentials", func() {
 		talosServiceAccount := func() *unstructured.Unstructured {
 			GinkgoHelper()

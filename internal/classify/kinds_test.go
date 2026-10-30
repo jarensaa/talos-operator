@@ -61,6 +61,29 @@ func TestAKindWithoutARuleIsUnknown(t *testing.T) {
 	}
 }
 
+// Configs of an older contract hold the kubelet's settings and the node's taints in the legacy
+// document, where a 1.14 one may not set them: what they restart is read there too.
+func TestTheLegacyDocumentRestartsTheKubelet(t *testing.T) {
+	for doc, want := range map[string]string{
+		"machine:\n  kubelet:\n    extraArgs:\n      max-pods: \"200\"\n":                    "v1alpha1: machine.kubelet.extraArgs.max-pods",
+		"machine:\n  nodeTaints:\n    example.com/gpu: x:NoSchedule\n":                       "v1alpha1: machine.nodeTaints.example.com/gpu",
+		"machine:\n  baseRuntimeSpecOverrides:\n    process:\n      noNewPrivileges: true\n": "",
+	} {
+		got, err := rootRestarts([]byte("machine: {}\n"), []byte(doc))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if want != "" && got[restartsKubelet] != want {
+			t.Errorf("%q: kubelet restarted by %q, want %q", doc, got[restartsKubelet], want)
+		}
+
+		if want == "" && got[restartsCRI] != "v1alpha1: machine.baseRuntimeSpecOverrides.process.noNewPrivileges" {
+			t.Errorf("%q: the runtime must restart for its base spec, got %v", doc, got)
+		}
+	}
+}
+
 // registeredKinds reads, from the source of the machinery module the operator is built with,
 // every kind its config document types register (registry.Register in config/types). The
 // registry itself is internal to machinery, so its source is what can be asked.

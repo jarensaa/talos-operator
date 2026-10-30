@@ -489,7 +489,9 @@ type ObservedState struct {
 	// +optional
 	EtcdMembers []EtcdMember `json:"etcdMembers,omitempty"`
 
-	// ObservedAt is when this observation completed.
+	// ObservedAt is when what is observed last changed. A cluster at rest is not written to, so
+	// it does not move while the cluster stays as it is; the operator's metrics say when it last
+	// finished an observation.
 	// +optional
 	ObservedAt *metav1.Time `json:"observedAt,omitempty"`
 }
@@ -724,6 +726,15 @@ type OperationStep struct {
 	// what has to be gone from the member list before the removal is done.
 	// +optional
 	EtcdMember string `json:"etcdMember,omitempty"`
+	// RebootAfter is set on the steps of a reboot a human asked for after the operation halted at
+	// the machine: the failure the reboot answers. The operation halts again once the node is
+	// back (docs/scope.md §8.3).
+	// +optional
+	RebootAfter *OperationFailure `json:"rebootAfter,omitempty"`
+	// System is what the node of a reboot ran when the reboot was asked of it, as
+	// "<version> <schematic>": it is to come back on the same.
+	// +optional
+	System string `json:"system,omitempty"`
 	// Since is when the step started.
 	Since metav1.Time `json:"since"`
 }

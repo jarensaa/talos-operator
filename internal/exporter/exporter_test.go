@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -283,7 +284,7 @@ func collect(t *testing.T, objects ...client.Object) map[string]float64 {
 	reader := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(objects...).Build()
 
 	out := map[string]float64{}
-	for _, s := range scrape(t, New(reader)) {
+	for _, s := range scrape(t, New(reader, nil)) {
 		// The build is the test binary's, and not something to compare.
 		if s.name == "talos_operator_info" {
 			s.labels = nil
@@ -498,6 +499,137 @@ func TestCollectorExportsTheOperation(t *testing.T) {
 	}
 }
 
+// A machine is in its turn from its preNode hooks to its postNode hooks, and nobody is between
+// turns.
+func TestCollectorExportsTheMachineInItsTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   talosv1alpha1.Operation
+		want string
+	}{
+		{name: "before the first turn", op: talosv1alpha1.Operation{Announced: true}},
+		{
+			name: "its preNode hooks run",
+			op: talosv1alpha1.Operation{Announced: true, Hook: &talosv1alpha1.HookRun{
+				Stage: talosv1alpha1.HookPreNode, Machine: "node-a", Job: "hook-1", Attempt: 1, Since: epoch,
+			}},
+			want: "node-a",
+		},
+		{name: "its preNode hooks ran", op: talosv1alpha1.Operation{Announced: true, Prepared: "node-a"}, want: "node-a"},
+		{
+			name: "its step",
+			op: talosv1alpha1.Operation{
+				Announced: true, Prepared: "node-a", Current: &talosv1alpha1.OperationStep{Machine: "node-a", Step: "Rebooting"},
+			},
+			want: "node-a",
+		},
+		{
+			name: "a component of it",
+			op: talosv1alpha1.Operation{Type: talosv1alpha1.OperationKubernetesUpgrade, Announced: true, Current: &talosv1alpha1.OperationStep{
+				Machine: "node-b", Component: "kubelet", Step: "Verifying",
+			}},
+			want: "node-b",
+		},
+		{
+			name: "its postNode hooks are due",
+			op:   talosv1alpha1.Operation{Announced: true, Prepared: "node-c", Finishing: "node-c"}, want: "node-c",
+		},
+		{
+			name: "a preRollout hook runs",
+			op: talosv1alpha1.Operation{Hook: &talosv1alpha1.HookRun{
+				Stage: talosv1alpha1.HookPreRollout, Job: "hook-0", Attempt: 1, Since: epoch,
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := healthy()
+			op := tc.op
+			op.ID, op.StartedAt = "op-1", epoch
+
+			if op.Type == "" {
+				op.Type = talosv1alpha1.OperationTalosUpgrade
+			}
+
+			f.cluster.Status.Operation = &op
+
+			var got []string
+
+			for series := range collect(t, f.objects()...) {
+				if strings.HasPrefix(series, "talos_operator_operation_machine_info") {
+					got = append(got, series)
+				}
+			}
+
+			want := of("talos_operator_operation_machine_info", "type", string(op.Type), "machine", tc.want)
+
+			switch {
+			case tc.want == "" && len(got) > 0:
+				t.Errorf("got %v, want none", got)
+			case tc.want != "" && (len(got) != 1 || got[0] != want):
+				t.Errorf("got %v, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// observedAt is what a replica remembers of its own observations.
+type observedAt map[types.NamespacedName]time.Time
+
+func (o observedAt) LastObserved(cluster types.NamespacedName) (time.Time, bool) {
+	at, ok := o[cluster]
+
+	return at, ok
+}
+
+// Status says when what was observed last changed; the replica that observes says when it last
+// finished an observation, and the later of the two is exported.
+func TestCollectorExportsTheLastObservation(t *testing.T) {
+	key := types.NamespacedName{Namespace: namespace, Name: cluster}
+	other := types.NamespacedName{Namespace: namespace, Name: "other"}
+	series := of("talos_operator_cluster_observed_timestamp_seconds")
+
+	for _, tc := range []struct {
+		name       string
+		status     *metav1.Time
+		remembered observedAt
+		want       float64
+		absent     bool
+	}{
+		{name: "a standby exports what status says", status: &epoch, want: 0},
+		{name: "the leader observed since", status: &epoch, remembered: observedAt{key: after(time.Hour).Time}, want: 3600},
+		{name: "status is newer", status: &epoch, remembered: observedAt{key: after(-time.Hour).Time}, want: 0},
+		{name: "only the leader knows", remembered: observedAt{key: after(time.Minute).Time}, want: 60},
+		{name: "another cluster's", status: &epoch, remembered: observedAt{other: after(time.Hour).Time}, want: 0},
+		{name: "never observed", absent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := healthy()
+			f.cluster.Status.Observed.ObservedAt = tc.status
+
+			reader := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(f.objects()...).Build()
+
+			var observations Observations
+			if tc.remembered != nil {
+				observations = tc.remembered
+			}
+
+			got := map[string]float64{}
+			for _, s := range scrape(t, New(reader, observations)) {
+				got[s.String()] = s.value
+			}
+
+			value, ok := got[series]
+
+			switch {
+			case tc.absent && ok:
+				t.Errorf("got %v, want no series", value)
+			case !tc.absent && (!ok || value != tc.want):
+				t.Errorf("got %v (there: %t), want %v", value, ok, tc.want)
+			}
+		})
+	}
+}
+
 // A machine whose pool is gone belongs to no cluster that could be named, and a resource that is
 // deleted takes its series with it: nothing is remembered between two scrapes.
 func TestCollectorKeepsNothing(t *testing.T) {
@@ -505,7 +637,7 @@ func TestCollectorKeepsNothing(t *testing.T) {
 	f.machine("node-d").Spec.PoolRef.Name = "gone"
 
 	reader := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(f.objects()...).Build()
-	c := New(reader)
+	c := New(reader, nil)
 
 	count := func(substr string) int {
 		n := 0
@@ -558,7 +690,7 @@ func TestCollectorSaysWhenItCannotRead(t *testing.T) {
 	reader := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(f.objects()...).Build()
 
 	for _, kind := range []string{"*v1alpha1.TalosClusterList", "*v1alpha1.TalosMachinePoolList", "*v1alpha1.TalosMachineList"} {
-		c := New(failing{Reader: reader, kind: kind})
+		c := New(failing{Reader: reader, kind: kind}, nil)
 
 		for scrapes := 1; scrapes <= 2; scrapes++ {
 			var names []string

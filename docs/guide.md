@@ -100,6 +100,9 @@ TOKEN=$(kubectl -n talos-operator get taloscluster my-cluster -o jsonpath='{.sta
 # Run the step again, for instance after fixing what kept the node unhealthy:
 kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/retry=$TOKEN
 
+# Reboot the machine first, then decide (needs spec.management.upgrades: Enabled):
+kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/reboot=$TOKEN
+
 # Leave this machine out and go on with the others:
 kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github.io/skip-machine=$TOKEN
 
@@ -109,6 +112,8 @@ kubectl -n talos-operator annotate taloscluster my-cluster talos.jarensaa.github
 
 A node that is back on its previous config is only reported as `RolledBack` once its container runtime and kubelet run again, and etcd on a control plane. When they don't, within the step timeout, the reason is `RolledBackUnhealthy` and the message names them: the change broke the node in a way its revert did not undo, or the node was unhealthy before. It needs repair, often a reboot, before anything else.
 
+`reboot` has the operator do that reboot, the way an upgrade does one: it drains the node, respecting disruption budgets, reboots it once every other node is healthy (and a control plane never while etcd has two members), waits for it to come back on the system it ran, uncordons it if it cordoned it, and waits for the whole cluster to be healthy for the soak. The operation then halts again, with reason `Rebooted` and a new token, and you say what follows: `retry`, `skip-machine` or `abort`. It needs `spec.management.upgrades: Enabled`; without it the annotation does nothing.
+
 After an abort the same change isn't started again. Change the spec, or revert it, and the operator rolls out whatever it renders then.
 
 **What the node said.** When an operation halts at a machine, the operator asks that machine for the state of its Talos services and the end of their logs and of the kernel's, and keeps them in a Secret. `status.operation.failure.bundle` names it:
@@ -117,7 +122,7 @@ After an abort the same change isn't started again. Change the spec, or revert i
 kubectl -n talos-operator get secret my-cluster-support-bundle -o jsonpath='{.data.kubelet\.log\.gz}' | base64 -d | gunzip
 ```
 
-It holds `failure.txt` (what failed, and what could not be read), `services.txt`, `dmesg.log.gz`, and a log each of `machined`, `apid`, `kubelet` and `cri`, and of `etcd` on a control plane. Each log is its last 500 lines. A few things to know:
+It holds `failure.txt` (what failed, and what could not be read), `services.txt`, `dmesg.log.gz`, and a log each of `machined`, `apid`, `kubelet` and `cri`, and of `etcd` on a control plane. Each log is the end of what Talos keeps of it, at most 128 KiB, without the lines that only record a read Talos answered, so what happened when the step failed is still there. A few things to know:
 
 - There is one bundle per cluster. The next failure overwrites it, and it goes when the TalosCluster does.
 - A node that does not answer has nothing to say. The operator tries for five minutes after the failure, and `bundle` then says why there is none (`not collected: ...`).
@@ -130,6 +135,7 @@ It holds `failure.txt` (what failed, and what could not be read), `services.txt`
 |---|---|
 | `ProtectedChange` | The change touches cluster identity: a CA, a token, the cluster name, a hostname. The operator never applies these. |
 | `RequiresReinstall` | The change only takes effect through a reinstall, such as a different installer image. Not supported yet. |
+| `RestartsTogether` | The change restarts both the container runtime and the kubelet on a node: a CRI customization, the base runtime spec or a registry's credentials, together with the kubelet's settings, a credential provider, or the node's taints or address. Talos can lose the kubelet when it restarts both at once, and the revert of the try races the same way. Make it as two changes, one after the other. |
 | `AwaitingApproval` | The change touches storage, or something the operator has no rule for. Review each machine's `status.config.diff`, then approve with the hash from `status.approval`: `kubectl annotate taloscluster my-cluster talos.jarensaa.github.io/approve-diff=<hash>`. The approval is for exactly that change. |
 | `GateClosed` | A node other than the one to be changed isn't healthy, or the cluster as a whole isn't, so no node is touched. The message says what is wrong. |
 | `Paused` | `spec.paused` is set. |
@@ -633,6 +639,8 @@ The metrics endpoint is HTTPS and asks the Kubernetes API whether the scraper ma
 | `TalosNodeClockNotSynced` | warning | A node's clock has not been synchronised for 10 minutes. |
 | `TalosBondMemberDown` | warning | A link that is a member of a bond has been down for 5 minutes. |
 | `TalosVolumeNotReady` | warning | One of Talos's volumes on a node, such as `STATE` or `EPHEMERAL`, has not been ready for 15 minutes. |
+| `TalosOperationInProgress` | none | An operation is changing the cluster's nodes. Tells nobody anything: it is there to mute other alerts ([Muting alerts while an operation runs](#muting-alerts-while-an-operation-runs)). |
+| `TalosMachineInOperation` | none | A machine is in its turn of an operation. The same, for the alerts about one node. |
 
 Waiting as you told it to raises nothing: a paused cluster, a change outside its maintenance window, an etcd that waits for its interval.
 
@@ -640,9 +648,49 @@ The alerts about a node are about nodes that answer. A node that cannot be read 
 
 Every alert names the cluster in the labels `namespace` and `taloscluster`, and where it is about one, the `machine`. Its description says where in the TalosCluster's status to read on.
 
+### Muting alerts while an operation runs
+
+A rolling upgrade reboots every node in turn, and the rest of your monitoring sees each reboot: Ceph rebalances and raises its health warnings, a Node is not ready, pods are rescheduled. The chart has two alerts for muting those with an inhibit rule of Alertmanager. They notify nobody themselves:
+
+- **`TalosOperationInProgress`** fires while an operation is changing the cluster's nodes. Its labels are `namespace`, `taloscluster` and `type`: `ConfigRollout`, `TalosUpgrade`, `KubernetesUpgrade`, `AddMachine`, `RemoveMachine` or `EtcdDefragment`.
+- **`TalosMachineInOperation`** fires while one machine is in its turn, from its `preNode` hooks to its `postNode` hooks. It has the labels above, the `machine`, and the `node`: the name of its Kubernetes Node, as kube-state-metrics' alerts call it.
+
+Neither fires while the operation is halted: muting ends at once, and what the operation broke reaches you along with `TalosOperationHalted`. An operation that is paused, or outside its maintenance window between nodes, changes nothing and mutes nothing; a node that is being finished meanwhile is still in its turn. Both go on firing for five minutes after the turn or the operation ended, because an alert that was muted takes a few evaluations to be resolved once its cause is gone.
+
+In Alertmanager's config, route the two to a receiver that sends nothing, and name them as the source of an inhibit rule. With kube-prometheus-stack, in its values:
+
+```yaml
+alertmanager:
+  config:
+    route:
+      routes:
+        - receiver: "null"
+          matchers: [alertname=~"TalosOperationInProgress|TalosMachineInOperation"]
+    receivers:
+      - name: "null"
+    inhibit_rules:
+      # Ceph's alerts are about the whole storage cluster, and carry no node: mute them while
+      # an operation takes nodes down. A Kubernetes upgrade or a defragmentation of etcd does not.
+      - source_matchers:
+          - alertname="TalosOperationInProgress"
+          - type=~"TalosUpgrade|ConfigRollout|RemoveMachine"
+        target_matchers: [namespace="rook-ceph"]
+      # The alerts about one Node, while that node is in its turn and no other.
+      - source_matchers: [alertname="TalosMachineInOperation"]
+        target_matchers: [alertname=~"KubeNodeNotReady|KubeNodeUnreachable|KubeNodeReadinessFlapping"]
+        equal: [node]
+```
+
+Merge it into the config you have. Helm replaces a list in values as a whole, so these lists take the place of kube-prometheus-stack's own: keep its route of `Watchdog`, its receivers and its inhibit rules in yours. Which alerts to mute is yours to choose, and so is the namespace your storage runs in. What a rule mutes, you do not hear about during the operation, so keep it to what an operation is expected to raise. Two things hold up the operation itself whatever is muted:
+
+- **A gate on storage health** (`spec.rollout.gates`) is asked before a node is touched and while a changed node is verified. A node is not done until it has been true for the soak, so the operation does not end, and muting does not stop, while the storage is still recovering; and storage that does not recover halts the operation, which ends the muting.
+- **The operator's own alerts are not muted** by these rules, as long as yours do not name them.
+
+If one Prometheus watches several clusters, add the label it tells them apart by, `cluster` for instance, to `equal` in both rules.
+
 ### Metrics
 
-All of them start with `talos_operator_`, and all of them are what the status of your resources says, read when the operator is scraped. Both replicas export the same, so take the maximum, as the alerts do:
+All of them start with `talos_operator_`, and all of them are what the status of your resources says, read when the operator is scraped. Both replicas export the same, so take the maximum, as the alerts do. One is not in status: when the operator last finished observing the cluster. The leader, which observes, exports it as it goes; the other replica exports `status.observed.observedAt`, which says when what was observed last changed and so stands still while the cluster does:
 
 ```promql
 max by (taloscluster) (talos_operator_cluster_operation_halted)
@@ -652,9 +700,10 @@ max by (taloscluster) (talos_operator_cluster_operation_halted)
 |---|---|
 | `info` | An operator is running, and which build. |
 | `cluster_phase`, `cluster_condition` | The cluster's phase, and each of its conditions with the status and reason it has now. |
-| `cluster_observed_timestamp_seconds` | When the operator last finished observing the cluster. |
+| `cluster_observed_timestamp_seconds` | When the operator last finished observing the cluster. Only the leader's moves while the cluster is at rest. |
 | `cluster_operation_in_progress`, `cluster_operation_halted`, `cluster_approval_pending` | 0 or 1. |
 | `operation_info`, `operation_start_timestamp_seconds`, `operation_turns` | The rollout or upgrade in flight, and how far it is. |
+| `operation_machine_info` | The machine whose turn is in flight, from its `preNode` hooks to its `postNode` hooks. |
 | `operation_failure_info`, `operation_failure_timestamp_seconds` | Where a halted operation waits: the machine, the step, the reason. |
 | `cluster_version_info`, `cluster_version_plan_steps` | The versions asked for and run, and how many upgrades lie between them. |
 | `cluster_etcd_members`, `machine_etcd_member` | Voters and learners; for each control plane, whether it is one. |
