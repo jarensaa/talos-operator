@@ -3,7 +3,7 @@ module github.com/jarensaa/talos-operator
 go 1.26.5
 
 require (
-	github.com/cosi-project/runtime v1.16.4
+	github.com/cosi-project/runtime v1.17.1
 	github.com/evanphx/json-patch v5.9.11+incompatible
 	github.com/google/cel-go v0.31.0
 	github.com/onsi/ginkgo/v2 v2.34.0
